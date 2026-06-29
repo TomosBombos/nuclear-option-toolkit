@@ -29,6 +29,7 @@ Run standalone for a dry connectivity check:
 import argparse
 import io
 import os
+import re
 import sys
 import time
 
@@ -116,11 +117,47 @@ def render_wrapper(relay_port=5550, framerate=60):
 # ---------------------------------------------------------------------------
 # Pterodactyl client API (power only) — urllib, no third-party deps.
 # ---------------------------------------------------------------------------
+_PANEL_SCHEME_RE = re.compile(r'^[a-z][a-z0-9+.-]*://', re.I)
+
+
+def normalize_panel_url(url):
+    """Forgiving Pterodactyl panel base: add https:// if no scheme, replace a wrong scheme
+    (sftp://, ws://...), drop a pasted /server/... path and a trailing /api/client. A correct
+    base is returned unchanged."""
+    u = (url or "").strip()
+    if not u:
+        return ""
+    m = _PANEL_SCHEME_RE.match(u)
+    if m:
+        if m.group(0).lower() not in ("http://", "https://"):
+            u = "https://" + u[m.end():]
+    else:
+        u = "https://" + u
+    i = u.lower().find("/server/")
+    if i != -1:
+        u = u[:i]
+    u = u.rstrip("/")
+    if u.lower().endswith("/api/client"):
+        u = u[:-len("/api/client")].rstrip("/")
+    return u
+
+
+def _friendly_json(raw, ctype):
+    body = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else (raw or "")
+    if not body:
+        return {}
+    if "json" not in (ctype or "").lower() and body.lstrip()[:1] not in ("{", "["):
+        raise DeployError("the panel URL returned a web page, not the API — check the panel URL "
+                          "is your panel's base address (e.g. https://panel.host.net), no /server/... path")
+    import json as _json
+    return _json.loads(body)
+
+
 class Ptero:
     UA = "nuclear-option-toolkit-installer"
 
     def __init__(self, base, key, server_id):
-        self.base = (base or "").rstrip("/")
+        self.base = normalize_panel_url(base)
         self.key = key
         self.server = server_id
 
@@ -133,8 +170,9 @@ class Ptero:
             "Authorization": "Bearer " + self.key, "Accept": "application/json",
             "Content-Type": "application/json", "User-Agent": self.UA})
         with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=20) as r:
+            ctype = r.headers.get("Content-Type", "")
             raw = r.read()
-        return json.loads(raw) if raw else {}
+        return _friendly_json(raw, ctype)
 
     def discover(self):
         """Fill self.server from the key if not given. Returns the id or None."""

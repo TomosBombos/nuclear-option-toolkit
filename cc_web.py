@@ -389,14 +389,11 @@ def _pt_load():
         except Exception:                                # noqa: BLE001
             _pt["key"] = None
         cfg = _tail(os.path.join(HERE, "panel.txt"), 2)
-        raw = (cfg[0].strip().rstrip("/") if cfg else "") or ""
+        raw = (cfg[0].strip() if cfg else "") or ""
         want = cfg[1].strip() if len(cfg) > 1 else None
-        if "/server/" in raw:                            # accept the browser URL form
-            base, _, tail = raw.partition("/server/")
-            _pt["base"] = base or None
-            want = want or tail.split("/")[0] or None
-        else:
-            _pt["base"] = raw or None
+        if "/server/" in raw and not want:               # accept the full browser URL form
+            want = raw.partition("/server/")[2].split("/")[0] or None
+        _pt["base"] = bot.normalize_panel_url(raw) or None
         _pt["err"] = None
         if not _pt["key"]:
             _pt["err"] = "no apiKey.txt"
@@ -423,8 +420,9 @@ def _pt_call(method, path, body):
         "Authorization": "Bearer " + _pt["key"], "Accept": "application/json",
         "Content-Type": "application/json", "User-Agent": _PT_UA})
     with urllib.request.urlopen(req, context=ctx, timeout=12) as r:
+        ctype = r.headers.get("Content-Type", "")
         raw = r.read()
-    return json.loads(raw) if raw else {}
+    return bot._pt_friendly_json(raw, ctype)
 
 
 def _pt_power(signal):

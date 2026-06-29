@@ -189,28 +189,76 @@ def _test_sftp(p):
         return {"ok": False, "error": str(e)}
 
 
+import re as _re
+
+_PANEL_SCHEME_RE = _re.compile(r'^[a-z][a-z0-9+.-]*://', _re.I)
+
+
+def _normalize_panel_url(url):
+    """Be forgiving about what the user pastes as the panel URL: add https:// if there's no
+    scheme, replace a wrong scheme (sftp://, ws://, ...) that they might paste from the SFTP
+    field, drop anything from /server/... onward (people paste the full server URL), and strip
+    a trailing /api/client. A CORRECT base is returned unchanged. Returns the panel's base."""
+    u = (url or "").strip()
+    if not u:
+        return ""
+    m = _PANEL_SCHEME_RE.match(u)
+    if m:
+        if m.group(0).lower() not in ("http://", "https://"):
+            u = "https://" + u[m.end():]
+    else:
+        u = "https://" + u
+    i = u.lower().find("/server/")    # full server URL pasted -> keep only the base
+    if i != -1:
+        u = u[:i]
+    u = u.rstrip("/")
+    if u.lower().endswith("/api/client"):   # only the well-known client-API path, never a bare /api
+        u = u[:-len("/api/client")].rstrip("/")
+    return u
+
+
 def _test_panel(p):
     if urllib is None:
         return {"ok": False, "error": "urllib unavailable"}
-    panel = (p.get("panel_url") or "").strip().rstrip("/")
+    panel = _normalize_panel_url(p.get("panel_url"))
     key = (p.get("api_key") or "").strip()
     if not panel or not key:
         return {"ok": False, "error": "panel URL and API key are required"}
+    base_hint = ("Use just your panel's base address, e.g. https://panel.yourhost.net — "
+                 "with no /server/... on the end.")
     req = urllib.request.Request(panel + "/api/client",
                                  headers={"Authorization": "Bearer " + key,
                                           "Accept": "application/json",
                                           "User-Agent": "Mozilla/5.0 NukeOptionToolkit"})
     try:
         with urllib.request.urlopen(req, timeout=12) as r:
-            data = json.loads(r.read().decode("utf-8", "replace"))
-        servers = [s.get("attributes", {}).get("identifier") for s in (data.get("data") or [])]
-        return {"ok": True, "info": "panel reachable; %d server(s): %s" % (len(servers), ", ".join(filter(None, servers)) or "(none)"),
-                "servers": [{"id": s.get("attributes", {}).get("identifier"),
-                             "name": s.get("attributes", {}).get("name")} for s in (data.get("data") or [])]}
+            ctype = (r.headers.get("Content-Type") or "")
+            body = r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:            # noqa: BLE001
-        return {"ok": False, "error": "HTTP %s — check the panel URL + that this is a CLIENT (account) API key" % e.code}
-    except Exception as e:                         # noqa: BLE001
-        return {"ok": False, "error": str(e)}
+        if e.code in (401, 403):
+            return {"ok": False, "error": "HTTP %s — the API key was rejected. It must be a "
+                    "CLIENT (account) key starting 'ptlc_', from Account -> API Credentials." % e.code}
+        if e.code in (301, 302, 404):
+            return {"ok": False, "error": "HTTP %s from %s/api/client. %s" % (e.code, panel, base_hint)}
+        return {"ok": False, "error": "HTTP %s from %s/api/client — check the panel URL." % (e.code, panel)}
+    except ValueError as e:                        # malformed URL
+        return {"ok": False, "error": "that panel URL doesn't look valid (%s). %s" % (e, base_hint)}
+    except Exception as e:                         # noqa: BLE001  (DNS, refused, TLS, timeout)
+        return {"ok": False, "error": "couldn't reach %s (%s). Check the address is right and "
+                "reachable from this PC." % (panel, e)}
+    # We got a 200 — but is it actually the API, or an HTML login/Cloudflare page?
+    if "json" not in ctype.lower() and not body.lstrip().startswith(("{", "[")):
+        return {"ok": False, "error": "the panel URL returned a web page, not the API. %s" % base_hint}
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return {"ok": False, "error": "the panel responded with something that isn't JSON. %s" % base_hint}
+    servers = [s.get("attributes", {}).get("identifier") for s in (data.get("data") or [])]
+    return {"ok": True, "panel_url": panel,
+            "info": "panel reachable (%s); %d server(s): %s" % (panel, len(servers),
+                    ", ".join(filter(None, servers)) or "(none)"),
+            "servers": [{"id": s.get("attributes", {}).get("identifier"),
+                         "name": s.get("attributes", {}).get("name")} for s in (data.get("data") or [])]}
 
 
 def _render_plugin_cfg(features):
@@ -755,7 +803,8 @@ def _api_deploy(payload):
                 "'Install Python packages', then retry."}
     if not _serverconfig:
         return {"ok": False, "error": "installer modules unavailable (serverconfig)"}
-    conn = payload.get("connection", {}) or {}
+    conn = dict(payload.get("connection") or {})
+    conn["panel_url"] = _normalize_panel_url(conn.get("panel_url"))   # forgiving: add https://, drop /server/...
     srv = payload.get("server", {}) or {}
     features = payload.get("features", {}) or {}
     game_side = os.path.join(ROOT, "game-side")
@@ -781,7 +830,7 @@ def _api_deploy(payload):
                       password=srv.get("password", ""), relay_port=relay_port, framerate=60)
     plugin_cfg_text = _render_plugin_cfg(features)
     ptero = None
-    panel = (conn.get("panel_url") or "").strip().rstrip("/")
+    panel = conn.get("panel_url") or ""
     key = (conn.get("api_key") or "").strip()
     if panel and key:
         ptero = _deployer.Ptero(panel, key, (conn.get("server_id") or "").strip())

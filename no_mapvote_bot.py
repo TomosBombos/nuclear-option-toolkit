@@ -4320,6 +4320,43 @@ def _deploy_log(msg):
         pass
 
 
+_PANEL_SCHEME_RE = re.compile(r'^[a-z][a-z0-9+.-]*://', re.I)
+
+
+def normalize_panel_url(url):
+    """Forgiving Pterodactyl panel BASE. Adds https:// when there's no scheme, replaces a wrong
+    scheme (sftp://, ws://, ...), drops a pasted /server/... path and a trailing /api/client.
+    A CORRECT base is returned byte-identical (strict superset) so existing setups are unchanged."""
+    u = (url or "").strip()
+    if not u:
+        return ""
+    m = _PANEL_SCHEME_RE.match(u)
+    if m:
+        if m.group(0).lower() not in ("http://", "https://"):
+            u = "https://" + u[m.end():]          # someone pasted sftp://… etc.
+    else:
+        u = "https://" + u
+    i = u.lower().find("/server/")                 # full server URL pasted -> keep the base
+    if i != -1:
+        u = u[:i]
+    u = u.rstrip("/")
+    if u.lower().endswith("/api/client"):          # only the well-known client-API path (NOT a bare /api)
+        u = u[:-len("/api/client")].rstrip("/")
+    return u
+
+
+def _pt_friendly_json(raw, ctype):
+    """json.loads with a clear error when the panel returns an HTML page (wrong URL) not JSON,
+    so the cryptic 'Expecting value: line 1 column 1' never surfaces on the power button."""
+    body = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else (raw or "")
+    if not body:
+        return {}
+    if "json" not in (ctype or "").lower() and body.lstrip()[:1] not in ("{", "["):
+        raise ValueError("the panel URL returned a web page, not the API — check panel.txt is your "
+                         "panel's base address (e.g. https://panel.host.net), with no /server/... path")
+    return json.loads(body)
+
+
 def _pt_cfg():
     """Load Pterodactyl client-API config from apiKey.txt + panel.txt (mirrors cc_web._pt_load)."""
     cfg = {"key": None, "base": None, "server": None, "err": None}
@@ -4331,13 +4368,11 @@ def _pt_cfg():
         rows = [l.strip() for l in open(os.path.join(_BASE_DIR, "panel.txt")) if l.strip()]
     except OSError:
         rows = []
-    raw = (rows[0].rstrip("/") if rows else "")
+    raw = (rows[0] if rows else "")
     want = rows[1] if len(rows) > 1 else None
-    if "/server/" in raw:
-        base, _, tail = raw.partition("/server/")
-        cfg["base"], cfg["server"] = (base or None), (want or (tail.split("/")[0] or None))
-    else:
-        cfg["base"], cfg["server"] = (raw or None), want
+    if "/server/" in raw and not want:
+        want = raw.partition("/server/")[2].split("/")[0] or None
+    cfg["base"], cfg["server"] = (normalize_panel_url(raw) or None), want
     if not cfg["key"]:
         cfg["err"] = "no apiKey.txt"
     elif not cfg["base"]:
@@ -4361,8 +4396,9 @@ def _pt_api(cfg, method, path, body):
         "Authorization": "Bearer " + cfg["key"], "Accept": "application/json",
         "Content-Type": "application/json", "User-Agent": _PT_UA})
     with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=15) as r:
+        ctype = r.headers.get("Content-Type", "")
         raw = r.read()
-    return json.loads(raw) if raw else {}
+    return _pt_friendly_json(raw, ctype)
 
 
 def _pt_power_signal(cfg, signal):

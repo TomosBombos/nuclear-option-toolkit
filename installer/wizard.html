@@ -169,7 +169,8 @@ function renderConnection(p){
 async function testSftp(btn){btn.disabled=true;$('#sftpmsg').textContent='testing…';const r=await api('/api/test-sftp',state.connection);
   $('#sftpmsg').innerHTML=r.ok?'<span class="ok">✓ '+esc(r.info)+'</span>':'<span class="bad">✗ '+esc(r.error)+'</span>';btn.disabled=false;}
 async function testPanel(btn){btn.disabled=true;$('#panelmsg').textContent='testing…';const r=await api('/api/test-panel',state.connection);
-  if(r.ok&&r.servers&&r.servers.length&&!state.connection.server_id){state.connection.server_id=r.servers[0].id;render();}
+  if(r.ok&&r.panel_url){state.connection.panel_url=r.panel_url;}
+  if(r.ok&&((r.servers&&r.servers.length&&!state.connection.server_id)||r.panel_url)){if(r.servers&&r.servers.length&&!state.connection.server_id)state.connection.server_id=r.servers[0].id;render();}
   $('#panelmsg').innerHTML=r.ok?'<span class="ok">✓ '+esc(r.info)+'</span>':'<span class="bad">✗ '+esc(r.error)+'</span>';btn.disabled=false;}
 
 function renderServer(p){
