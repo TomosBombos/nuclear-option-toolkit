@@ -41,9 +41,17 @@ code{background:#0a0f17;border:1px solid var(--bd);border-radius:5px;padding:1px
 </div>
 <script>
 const TOKEN="__TOKEN__";
-const S=["Welcome","Hosting","Server","Connection","Features","Files","Review"];
+// A pre-assembled bundle injects its type here; absent => the full multi-option wizard.
+let BUNDLE_TYPE="__BUNDLE_TYPE__"; if(BUNDLE_TYPE.indexOf("__")===0)BUNDLE_TYPE="";
+const BUNDLES={
+  pterodactyl:{steps:["Welcome","Server","Connection","Features","Install"],scenario:"external_linux"},
+  local:      {steps:["Welcome","Server","Connection","Features","Install"],scenario:"own_pc"},
+  manual:     {steps:["Welcome","Server","Connection","Features","Install"],scenario:"manual"},
+};
+const _B=BUNDLES[BUNDLE_TYPE]||{steps:["Welcome","Hosting","Server","Connection","Features","Files","Review"],scenario:"external_linux"};
+const S=_B.steps;
 let step=0;
-const state={scenario:"external_linux",connection:{},features:{},web_port:8770,power:"pterodactyl",
+const state={scenario:_B.scenario,connection:{},features:{},web_port:8770,power:(BUNDLE_TYPE==="local"?"local":"pterodactyl"),
   server:{mode:"install",dir:"",installed:false,exe:"",steamcmd_ready:false,game_port:7777,query_port:7778,server_name:"",max_players:16,password:"",admin_sid:""},
   github_repo:"TomosBombos/nuclear-option-toolkit",channel:"stable",auto_check:false,catalogue:[],
   mode:"online",platformTarget:"",detected:null,offlineDir:""};
@@ -52,43 +60,53 @@ async function api(path,body){const u=path+(path.indexOf('?')<0?'?':'&')+'t='+TO
   const r=await fetch(u,o);return r.json();}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 const $=s=>document.querySelector(s);
+// Reusable "what is this / where to find it" help block under a field.
+function fhelp(what,where){return '<div class="hint" style="margin:2px 0 6px;border-left:2px solid var(--bd);padding-left:8px"><b>What:</b> '+what+'<br><b>Where:</b> '+where+'</div>';}
 
 function renderSteps(){$('#steps').innerHTML=S.map((s,i)=>`<div class="${i===step?'on':i<step?'done':''}">${i+1}. ${s}</div>`).join('');}
 
+const WELCOME_BLURB={
+  pterodactyl:"This installs your community server onto your <b>Pterodactyl</b>-hosted game server. We'll take your panel's SFTP + API details (each explained), then push BepInEx, the plugin, all 18 missions and your config into the container — and make it boot modded with no panel edits. The bot + web command centre then run here on this PC.",
+  local:"This sets up a full community server on <b>this PC</b> — the dedicated server, the plugin, the missions, the bot and the web command centre, launched together.",
+  manual:"This helps you add the toolkit to a server you host <b>by hand</b> — it writes your config and shows exactly which files to place where.",
+};
 async function render(){
   renderSteps();
+  const name=S[step];
   $('#back').style.visibility=step?'visible':'hidden';
+  $('#next').style.display=(name==="Install")?'none':'';   // the Install step has its own actions
   $('#next').textContent=step===S.length-1?'Finish ✓':'Next ›';
   const p=$('#panel');
-  if(step===0){
-    p.innerHTML='<div class="card"><b>Welcome.</b> This sets up the toolkit for your Nuclear Option server. We\'ll check prerequisites, ask where your server runs, take your connection details, let you pick which plugin features you want, and write a clean config. <div class="hint" style="margin-top:8px">Everything runs locally — no internet needed. The only network calls are the “Test connection” buttons you click.</div><div id="pf" style="margin-top:12px" class="dim">checking…</div></div>';
+  if(name==="Welcome"){
+    const blurb=BUNDLE_TYPE?WELCOME_BLURB[BUNDLE_TYPE]:"This sets up the toolkit for your Nuclear Option server. We'll check prerequisites, ask where your server runs, take your connection details, let you pick which plugin features you want, and write a clean config.";
+    p.innerHTML='<div class="card"><b>Welcome.</b> '+blurb+' <div class="hint" style="margin-top:8px">Everything runs locally — your credentials stay on this machine and are never committed. Network is used only for the “Test connection” buttons and the actual upload to your server.</div><div id="pf" style="margin-top:12px" class="dim">checking…</div></div>';
     const r=await api('/api/preflight');
-    $('#pf').innerHTML=r.checks.map(c=>`<div><span class="chk" style="background:${c.ok?'var(--ok)':'var(--warn)'}"></span><b>${esc(c.name)}</b> — <span class="${c.ok?'ok':'warn'}">${esc(c.detail)}</span></div>`).join('');
+    $('#pf').innerHTML=r.checks.map(c=>`<div><span class="chk" style="background:${c.ok?'var(--ok)':'var(--warn)'}"></span><b>${esc(c.name)}</b> — <span class="${c.ok?'ok':'warn'}">${esc(c.detail)}</span></div>`).join('')
+      +'<div class="row" style="margin-top:10px"><button class="go" onclick="installDeps(this)">Install Python packages</button> <span id="depsMsg" class="msg"></span></div>';
     try{const dt=await api('/api/detect');state.detected=dt;state.platformTarget=dt.platform_target||'';
-      if(dt.suggested_option){state.scenario=({external_linux_ptero:'external_linux',own_pc_windows:'own_pc',own_pc_linux:'own_pc',external_windows:'external_windows'})[dt.suggested_option]||state.scenario;}
+      if(!BUNDLE_TYPE && dt.suggested_option){state.scenario=({external_linux_ptero:'external_linux',own_pc_windows:'own_pc',own_pc_linux:'own_pc',external_windows:'external_windows'})[dt.suggested_option]||state.scenario;}
       if(dt.local_game_dir&&!state.connection.local_game_dir)state.connection.local_game_dir=dt.local_game_dir;
       state.mode=(dt.connectivity&&dt.connectivity.online_ok)?'online':'offline';
-      $('#pf').innerHTML+=`<div style="margin-top:10px;border-top:1px solid var(--bd);padding-top:8px"><b>Autodetected:</b> ${esc(dt.reason||'')} <span class="hint">(${(dt.connectivity&&dt.connectivity.online_ok)?'internet available — online install':'no connectivity — offline install'})</span></div>`;
     }catch(e){}
   }
-  else if(step===1){
+  else if(name==="Hosting"){
     const opt=(id,t,h)=>`<div class="opt ${state.scenario===id?'sel':''}" onclick="state.scenario='${id}';render()"><b>${t}</b><div class="hint">${h}</div></div>`;
     p.innerHTML='<div class="card"><label class="fl">Where does your game server run?</label><div class="row">'
-      +opt('external_linux','External Linux (Pterodactyl)','A hosted server behind a Pterodactyl panel. We tail logs + transfer files over SFTP and control power via the panel API. (The current, most-tested path.)')
+      +opt('external_linux','External Linux (Pterodactyl)','A hosted server behind a Pterodactyl panel. We tail logs + transfer files over SFTP and control power via the panel API. (The most-tested path.)')
       +opt('own_pc','My own PC','The dedicated server runs on this same machine. We read the local log + control the local process directly — usually no SFTP needed.')
-      +opt('external_windows','External Windows','A hosted Windows server. Files over SFTP/SCP; power via SSH or manual.')
       +'</div>'
-      +'<label class="fl" style="margin-top:14px">Install mode</label><div class="row">'
-      +'<label style="cursor:pointer"><input type="radio" name="mode" value="online" '+(state.mode==='online'?'checked':'')+' onchange="state.mode=\'online\'"> Online — download the right files automatically</label>'
-      +'<label style="cursor:pointer;margin-left:14px"><input type="radio" name="mode" value="offline" '+(state.mode==='offline'?'checked':'')+' onchange="state.mode=\'offline\'"> Offline — I\'ll provide pre-downloaded files (from the official GitHubs)</label></div>'
-      +'<div class="hint" style="margin-top:10px">You can change this later by re-running setup.</div></div>';
+      +'<div class="hint" style="margin-top:10px">Want a remote Windows box? Host it on a Pterodactyl panel and use the Pterodactyl path. You can change this later by re-running setup.</div></div>';
   }
-  else if(step===2){ renderServer(p); }
-  else if(step===3){ renderConnection(p); }
-  else if(step===4){ await renderFeatures(p); }
-  else if(step===5){ await renderFiles(p); }
-  else if(step===6){ renderReview(p); }
+  else if(name==="Server"){ renderServer(p); }
+  else if(name==="Connection"){ renderConnection(p); }
+  else if(name==="Features"){ await renderFeatures(p); }
+  else if(name==="Files"){ await renderFiles(p); }
+  else if(name==="Review"){ renderReview(p); }
+  else if(name==="Install"){ renderInstall(p); }
 }
+async function installDeps(btn){btn.disabled=true;const m=$('#depsMsg');if(m)m.textContent='installing flask + paramiko + requests…';
+  let r;try{r=await api('/api/install-deps',{});}catch(e){r={ok:false,error:String(e)};}
+  if(m)m.innerHTML=r.ok?'<span class="ok">✓ installed — restart the installer if a check above was red</span>':'<span class="bad">✗ '+esc(r.error||(r.log||'failed'))+'</span>';btn.disabled=false;}
 
 function renderConnection(p){
   const c=state.connection, v=(k)=>esc(c[k]||'');
@@ -104,20 +122,44 @@ function renderConnection(p){
       +'<div class="hint">The port the game server opens for admin commands — the StartServer launcher passes <code>-ServerRemoteCommands &lt;port&gt;</code> (default 5504). On your own PC the bot reaches it over <b>127.0.0.1</b>, so you do <b>not</b> need to open or forward this port.</div>';
     state.power='local';
   } else {
-    html+='<div class="hint" style="margin-bottom:6px">SFTP is used to tail the log + deploy the plugin. Power control is optional (Pterodactyl / manual).</div>'
-      +f('sftp_host','SFTP host','your-host.example.net')
-      +'<div class="row"><div style="flex:1">'+f('sftp_port','SFTP port','22','number')+'</div><div style="flex:2">'+f('sftp_user','SFTP user','user.xxxxxx')+'</div></div>'
-      +f('sftp_pass','SFTP password','••••••••','password')
-      +f('log_path','Remote log path','console.log')
-      +'<div class="row"><div style="flex:1">'+f('rcmd_host','Relay host (for game commands)','same as SFTP host')+'</div><div style="flex:1">'+f('rcmd_port','Relay port','5550','number')+'</div></div>'
+    if(c.sftp_port===undefined)c.sftp_port=2022;
+    if(c.rcmd_port===undefined)c.rcmd_port=5550;
+    if(!c.log_path)c.log_path='logs/console.log';
+    const fh=(k,label,ph,type,what,where)=>f(k,label,ph,type)+fhelp(what,where);
+    html+='<div class="hint" style="margin-bottom:6px"><b>Your Pterodactyl panel details.</b> Each field below explains what it is and exactly where to find it. The installer uses SFTP to upload the toolkit into your container, and the API key to restart it.</div>'
+      +'<div class="grp" style="margin-top:8px">SFTP (file transfer)</div>'
+      +fh('sftp_host','SFTP host','your-host.example.net','text',
+          'The address the installer uploads files to.',
+          'Panel → your server → <b>Settings → SFTP Details</b>. It shows <code>sftp://HOST:PORT</code> — copy the HOST part (before the colon).')
+      +'<div class="row"><div style="flex:1">'+fh('sftp_port','SFTP port','2022','number',
+          'The SFTP port (Pterodactyl is usually 2022, not 22).',
+          'Same <b>SFTP Details</b> box — the number after the colon in <code>sftp://host:PORT</code>.')+'</div>'
+      +'<div style="flex:2">'+fh('sftp_user','SFTP username','name.abcd1234','text',
+          'Your SFTP login (usually <code>youraccount.SERVERID</code>).',
+          'Same <b>SFTP Details</b> box — copy it exactly.')+'</div></div>'
+      +fh('sftp_pass','SFTP password','••••••••','password',
+          'Your password for SFTP — on Pterodactyl this is your <b>panel account password</b>.',
+          'The password you log into the panel website with. (Stored only in your local secrets.json.)')
       +'<button class="go" onclick="testSftp(this)">Test SFTP</button> <span id="sftpmsg" class="msg"></span>'
-      +'<hr style="border-color:var(--bd);margin:14px 0">'
-      +'<label class="fl">Power control (optional)</label>'
-      +'<div class="hint">For a Pterodactyl-hosted server, paste your <b>client</b> API key to let the toolkit start/stop the server. Leave blank to control power manually.</div>'
-      +f('panel_url','Panel URL','https://panel.yourhost.net')
-      +f('api_key','Pterodactyl client API key','ptlc_…','password')
-      +f('server_id','Server ID (short)','abcd1234')
-      +'<button class="go" onclick="testPanel(this)">Test panel</button> <span id="panelmsg" class="msg"></span>';
+      +'<div class="grp" style="margin-top:14px">Power control (restart the server)</div>'
+      +fh('panel_url','Panel URL','https://panel.yourhost.net','text',
+          'Your panel\'s web address — lets the installer stop/start the server around the upload.',
+          'The URL in your browser when you\'re logged into the panel (just the <code>https://...</code> host part).')
+      +fh('api_key','Pterodactyl CLIENT API key','ptlc_…','password',
+          'A token that lets the toolkit power your server on/off. Must be a <b>client</b> key (starts <code>ptlc_</code>), not an application key.',
+          'Panel → <b>Account → API Credentials → Create</b>. Copy the key it shows once.')
+      +fh('server_id','Server ID','abcd1234','text',
+          'Which server on the panel to control (leave blank — “Test panel” fills it in).',
+          'In the panel URL when viewing your server: <code>…/server/<b>abcd1234</b></code>.')
+      +'<button class="go" onclick="testPanel(this)">Test panel</button> <span id="panelmsg" class="msg"></span>'
+      +'<div class="grp" style="margin-top:14px">In-game commands (relay)</div>'
+      +'<div class="row"><div style="flex:1">'+fh('rcmd_host','Server address','same as SFTP host','text',
+          'Where the bot sends in-game admin commands.',
+          'The same host as SFTP (your server\'s public address). Leave blank to reuse the SFTP host.')+'</div>'
+      +'<div style="flex:1">'+fh('rcmd_port','Relay port','5550','number',
+          'The public TCP port the in-container relay listens on (the bot connects here).',
+          'Add a <b>second allocation</b> to your server (Panel → <b>Network</b>) and use its port. Default 5550.')+'</div></div>'
+      +fhelp('You may also need a free relay port allocation.','Some hosts give one allocation by default — add a second one in Panel → Network for the relay, or reuse a spare port.');
   }
   html+='<hr style="border-color:var(--bd);margin:14px 0"><label class="fl">Web command centre port</label><input type="number" value="'+(state.web_port)+'" oninput="state.web_port=this.value">'
     +'<div class="hint">The browser admin dashboard runs locally at <code>http://localhost:'+esc(state.web_port)+'</code> on this PC — open that address after launching. No port-forwarding needed; to reach it from another device on your home network, open this port in your firewall and browse to this PC\'s LAN IP.</div>';
@@ -131,7 +173,7 @@ async function testPanel(btn){btn.disabled=true;$('#panelmsg').textContent='test
   $('#panelmsg').innerHTML=r.ok?'<span class="ok">✓ '+esc(r.info)+'</span>':'<span class="bad">✗ '+esc(r.error)+'</span>';btn.disabled=false;}
 
 function renderServer(p){
-  const sv=state.server, ext=(state.scenario==='external_linux');
+  const sv=state.server, ext=(state.scenario==='external_linux'||state.scenario==='manual');
   const v=(k)=>esc(sv[k]==null?'':sv[k]);
   let html='<div class="card">';
   if(ext){
@@ -280,6 +322,65 @@ async function fetchFiles(btn){btn.disabled=true;$('#fetchMsg').textContent='wor
   $('#fetchMsg').innerHTML='<span class="ok">staged → '+esc(r.dest||'')+'</span>';
   $('#fetchOut').innerHTML=(r.results||[]).map(x=>'<div>'+(x.ok===true?'<span class="ok">✓</span>':x.ok===null?'<span class="info">—</span>':'<span class="bad">✗</span>')+' '+esc(x.id)+' <span class="hint">'+esc(x.placed||x.note||'')+'</span></div>').join('');
   btn.disabled=false;
+}
+function renderInstall(p){
+  if(BUNDLE_TYPE==='local'){ return renderInstallLocal(p); }
+  if(BUNDLE_TYPE==='manual'){ return renderInstallManual(p); }
+  // Pterodactyl: push everything to the container over SFTP.
+  const sv=state.server, c=state.connection;
+  const onCount=Object.keys(state.features).filter(k=>state.features[k]).length;
+  p.innerHTML='<div class="card"><b>Install to your Pterodactyl server</b>'
+    +'<div class="hint" style="margin-top:4px">This uploads, over SFTP: BepInEx + the NukeStats plugin + all 18 missions + the relay, writes your <code>DedicatedServerConfig.json</code> (ports, ModdedServer, the 19-mission rotation), and installs a launch wrapper so the server boots <b>modded with no panel edits</b>. If you gave a panel API key it stops the server first and starts it after.</div>'
+    +'<div class="card" style="background:#0a0f17;margin-top:12px"><b>Recap</b>'
+      +'<div class="hint">SFTP: <code>'+esc(c.sftp_host||'(not set)')+':'+esc(c.sftp_port||2022)+'</code> · ports game '+esc(sv.game_port)+' / query '+esc(sv.query_port)+' · relay '+esc(c.rcmd_port||5550)+' · power '+(c.api_key?'<span class="ok">panel API</span>':'<span class="warn">manual (no API key)</span>')+' · name “'+esc(sv.server_name||'(unnamed)')+'” · '+onCount+' features on</div></div>'
+    +'<div class="row" style="margin-top:12px"><button class="pri" onclick="deployNow(this)">⬆ Install to my server</button> <span id="depMsg" class="msg"></span></div>'
+    +'<div class="hint" style="margin-top:6px">This uploads ~25&nbsp;MB and can take a minute or two — keep this window open.</div>'
+    +'<pre id="depLog" style="display:none;white-space:pre-wrap;background:#0a0f17;border:1px solid var(--bd);border-radius:8px;padding:10px;margin-top:10px;max-height:240px;overflow:auto;font-size:12px"></pre>'
+    +'<div id="depDone" class="hide" style="margin-top:12px"></div></div>';
+}
+async function deployNow(btn){btn.disabled=true;const m=$('#depMsg');
+  m.innerHTML='<span class="dim">installing… uploading to your server (can take a couple of minutes)</span>';
+  const log=$('#depLog');log.style.display='block';log.textContent='Connecting…';
+  let r;try{r=await api('/api/deploy',state);}catch(e){r={ok:false,error:String(e)};}
+  btn.disabled=false;
+  if(r.log)log.textContent=r.log;
+  if(!r.ok){m.innerHTML='<span class="bad">✗ '+esc(r.error||'failed')+'</span>';return;}
+  m.innerHTML='<span class="ok">✓ installed to your server</span>';
+  window._launchInfo=r.launch||{};
+  const webPort=esc(state.web_port||8770);
+  const d=$('#depDone');d.classList.remove('hide');
+  d.innerHTML='<b class="ok" style="font-size:16px">✅ Your server is set up!</b>'
+    +'<ol style="margin:8px 0 4px 20px;padding:0;line-height:1.7">'
+    +'<li>Your Pterodactyl server now has the plugin, missions and config'+(r.powered?' and is restarting':' — restart it from the panel')+'. Watch the panel console for <code>NukeStats loaded</code>.</li>'
+    +'<li>Click <b>🚀 Launch Everything</b> to start the bot + web command centre here and open your dashboard.</li>'
+    +'<li>Any time after, double-click <b>START EVERYTHING.bat</b> in this folder.</li></ol>'
+    +'<div class="row" style="margin-top:12px"><button class="pri" onclick="launchNow(this)">🚀 Launch Everything</button> <button class="go" onclick="finishClose(this)">✓ Finish &amp; close</button></div>'
+    +'<div class="hint" style="margin-top:6px">Dashboard: <code>http://localhost:'+webPort+'</code></div><div id="launchMsg" class="msg"></div>';
+}
+function renderInstallLocal(p){
+  const sv=state.server;
+  p.innerHTML='<div class="card"><b>Install on this PC</b>'
+    +'<div class="hint" style="margin-top:4px">This writes your config, copies the bundled BepInEx + plugin + missions into your server folder, and creates a <b>START EVERYTHING</b> launcher (server + bot + web command centre).</div>'
+    +((!sv.dir)?'<div class="warn" style="margin-top:8px">Go back to the <b>Server</b> step and choose/point to your server folder first.</div>':'')
+    +'<div class="row" style="margin-top:12px"><button class="pri" '+(sv.dir?'':'disabled')+' onclick="placeLocal(this)">⬇ Install &amp; set up</button> <span id="depMsg" class="msg"></span></div>'
+    +'<div id="depDone" class="hide" style="margin-top:12px"></div></div>';
+}
+async function placeLocal(btn){btn.disabled=true;const m=$('#depMsg');m.textContent='installing…';
+  let r;try{r=await api('/api/save',state);}catch(e){r={ok:false,error:String(e)};}
+  btn.disabled=false;
+  if(!r.ok){m.innerHTML='<span class="bad">✗ '+esc(r.error||'failed')+'</span>';return;}
+  m.innerHTML='<span class="ok">✓ set up</span>';window._launchInfo=r.launch||{};
+  const d=$('#depDone');d.classList.remove('hide');
+  d.innerHTML='<b class="ok" style="font-size:16px">✅ Ready!</b>'
+    +(r.launch?'<div class="hint" style="margin-top:6px">Click Launch Everything to boot the server + bot + web command centre and open your dashboard.</div>'
+      +'<div class="row" style="margin-top:10px"><button class="pri" onclick="launchNow(this)">🚀 Launch Everything</button> <button onclick="openFolder(this)">Open server folder</button> <button class="go" onclick="finishClose(this)">✓ Finish</button></div><div id="launchMsg" class="msg"></div>'
+      :'<div class="hint" style="margin-top:6px">Config written. Open your server folder and run START EVERYTHING.</div><div class="row" style="margin-top:10px"><button class="go" onclick="finishClose(this)">✓ Finish</button></div>');
+}
+function renderInstallManual(p){
+  p.innerHTML='<div class="card"><b>Manual setup</b>'
+    +'<div class="hint" style="margin-top:4px">This writes your admin config + the plugin cfg. Then follow <b>README.md</b> in this folder to drag the game-side files onto your server and paste the startup line.</div>'
+    +'<div class="row" style="margin-top:12px"><button class="pri" onclick="placeLocal(this)">💾 Write my config</button> <span id="depMsg" class="msg"></span></div>'
+    +'<div id="depDone" class="hide" style="margin-top:12px"></div></div>';
 }
 function renderReview(p){
   const c=state.connection;const on=Object.keys(state.features).filter(k=>state.features[k]);

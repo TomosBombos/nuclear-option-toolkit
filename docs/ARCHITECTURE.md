@@ -1,8 +1,11 @@
-# Nuclear Option Community Server Toolkit
+# Architecture
 
-> Authoritative documentation for the three-process toolkit that turns a vanilla *Nuclear Option* Pterodactyl-hosted dedicated server into a managed community server: persistent ranks, a real-score economy, skill ratings, team balance, anti-grief enforcement, a live battle map, and a browser admin console.
->
-> **Current plugin version: `anz.nukestats` 0.9.14** (the `[BepInPlugin]` attribute is authoritative).
+This page explains how the toolkit fits together. **It's layered:** a plain-English overview
+first, then the full technical reference in [Part II](#part-ii--technical-reference) (exact
+hooks, algorithms, and data contracts). To learn what each feature *does* rather than how it's
+wired, see **[FEATURES.md](FEATURES.md)**; for the command list, **[COMMANDS.md](COMMANDS.md)**.
+
+> **Plugin version:** `anz.nukestats` `0.9.14` (the `[BepInPlugin]` attribute is authoritative).
 
 ---
 
@@ -25,7 +28,7 @@ The toolkit is built from **three independent processes** that never call each o
         │   ▲ Harmony patches + [Server] API calls                       │
         │   │                                                            │
         │  ┌┴───────────────────────────┐                                │
-        │  │  NukeStats plugin v0.9.14    │  Debug.Log("[NOSTATS] {...}")  │
+        │  │  NukeStats plugin v0.9.14   │  Debug.Log("[NOSTATS] {...}")  │
         │  │  (BepInEx)                  ├───────────────┐                │
         │  └─────────────▲──────────────┘               │                │
         │   reads:        │ reads/deletes:               ▼                │
@@ -76,9 +79,17 @@ The toolkit is built from **three independent processes** that never call each o
 
 ---
 
+# Part II — Technical reference
+
+> Everything below is the deep dive — exact Harmony hooks, algorithms, the `[NOSTATS]` wire
+> schema, every data contract, and the CLI/API surface. You don't need any of it to run a
+> server; read it if you're modifying the code.
+
+---
+
 ## 2. Component: NukeStats BepInEx plugin (`NukeStatsPlugin.cs`)
 
-The plugin is a single `BaseUnityPlugin` (`[BepInPlugin("anz.nukestats", "NukeStats", "0.9.14")]`, `NukeStatsPlugin.cs:45-48`). Every behaviour is a HarmonyLib patch or a `[Server]`-API call. All tunables live in `BepInEx/config/anz.nukestats.cfg`.
+The plugin is a single `BaseUnityPlugin` (`[BepInPlugin("anz.nukestats", "NukeStats", "0.9.14")]`). Every behaviour is a HarmonyLib patch or a `[Server]`-API call. All tunables live in `BepInEx/config/anz.nukestats.cfg`.
 
 ### 2.1 Bootstrap & scheduling
 

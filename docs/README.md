@@ -2,14 +2,20 @@
 
 A three‑process toolkit that turns a vanilla *Nuclear Option* dedicated server into a managed community server: persistent ranks, a real‑score economy, skill ratings, PvP team balance, anti‑grief enforcement, a live battle map, and a browser admin console.
 
+**New here?** Start with **[FEATURES.md](FEATURES.md)** for what it does, then **[COMMANDS.md](COMMANDS.md)** for how to drive it.
+
 ## Documents
 
 | Doc | What it is |
 |---|---|
-| **[ARCHITECTURE.md](ARCHITECTURE.md)** | The authoritative technical reference — every plugin, bot, and web‑command‑centre feature: what it does, how it works (hooks/algorithms/files), the `[NOSTATS]` wire schema, all data contracts, the `run.bat` CLI and `/api` surface, and the cross‑process data flow. Start here to understand the system. |
-| **[DESIGN_HISTORY.md](DESIGN_HISTORY.md)** | *Why* it's shaped this way — the founding constraint (the game hides per‑player score) and the incidents (exploits, mass‑disconnects, balance ping‑pong) that drove each feature into existence. Read this to understand the reasoning behind the architecture. |
-| **[PRODUCTIZATION_PLAN.md](PRODUCTIZATION_PLAN.md)** | The plan to turn this from one admin's setup into an installable product for other server owners: a setup UI, selectable plugin features, full customisation, support for the game server on your own PC / external Linux / external Windows, and GitHub‑based auto‑updates. Includes a phased roadmap and the decisions the owner must make. |
-| **[PRE_UPLOAD_CHECKLIST.md](PRE_UPLOAD_CHECKLIST.md)** | **Read before publishing.** The exhaustive secret‑scrub + first‑steps checklist (the working folder contains live credentials and player PII). |
+| **[FEATURES.md](FEATURES.md)** | Every feature in plain English — what it does, how it works, why it matters. |
+| **[COMMANDS.md](COMMANDS.md)** | The complete command & tool reference: player chat commands, admin commands, the web command centre, and the `run.bat` CLI. |
+| **[MODERATION.md](MODERATION.md)** | The moderation toolkit in depth: teamkill enforcement, anti‑grief auto‑kick, bans/unbans, votekick, the flood guard, and the reports tab. |
+| **[ARCHITECTURE.md](ARCHITECTURE.md)** | How the three processes fit together: a simple overview up top, then the full technical reference (hooks, data contracts, the `[NOSTATS]` schema, the CLI/API surface). |
+
+> The live **Global Leaderboard** (global Top 5) and **Community Servers** listings are on the [main page](../README.md), not here — that's where the data is shown.
+
+For installers & maintainers: **[INSTALL_SOURCES.md](INSTALL_SOURCES.md)** (where the installer fetches each file), **[GLOBAL_LEADERBOARD_CONTRACT.md](GLOBAL_LEADERBOARD_CONTRACT.md)** (the cross‑server data format), and **[../SECURITY.md](../SECURITY.md)** (update signing + the credential stance).
 
 ## The three processes at a glance
 
@@ -26,4 +32,4 @@ A three‑process toolkit that turns a vanilla *Nuclear Option* dedicated server
 - **Bot → plugin:** SFTP file drops + a relay to the game's localhost‑only remote‑command port.
 - **Web CC ⇄ bot:** shared local files (the web process never touches SFTP or the rank data directly; it queues intents the bot executes).
 
-See **ARCHITECTURE.md §1** for the full diagram and **§6** for every data contract.
+See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full diagram and every data contract.

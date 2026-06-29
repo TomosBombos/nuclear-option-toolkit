@@ -58,10 +58,12 @@ ROOT_FILES = [
 # Whole-subtree includes, each minus the listed glob excludes (paths relative to
 # the subtree root, forward-slashes). Excluded dirs are pruned for speed.
 TREE_INCLUDES = {
-    "docs":       ["_*.json"],                                    # drop machine dumps
+    "docs":       ["_*.json", "DESIGN_HISTORY.md", "PRODUCTIZATION_PLAN.md",
+                   "PRE_UPLOAD_CHECKLIST.md", "INSTALL_WIZARD_CONTENT.md",
+                   "PUBLIC_REPO_MANIFEST.md", "SETTINGS_AND_INSTALL_V2.md"],  # internal-only docs
     "installer":  ["__pycache__/*", "sources.lock.json"],         # local install state
     "scripts":    ["__pycache__/*", "scrub_targets.json"],        # never ship real targets
-    "NukeStats":  ["libs/*", "bin/*", "obj/*", "bepinex_pack/*"],  # proprietary/build
+    "NukeStats":  ["libs/*", "bin/*", "obj/*", "bepinex_pack/*", "bepinex_pack_win/*"],  # proprietary/build/binaries (bundles re-add from source)
     "map-build":  ["__pycache__/*"],
     "relay":      [],                                            # localhost->WAN remote-command relay
     "missions":   [],                                            # the 18 custom co-op missions
@@ -141,9 +143,15 @@ def strip_preamble(text):
 
 
 def scrub_architecture(text):
-    if "0.9.5" not in text:
-        raise AssertionError("ARCHITECTURE.md: expected 0.9.5 version refs to fix")
-    return text.replace("0.9.5", PLUGIN_VERSION)
+    # Keep the documented plugin version synced to the live source on every build.
+    # Tolerant: if a reference isn't found (doc changed), that spot is left as-is.
+    v = PLUGIN_VERSION
+    text = re.sub(r'(\*\*Plugin version:\*\* `anz\.nukestats` )`[0-9][0-9.]*`',
+                  lambda m: m.group(1) + "`" + v + "`", text)
+    text = re.sub(r'(NukeStats plugin v)[0-9][0-9.]*', lambda m: m.group(1) + v, text)
+    text = re.sub(r'(\[BepInPlugin\("anz\.nukestats", "NukeStats", ")[0-9][0-9.]*',
+                  lambda m: m.group(1) + v, text)
+    return text
 
 
 def scrub_design_history(text):
@@ -167,10 +175,7 @@ SCRUBS = {
     "no_mapvote_bot.py": scrub_bot,
     "NukeStats/NukeStatsPlugin.cs": scrub_plugin,
     "docs/INSTALL_SOURCES.md": strip_preamble,
-    "docs/SETTINGS_AND_INSTALL_V2.md": strip_preamble,
-    "docs/PRODUCTIZATION_PLAN.md": strip_preamble,
     "docs/ARCHITECTURE.md": scrub_architecture,
-    "docs/DESIGN_HISTORY.md": scrub_design_history,
     "SECURITY.md": scrub_security,
 }
 

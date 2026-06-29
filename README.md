@@ -5,17 +5,71 @@ persistent ranks, a real-score economy, skill ratings, PvP team balance (with ne
 & squad protection), anti-grief enforcement, a flood-disconnect guard, a live battle map,
 and a browser admin console where you can change every setting **live**.
 
-It's three cooperating pieces: a server-side **plugin** (BepInEx/Harmony), a **bot** that
+It's three cooperating pieces — a server-side **plugin** (BepInEx/Harmony), a **bot** that
 runs on your PC, and a **web command centre** in your browser. They talk only through the
-game's log + a relay + shared files, so any one can restart without taking the others down.
+game's log, a relay, and shared files, so any one can restart without taking the others down.
+
+## ⬇️ Download — pick your server type
+
+Each download is a ready-to-go folder with **everything inside** — BepInEx, the NukeStats
+plugin, all 18 missions, the bot, and the web command centre. Grab the one that matches how
+your server is hosted, unzip it, and run the installer inside it. The installer asks for your
+details (each field explains **what it is** and **where to find it**) and wires everything up.
+
+| Your setup | Download | What you do |
+|---|---|---|
+| **Pterodactyl panel** (hosted Linux) | **[⬇ Pterodactyl bundle](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-pterodactyl.zip)** | Unzip → run `install.bat` (or `./install.sh`) → enter your panel's SFTP + API details → it pushes the plugin, missions and config to your server over SFTP and makes it boot modded. Then launch the bot + dashboard. |
+| **Your own PC** (Windows / Linux) | **[⬇ Local bundle](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-local.zip)** | Unzip → run `install.bat` → it installs the dedicated server (SteamCMD), copies the toolkit in, and launches server + bot + dashboard together. |
+| **Hosting by hand / other** | **[⬇ Manual bundle](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-manual.zip)** | Unzip → follow `README.md` to drag the files into place (both BepInEx packs included); the installer writes your config. |
+
+> All downloads live on the **[Releases page](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest)**.
+> You only need **Python 3.8+** installed first. Prefer to clone the repo and run the
+> installer from source? See **[Get started](#get-started)** below.
+
+## What it does
+
+- **Ranks & economy** — lifetime points from real in-game score + win/placement bonuses, 11 ranks, fully audited ledgers.
+- **NuclearSkill** — a points-per-life skill rating (`!skill`), used to balance teams fairly.
+- **Team balance (PvP)** — keeps sides even; protects new joiners and **`!squadup`** friend groups; moves the player who best evens the skill totals.
+- **Anti-grief & moderation** — automated teamkill enforcement (warn → kick → ban), bans, votekick, and a network flood guard that stopped a recurring match-start mass-disconnect.
+- **AI limiter** — caps AI aircraft and clears stuck ones for performance; never touches players.
+- **Live map + web command centre** — pan/zoom battle map with player/AI/ship blips, power control, a map-change button, scheduling, and a **⚙ Settings menu to change any plugin setting live**.
+- **More** — map voting, chat rank tags, profanity filter, forfeit votes, a server-message manager, PvE timeout rules, and an opt-in **global cross-server leaderboard**.
+
+→ Full plain-English tour: **[docs/FEATURES.md](docs/FEATURES.md)**
+
+## Global Leaderboard
+
+The top-ranked pilots across every server running the toolkit.
+*(Goes live here once the shared cross-server board is up — it's being stood up now.)*
+
+| Points | Rank | Name | Server |
+|--------|------|------|--------|
+| *coming soon* | | | |
+| | | | |
+| | | | |
+| | | | |
+| | | | |
+
+The full board is also available in game with `!global`. **Running a server?** Turn on the global
+leaderboard in the command centre's settings to contribute — only player names, points, region, and
+your server name are published (never IPs or SteamIDs).
+
+## Documentation
+
+| Doc | What it covers |
+|---|---|
+| **[docs/FEATURES.md](docs/FEATURES.md)** | What every feature does and why — in plain English |
+| **[docs/COMMANDS.md](docs/COMMANDS.md)** | Every command & tool: players, admins, the web console, the CLI |
+| **[docs/MODERATION.md](docs/MODERATION.md)** | Teamkill enforcement, anti-grief auto-kick, bans, votekick, reports |
+| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | How the three processes fit together — overview up top, deep technical reference below |
+| **[SECURITY.md](SECURITY.md)** | Update signing (minisign) + the credential/secrets stance |
 
 ## Get started
 
-### Prerequisites — install these first
+**1. Install the prerequisites** — you need **Python 3.8+**, the **paramiko** package, and (to clone) **Git**.
 
-You need **Python 3.8+**, the **paramiko** package, and (to clone) **Git**. Step by step:
-
-<details open>
+<details>
 <summary><b>Windows</b></summary>
 
 1. **Python** — open <https://www.python.org/downloads/>, click **Download Python 3.x**, run the
@@ -49,7 +103,7 @@ python3 --version && git --version
 
 > Use `python` / `pip` on Windows, and `python3` / `pip3` on macOS & Linux.
 
-**1. Download the toolkit**
+**2. Download the toolkit**
 
 With git:
 ```bash
@@ -59,7 +113,7 @@ cd nuclear-option-toolkit
 No git? On this page click the green **`< > Code ▾` → Download ZIP**, extract it, and open a
 terminal in the extracted folder.
 
-**2. Run the guided installer**
+**3. Run the guided installer**
 ```bash
 python installer/setup.py
 ```
@@ -72,30 +126,14 @@ machine and never enter the repo.** More detail: **[installer/README.md](install
 > Prefer to wire it up by hand? Copy `run.bat.example` → `run.bat`, `apiKey.txt.example` →
 > `apiKey.txt`, `panel.txt.example` → `panel.txt`, fill in your values, then run `run.bat`.
 
+> **Building the plugin from source** requires the game's managed assemblies
+> (`NukeStats/libs/`), which you supply from your own game install — they are not
+> distributed here.
+
 > ⚠️ **Early / iterating.** The guided installer is under active development. If a step
 > doesn't yet complete end-to-end on your setup, the manual path above works — please
 > [open an issue](https://github.com/TomosBombos/nuclear-option-toolkit/issues) with what
 > you hit so we can harden it.
-
-## Documentation
-
-| Doc | What it covers |
-|---|---|
-| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | Every feature, how it works, the data contracts, the CLI + API surface |
-| **[docs/DESIGN_HISTORY.md](docs/DESIGN_HISTORY.md)** | *Why* it's built this way — the incidents that drove each feature |
-| **[docs/PRODUCTIZATION_PLAN.md](docs/PRODUCTIZATION_PLAN.md)** | The roadmap to a one-click, cross-platform, auto-updating product |
-| **[docs/PRE_UPLOAD_CHECKLIST.md](docs/PRE_UPLOAD_CHECKLIST.md)** | **Read before publishing** — the secret-scrub gate |
-| **[SECURITY.md](SECURITY.md)** | Update signing (minisign) + the credential/secrets stance |
-
-## Features at a glance
-
-- **Ranks & economy** — lifetime points from real in-game score + win/placement bonuses, 11 ranks, fully audited ledgers.
-- **NuclearSkill** — a points-per-life skill rating (`!skill`), used to balance teams fairly.
-- **Team balance (PvP)** — keeps sides even; protects new joiners (15 min) and **`!squadup`** friend groups; moves the player who best evens the skill totals.
-- **Anti-grief** — automated teamkill enforcement (warn → kick → ban) and a network flood guard that stopped a recurring match-start mass-disconnect.
-- **AI limiter** — caps AI aircraft and clears stuck ones (performance), never touches players.
-- **Live map + web CC** — pan/zoom battle map, player/AI/ship blips, power control, a map-change button, and a **⚙ Settings menu to change any plugin setting live**.
-- **Map voting**, chat rank tags, profanity filter, forfeit votes, PvE timeout rules, and more.
 
 ## Updating (opt-in)
 
@@ -111,13 +149,17 @@ Pick your channel in `~/.nuke-option-toolkit/config.json` (`update.channel`: `"s
 deploy (plugin → `run.bat --deploy-plugin`; bot → `update --component bot --apply`).
 Maintainers publish with `scripts/release.py` (`--with-bot`, `--channel`). See **[SECURITY.md](SECURITY.md)**.
 
-## Status
+## Community Servers
 
-Actively developed against a live ANZ community server. The toolkit is feature-complete and
-battle-tested for the hosted-Linux/Pterodactyl setup; the cross-platform installer + frozen
-launcher are in progress (see the productization plan). **Building the plugin requires the
-game's managed assemblies** (`NukeStats/libs/`), which you supply from your own game install —
-they are not distributed here.
+Servers running the toolkit that have opted into the public directory — find them by **name** in the
+in-game server browser (Nuclear Option has no direct-connect).
+
+| Server | Region |
+|--------|--------|
+| *coming soon* | |
+
+**Running a server?** Enable listing in the command centre's settings to appear here (name + region
+only — never your IP).
 
 ## License
 

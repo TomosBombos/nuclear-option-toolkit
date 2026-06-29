@@ -45,13 +45,41 @@ TOKEN = _secrets.token_urlsafe(16)                # guards the setup API for thi
 _SERVER = None                                    # set in main(); used by /api/shutdown
 
 sys.path.insert(0, HERE)
-try:
-    import fetcher as _fetcher        # manifest-driven source resolver/downloader
-    import detect as _detect          # autodetect scenario + connectivity
-    import steamcmd as _steamcmd      # install/locate the dedicated server (SteamCMD)
-    import serverconfig as _serverconfig  # read/write DedicatedServerConfig.json (ports etc.)
-except Exception:                     # noqa: BLE001
-    _fetcher = _detect = _steamcmd = _serverconfig = None
+
+
+def _try_import(name):
+    """Import an installer module independently — a bundle ships only the modules its type needs
+    (e.g. the Pterodactyl bundle has no steamcmd.py), so one missing module must NOT take the
+    others down with it."""
+    try:
+        return __import__(name)
+    except Exception:                 # noqa: BLE001
+        return None
+
+
+_fetcher = _try_import("fetcher")          # manifest-driven source resolver/downloader
+_detect = _try_import("detect")            # autodetect scenario + connectivity
+_steamcmd = _try_import("steamcmd")        # install/locate the dedicated server (SteamCMD) — local only
+_serverconfig = _try_import("serverconfig")  # read/write DedicatedServerConfig.json (ports etc.)
+_deployer = _try_import("deployer")        # SFTP push of the bundled game-side payload (Pterodactyl)
+
+
+def _bundle_type():
+    """A pre-assembled bundle ships a one-line bundle_type.txt at its root (pterodactyl|local|
+    manual). When present the wizard scopes itself to that single type (no hosting chooser).
+    Absent (a dev / full-repo run) -> "" -> the original multi-option wizard."""
+    for p in (os.path.join(ROOT, "bundle_type.txt"), os.path.join(HERE, "bundle_type.txt")):
+        try:
+            with open(p, encoding="utf-8") as f:
+                t = f.read().strip().lower()
+            if t in ("pterodactyl", "local", "manual"):
+                return t
+        except OSError:
+            pass
+    return ""
+
+
+BUNDLE_TYPE = _bundle_type()
 
 try:
     import paramiko                               # optional: only needed for SFTP scenarios
@@ -112,7 +140,23 @@ def _preflight():
                 "detail": "Python %d.%d" % sys.version_info[:2]})
     out.append({"name": "paramiko (SFTP)",
                 "ok": paramiko is not None,
-                "detail": "available" if paramiko else "missing — needed only for external (SFTP) servers; pip install paramiko"})
+                "detail": "available" if paramiko else "missing — needed for external (SFTP) servers. Click 'Install Python packages' below."})
+    try:
+        import flask  # noqa: F401
+        _flask_ok = True
+    except Exception:                                    # noqa: BLE001
+        _flask_ok = False
+    out.append({"name": "Flask (web command centre)",
+                "ok": _flask_ok,
+                "detail": "available" if _flask_ok else "MISSING — the web dashboard won't start without it. Click 'Install Python packages' below."})
+    try:
+        import requests  # noqa: F401
+        _req_ok = True
+    except Exception:                                    # noqa: BLE001
+        _req_ok = False
+    out.append({"name": "requests",
+                "ok": _req_ok,
+                "detail": "available" if _req_ok else "missing — used by the bot/updater. Click 'Install Python packages' below."})
     out.append({"name": "Settings catalogue",
                 "ok": os.path.exists(CATALOGUE),
                 "detail": "%d settings" % len(_load_catalogue()) if os.path.exists(CATALOGUE) else "settings_catalogue.json not found next to the toolkit"})
@@ -132,12 +176,15 @@ def _test_sftp(p):
     if not host or not user:
         return {"ok": False, "error": "host and user are required"}
     try:
-        t = paramiko.Transport((host, port))
+        import socket as _sock
+        _s = _sock.create_connection((host, port), timeout=10)   # fail FAST on a wrong host/port
+        t = paramiko.Transport(_s)
+        t.banner_timeout = 15
         t.connect(username=user, password=pw)
         sftp = paramiko.SFTPClient.from_transport(t)
         listing = sftp.listdir(".")[:5]
         t.close()
-        return {"ok": True, "info": "connected; sample of remote files: " + ", ".join(listing) if listing else "connected (empty home)"}
+        return {"ok": True, "info": ("connected; sample of remote files: " + ", ".join(listing)) if listing else "connected (home looks empty)"}
     except Exception as e:                         # noqa: BLE001
         return {"ok": False, "error": str(e)}
 
@@ -266,6 +313,37 @@ def _generate_start_everything(game_dir, platform, web_port):
     return path
 
 
+def _place_local_gameside(game_dir, platform):
+    """Local bundle: copy the bundled BepInEx loader + plugin + missions from game-side/ into the
+    game folder so the local server boots modded. game-side/common/ ships the shared pieces
+    (BepInEx/core, BepInEx/plugins/NukeStats.dll, NuclearOption-Missions); game-side/<platform>/
+    ships the OS loader stub (Windows winhttp.dll+doorstop_config.ini, Linux libdoorstop.so+
+    run_bepinex.sh). Best-effort: silently no-ops if this isn't a bundle. Returns placed subdirs."""
+    import shutil
+    gs = os.path.join(ROOT, "game-side")
+    placed = []
+    if not os.path.isdir(gs):
+        return placed
+
+    def copytree(src, dst):
+        for base, _dirs, files in os.walk(src):
+            rel = os.path.relpath(base, src)
+            outd = dst if rel == "." else os.path.join(dst, rel)
+            os.makedirs(outd, exist_ok=True)
+            for fn in files:
+                shutil.copy2(os.path.join(base, fn), os.path.join(outd, fn))
+
+    for sub in ("common", platform):
+        src = os.path.join(gs, sub)
+        if os.path.isdir(src):
+            try:
+                copytree(src, game_dir)
+                placed.append(sub)
+            except OSError:
+                pass
+    return placed
+
+
 def _save(payload):
     scenario = payload.get("scenario", "external_linux")
     conn = payload.get("connection", {})
@@ -311,6 +389,7 @@ def _save(payload):
         rcmd = int(conn.get("rcmd_port") or 5504)
         plat = "windows" if _platform().startswith("win") else "linux"
         try:
+            config["server"]["gameside_placed"] = _place_local_gameside(game_dir, plat)
             script, logp = _generate_launch(game_dir, plat, rcmd)
             se = _generate_start_everything(game_dir, plat, int(payload.get("web_port") or 8770))
             launch = {"script": script, "log": logp, "start_everything": se}
@@ -534,6 +613,21 @@ def _api_open_folder(payload):
         return {"ok": False, "error": str(e)}
 
 
+def _api_install_deps(payload):
+    """Install the Python packages the toolkit needs (Flask for the web CC, paramiko for
+    SFTP, requests for the bot/updater) with pip. One click, so 'no module named flask' can't
+    happen."""
+    import subprocess
+    pkgs = ["flask", "paramiko", "requests"]
+    try:
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade"] + pkgs,
+                           capture_output=True, text=True, timeout=300)
+        tail = (r.stdout + "\n" + r.stderr).strip().splitlines()[-6:]
+        return {"ok": r.returncode == 0, "log": "\n".join(tail)}
+    except Exception as e:                               # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+
+
 def _api_run_launcher(payload):
     """Run a generated launcher (e.g. START EVERYTHING) on the user's machine."""
     path = (payload.get("path") or "").strip()
@@ -548,6 +642,164 @@ def _api_run_launcher(payload):
         return {"ok": True}
     except Exception as e:                               # noqa: BLE001
         return {"ok": False, "error": str(e)}
+
+
+# ---------- Pterodactyl bundle: SFTP deploy + admin-side wiring ----------
+def _write_power_files(conn):
+    """cc_web/the bot read Pterodactyl power creds from apiKey.txt + panel.txt next to them
+    (the bundle root = ROOT). Write them so power control works straight after install."""
+    panel = (conn.get("panel_url") or "").strip().rstrip("/")
+    key = (conn.get("api_key") or "").strip()
+    sid = (conn.get("server_id") or "").strip()
+    try:
+        if key:
+            kp = os.path.join(ROOT, "apiKey.txt")
+            with open(kp, "w", encoding="utf-8") as f:
+                f.write(key + "\n")
+            try:
+                os.chmod(kp, 0o600)
+            except OSError:
+                pass
+        if panel:
+            with open(os.path.join(ROOT, "panel.txt"), "w", encoding="utf-8") as f:
+                f.write(panel + "\n" + (sid + "\n" if sid else ""))
+    except OSError:
+        pass
+
+
+def _generate_admin_start_everything(root, platform, web_port):
+    """External (Pterodactyl) bundle: ONE launcher that starts the admin-side stack — the bot +
+    the web command centre — and opens the dashboard. The game itself runs in the container; the
+    web CC's power button (and the bot) drive it via the panel API. Mirrors the live admin START."""
+    if platform == "windows":
+        path = os.path.join(root, "START EVERYTHING.bat")
+        body = ("@echo off\r\n"
+                "cd /d \"%~dp0\"\r\n"
+                "echo Starting your Nuclear Option admin tools (bot + web command centre)...\r\n"
+                "powershell -NoProfile -Command \"Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'no_mapvote_bot.py|cc_web.py' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }\" 2>nul\r\n"
+                "start \"Nuke Option - Bot\" cmd /k python -u no_mapvote_bot.py\r\n"
+                "timeout /t 2 >nul\r\n"
+                "start \"Nuke Option - Web CC\" cmd /k python -u cc_web.py\r\n"
+                "timeout /t 3 >nul\r\n"
+                "start \"\" http://localhost:" + str(web_port) + "\r\n")
+    else:
+        path = os.path.join(root, "start_everything.sh")
+        body = ("#!/usr/bin/env bash\n"
+                "cd \"$(dirname \"$0\")\"\n"
+                "pkill -f 'no_mapvote_bot.py|cc_web.py' 2>/dev/null || true\n"
+                "(python3 -u no_mapvote_bot.py &)\n"
+                "sleep 2\n"
+                "(python3 -u cc_web.py &)\n"
+                "sleep 3\n"
+                "(xdg-open http://localhost:" + str(web_port) + " 2>/dev/null || true)\n")
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(body)
+    if platform != "windows":
+        try:
+            os.chmod(path, 0o755)
+        except OSError:
+            pass
+    return path
+
+
+def _write_admin_config(payload, conn, srv, features, gp, qp, relay_port):
+    """Write the admin-side config.json + secrets.json + power files + the START EVERYTHING
+    launcher for an external (Pterodactyl) install. Returns {start_everything: path}."""
+    config = {
+        "version": 1,
+        "scenario": "external_linux",
+        "server": {
+            "sftp_host": conn.get("sftp_host", ""),
+            "sftp_port": int(conn.get("sftp_port") or 2022),
+            "sftp_user": conn.get("sftp_user", ""),
+            "log_path": (conn.get("log_path") or "logs/console.log"),
+            "rcmd_host": (conn.get("rcmd_host") or conn.get("sftp_host") or ""),
+            "rcmd_port": relay_port,
+            "panel_url": conn.get("panel_url", ""),
+            "server_id": conn.get("server_id", ""),
+            "power": "pterodactyl",
+            "game_port": gp, "query_port": qp,
+            "server_name": srv.get("server_name", ""),
+            "max_players": int(srv.get("max_players") or 16),
+        },
+        "web": {"port": int(payload.get("web_port") or 8770)},
+        "features": features,
+        "update": {"github_repo": payload.get("github_repo", "TomosBombos/nuclear-option-toolkit"),
+                   "channel": payload.get("channel", "stable"),
+                   "auto_check": bool(payload.get("auto_check", False))},
+    }
+    _sid = (srv.get("admin_sid") or "").strip()
+    if _sid:
+        config["server"]["admin_sids"] = [_sid]
+    secret = {"sftp_pass": conn.get("sftp_pass", ""), "api_key": conn.get("api_key", "")}
+    _write_json_secure(CONFIG, config, secret=False)
+    _write_json_secure(SECRETS, secret, secret=True)
+    _write_power_files(conn)
+    # also keep a ready copy of the generated plugin cfg next to the config
+    try:
+        with open(os.path.join(USER_DIR, "anz.nukestats.cfg"), "w", encoding="utf-8") as f:
+            f.write(_render_plugin_cfg(features))
+    except OSError:
+        pass
+    plat = "windows" if _platform().startswith("win") else "linux"
+    se = _generate_admin_start_everything(ROOT, plat, int(payload.get("web_port") or 8770))
+    return {"start_everything": se}
+
+
+def _api_deploy(payload):
+    """Pterodactyl bundle: push the bundled game-side payload into the container over SFTP,
+    install the self-injecting launch wrapper, write the admin config + power creds, and
+    generate the admin START EVERYTHING launcher. Returns {ok, log, launch}."""
+    if _deployer is None or paramiko is None:
+        return {"ok": False, "error": "paramiko isn't installed yet — go back to Welcome and click "
+                "'Install Python packages', then retry."}
+    if not _serverconfig:
+        return {"ok": False, "error": "installer modules unavailable (serverconfig)"}
+    conn = payload.get("connection", {}) or {}
+    srv = payload.get("server", {}) or {}
+    features = payload.get("features", {}) or {}
+    game_side = os.path.join(ROOT, "game-side")
+    if not os.path.isdir(os.path.join(game_side, "container-root")):
+        return {"ok": False, "error": "this installer must be run from inside the downloaded "
+                "Pterodactyl bundle (game-side/container-root/ not found next to it)."}
+    sftp_params = dict(host=(conn.get("sftp_host") or "").strip(),
+                       port=int(conn.get("sftp_port") or 2022),
+                       user=(conn.get("sftp_user") or "").strip(),
+                       password=conn.get("sftp_pass") or "")
+    if not (sftp_params["host"] and sftp_params["user"] and sftp_params["password"]):
+        return {"ok": False, "error": "SFTP host, username and password are required — fill the "
+                "Connection step (your panel's Settings -> SFTP Details; the password is your "
+                "panel account password)."}
+    gp = int(srv.get("game_port") or 7777)
+    qp = int(srv.get("query_port") or 7778)
+    err = _serverconfig.validate_ports(gp, qp)
+    if err:
+        return {"ok": False, "error": err}
+    relay_port = int(conn.get("rcmd_port") or 5550)
+    server_cfg = dict(game_port=gp, query_port=qp, server_name=srv.get("server_name", ""),
+                      max_players=int(srv.get("max_players") or 16),
+                      password=srv.get("password", ""), relay_port=relay_port, framerate=60)
+    plugin_cfg_text = _render_plugin_cfg(features)
+    ptero = None
+    panel = (conn.get("panel_url") or "").strip().rstrip("/")
+    key = (conn.get("api_key") or "").strip()
+    if panel and key:
+        ptero = _deployer.Ptero(panel, key, (conn.get("server_id") or "").strip())
+    log = []
+
+    def prog(stage, msg):
+        log.append("[%s] %s" % (stage, msg))
+
+    try:
+        summary = _deployer.deploy(ROOT, sftp_params, server_cfg, plugin_cfg_text,
+                                   ptero=ptero, manage_power=bool(ptero), progress=prog)
+    except _deployer.DeployError as e:
+        return {"ok": False, "error": str(e), "log": "\n".join(log)}
+    except Exception as e:                               # noqa: BLE001
+        return {"ok": False, "error": "deploy failed: %s" % e, "log": "\n".join(log)}
+    launch = _write_admin_config(payload, conn, srv, features, gp, qp, relay_port)
+    return {"ok": True, "log": "\n".join(log), "summary": summary, "launch": launch,
+            "powered": bool(ptero)}
 
 
 # ----------------------------- HTTP server -----------------------------
@@ -576,7 +828,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             try:
                 with open(os.path.join(HERE, "wizard.html"), encoding="utf-8") as f:
-                    html = f.read().replace("__TOKEN__", TOKEN)
+                    html = f.read().replace("__TOKEN__", TOKEN).replace("__BUNDLE_TYPE__", BUNDLE_TYPE)
                 return self._send(200, html, "text/html; charset=utf-8")
             except OSError:
                 return self._send(500, "wizard.html missing", "text/plain")
@@ -619,6 +871,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             platform = "windows" if str(plat).startswith("win") else "linux"
             present = bool(_steamcmd.find_steamcmd(os.path.join(USER_DIR, "steamcmd"), platform)) if _steamcmd else False
             return self._send(200, json.dumps({"present": present}))
+        if path == "/api/bundle-info":
+            game_side = os.path.join(ROOT, "game-side", "container-root")
+            return self._send(200, json.dumps({"bundle_type": BUNDLE_TYPE,
+                                                "root": ROOT,
+                                                "game_side_present": os.path.isdir(game_side)}))
         return self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):
@@ -639,6 +896,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps(_save(payload)))
         if path == "/api/fetch":
             return self._send(200, json.dumps(_api_fetch(payload)))
+        if path == "/api/deploy":
+            return self._send(200, json.dumps(_api_deploy(payload)))
         if path == "/api/install-server":
             return self._send(200, json.dumps(_api_install_server(payload)))
         if path == "/api/install-steamcmd":
@@ -647,6 +906,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps(_api_open_folder(payload)))
         if path == "/api/run-launcher":
             return self._send(200, json.dumps(_api_run_launcher(payload)))
+        if path == "/api/install-deps":
+            return self._send(200, json.dumps(_api_install_deps(payload)))
         if path == "/api/shutdown":
             self._send(200, json.dumps({"ok": True}))
             if _SERVER is not None:
@@ -656,7 +917,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
-    port = _free_port()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=0, help="bind a fixed port (default: a free one)")
+    ap.add_argument("--no-browser", action="store_true", help="don't auto-open the browser")
+    a, _ = ap.parse_known_args()
+    port = a.port or int(os.environ.get("NOST_PORT") or 0) or _free_port()
     url = "http://127.0.0.1:%d/?t=%s" % (port, TOKEN)
     httpd = http.server.HTTPServer(("127.0.0.1", port), Handler)
     global _SERVER
@@ -664,7 +930,8 @@ def main():
     print("Nuke Option setup wizard — open this in your browser if it doesn't pop up:")
     print("   " + url)
     print("(Ctrl+C to stop.)  User data dir: " + USER_DIR)
-    threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    if not a.no_browser:
+        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
