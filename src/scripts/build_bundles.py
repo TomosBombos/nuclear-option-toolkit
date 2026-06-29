@@ -163,6 +163,13 @@ def _stage_admin(clean, bundle, spec):
             _copy(src, os.path.join(bundle, "installer", name))
         else:
             print("  [warn] installer/%s not in clean tree" % name)
+    # the updater's trust root (minisign public key) must ship in EVERY bundle so the opt-in
+    # updater can verify signed releases before applying them.
+    tp = os.path.join(clean, "installer", "trusted.pub")
+    if os.path.exists(tp):
+        _copy(tp, os.path.join(bundle, "installer", "trusted.pub"))
+    else:
+        print("  [warn] installer/trusted.pub missing — bundled updater can't verify signatures")
     # license + a couple of reference docs
     if os.path.exists(os.path.join(clean, "LICENSE")):
         _copy(os.path.join(clean, "LICENSE"), os.path.join(bundle, "LICENSE"))
@@ -365,6 +372,7 @@ def main(argv=None):
         elif btype == "manual":
             stage_manual(clean, bundle, warnings)
         _entrypoints(bundle, btype)
+        _write(os.path.join(bundle, "bundle_version.txt"), version + "\n")   # install-time baseline for the updater
         _write(os.path.join(bundle, "README.md"), _readme(btype, version))
 
         hard, warn = bpr.scan(bundle)

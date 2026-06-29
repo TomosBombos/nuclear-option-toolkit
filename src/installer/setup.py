@@ -392,6 +392,27 @@ def _place_local_gameside(game_dir, platform):
     return placed
 
 
+def _stamp_versions():
+    """Record the installed component versions so the opt-in updater can report installed-vs-available
+    accurately from the first run. A bundle ships bundle_version.txt; we stamp deployed_plugin.json +
+    deployed_bot.json with it. (For Pterodactyl the plugin is what we just pushed; for local it's what
+    we just copied — both equal the bundle version.)"""
+    v = ""
+    try:
+        with open(os.path.join(ROOT, "bundle_version.txt"), encoding="utf-8") as f:
+            v = f.read().strip()
+    except OSError:
+        return
+    if not v:
+        return
+    for name in ("deployed_plugin.json", "deployed_bot.json"):
+        try:
+            with open(os.path.join(ROOT, name), "w", encoding="utf-8") as f:
+                json.dump({"version": v.lstrip("v")}, f, indent=2)
+        except OSError:
+            pass
+
+
 def _apply_options(config, payload):
     """Map the wizard's 3 simple Options toggles onto config flags. The actual advertise-upload,
     global-leaderboard hook and auto-update pipelines are owned elsewhere (OPS) — this just
@@ -496,6 +517,7 @@ def _save(payload):
                 dsc.append(p2)
         except ValueError as e:
             dsc.append("PORTS INVALID: %s" % e)
+    _stamp_versions()
     return {"ok": True, "config_path": CONFIG, "secrets_path": SECRETS, "cfg_path": cfg_path,
             "dedicated_config": dsc, "launch": launch}
 
@@ -809,6 +831,7 @@ def _write_admin_config(payload, conn, srv, features, gp, qp, relay_port):
         pass
     plat = "windows" if _platform().startswith("win") else "linux"
     se = _generate_admin_start_everything(ROOT, plat, int(payload.get("web_port") or 8770))
+    _stamp_versions()
     return {"start_everything": se}
 
 
