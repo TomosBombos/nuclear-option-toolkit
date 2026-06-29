@@ -2,8 +2,6 @@
 
 This feature set is for those wanting to easily manage their dedicated servers with some additional features that add a ranking system, improve performance and moderation tools. As well as some other things like a live map because why not?
 
-> *On the name: the command centre — and the project as a whole — goes by **Nuke-Option**. Under the hood the package keeps its original name, the **nuclear-option toolkit** (the repo, the file names, the bundles); renaming all of that now would break existing installs and download links, and frankly felt wrong this late. So "toolkit" stays under the hood while **Nuke-Option** is the face of it.*
-
 It's three cooperating pieces — a server-side **plugin** (BepInEx/Harmony), a **bot** that
 runs on your PC, and a **web command centre** in your browser. They talk only through the
 game's log, a relay, and shared files, so any one can restart without taking the others down.
@@ -150,21 +148,27 @@ You're never auto-updated — you update when *you* want to. Two ways:
 
 ### In-place way — pull just the changed files (no re-download)
 
-From the folder where your toolkit lives:
+Run these from a terminal opened **inside your toolkit folder** — the folder you unzipped, the one
+that contains `install.bat`, the `installer` folder, and `START EVERYTHING.bat`.
+*(On Windows: open that folder in File Explorer, click the address bar, type `powershell`, press Enter — that opens a terminal already in the folder.)*
 
-1. **Check what's available** on your channel:
-   ```bash
-   python installer/updater.py check
+1. **See what's available** on your channel:
    ```
-2. **Download + verify + stage** it (checks the SHA-256 and the signature before staging):
-   ```bash
-   python installer/updater.py update --component all
+   python installer\updater.py check
    ```
-3. **Apply it** — nothing changes on your server until this step:
-   - **Plugin:** `run.bat --deploy-plugin` (Pterodactyl/external) or restart your server (local).
-   - **Bot:** `python installer/updater.py update --component bot --apply`, then restart the bot.
+2. **Download + verify + stage** it (it checks the SHA-256 and the signature before staging anything):
+   ```
+   python installer\updater.py update --component all
+   ```
+3. **Apply it** — nothing on your server changes until this step:
+   - **Plugin** → deploy it: `run.bat --deploy-plugin` (Pterodactyl/external — `run.bat` is in this same folder), or just restart your server (local PC).
+   - **Bot** → install the new bot file:
+     ```
+     python installer\updater.py update --component bot --apply
+     ```
+     then **restart the bot so it loads the new version** — double-click **`START EVERYTHING.bat`** in this folder (or close the bot's window and run it again).
 
-*(From a git clone rather than a downloaded bundle, the path is `src/installer/updater.py`.)*
+*(macOS/Linux: use `/` instead of `\`. From a git clone rather than a downloaded bundle, the path is `src/installer/updater.py`.)*
 
 **Channel:** in `~/.nuke-option-toolkit/config.json` set `update.channel` to `"stable"` (default —
 polished releases) or `"nightly"` (latest build, less tested). Every download is signature-checked
@@ -176,11 +180,7 @@ Servers running the toolkit that have opted into the public directory. Find them
 in-game server browser (Nuclear Option has no direct-connect). This list updates automatically every hour.
 
 <!-- COMMUNITY-SERVERS:START -->
-**1 server** running the toolkit &nbsp; ([full directory ↗](https://tomosbombos.github.io/nuclear-option-servers/))
-
-| Server | Region | Plugin |
-|---|---|---|
-| Tomo's Co-Op/PvP Mission Vote \| OCE \| 60hz \| Ranked \| no-TKs | Oceania | v0.9.14 |
+_Loading the live list…_ &nbsp; ([full directory ↗](https://tomosbombos.github.io/nuclear-option-servers/))
 <!-- COMMUNITY-SERVERS:END -->
 
 **Running a server?** Enable *List Server Publicly* in the command centre's settings to appear here —

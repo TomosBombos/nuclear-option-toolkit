@@ -393,10 +393,10 @@ def _place_local_gameside(game_dir, platform):
 
 
 def _stamp_versions():
-    """Record the installed component versions so the opt-in updater can report installed-vs-available
-    accurately from the first run. A bundle ships bundle_version.txt; we stamp deployed_plugin.json +
-    deployed_bot.json with it. (For Pterodactyl the plugin is what we just pushed; for local it's what
-    we just copied — both equal the bundle version.)"""
+    """Record the installed TOOLKIT version so the opt-in updater reports up-to-date / update-available
+    accurately from the first run. A bundle ships bundle_version.txt (the toolkit version, e.g. 1.0);
+    we stamp it into deployed_toolkit.json. (deployed_plugin.json is owned by the bot's deploy and holds
+    the plugin's own version, for the directory listing — kept separate.)"""
     v = ""
     try:
         with open(os.path.join(ROOT, "bundle_version.txt"), encoding="utf-8") as f:
@@ -405,12 +405,11 @@ def _stamp_versions():
         return
     if not v:
         return
-    for name in ("deployed_plugin.json", "deployed_bot.json"):
-        try:
-            with open(os.path.join(ROOT, name), "w", encoding="utf-8") as f:
-                json.dump({"version": v.lstrip("v")}, f, indent=2)
-        except OSError:
-            pass
+    try:
+        with open(os.path.join(ROOT, "deployed_toolkit.json"), "w", encoding="utf-8") as f:
+            json.dump({"version": v.lstrip("v")}, f, indent=2)
+    except OSError:
+        pass
 
 
 def _apply_options(config, payload):

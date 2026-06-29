@@ -46,6 +46,19 @@ sys.path.insert(0, os.path.join(ROOT, "installer"))
 import build_public_repo as bpr        # the clean-room builder/scrubber/scanner (reused)
 import serverconfig                     # DedicatedServerConfig template
 
+
+def _toolkit_version():
+    """The TOOLKIT version (the marker for releases + bundles) — NOT the plugin version.
+    Read from the VERSION file at the repo root; first stable is 1.0."""
+    try:
+        with open(os.path.join(ROOT, "VERSION"), encoding="utf-8") as f:
+            v = f.read().strip().lstrip("v")
+        if v:
+            return v
+    except OSError:
+        pass
+    return bpr._plugin_version()          # fallback if VERSION is missing
+
 # Binary assets the CLEAN public tree excludes — taken from the SOURCE repo.
 SRC_BEPINEX_LINUX = os.path.join(ROOT, "NukeStats", "bepinex_pack")          # libdoorstop.so + core
 SRC_BEPINEX_WIN = os.path.join(ROOT, "NukeStats", "bepinex_pack_win")        # winhttp.dll + doorstop_config.ini (vendored)
@@ -337,7 +350,7 @@ def main(argv=None):
     out = os.path.abspath(a.out)
     if out == ROOT or out.startswith(ROOT + os.sep):
         raise SystemExit("--out must be OUTSIDE the source repo")
-    version = a.version or bpr._plugin_version()
+    version = a.version or _toolkit_version()
     types = [t.strip() for t in a.types.split(",") if t.strip()]
     for t in types:
         if t not in BUNDLES:
@@ -358,7 +371,7 @@ def main(argv=None):
     warnings = []
     for btype in types:
         spec = BUNDLES[btype]
-        top = "nuclear-option-toolkit-%s" % btype
+        top = "nuclear-option-toolkit-%s-%s" % (btype, version)   # versioned folder
         bundle = os.path.join(out, top)
         if os.path.exists(bundle):
             shutil.rmtree(bundle)
@@ -386,8 +399,8 @@ def main(argv=None):
         print("  scan CLEAN, %d files" % nfiles)
 
         if not a.check:
-            top = "nuclear-option-toolkit-%s" % btype
-            # version-less asset name so the README can use a stable /releases/latest/download/ link
+            # `top` (set above) is the versioned in-zip folder, e.g. nuclear-option-toolkit-pterodactyl-1.0;
+            # the ZIP NAME stays version-less so the README can use a stable /releases/latest/download/ link.
             zp = os.path.join(out, "nuclear-option-toolkit-%s.zip" % btype)
             zip_bundle(bundle, zp, top)
             sha = _sha256(zp)

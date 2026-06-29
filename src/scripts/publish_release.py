@@ -109,7 +109,7 @@ def main(argv=None):
     out = os.path.abspath(a.out)
     if out == ROOT or out.startswith(ROOT + os.sep):
         raise SystemExit("--out must be OUTSIDE the source repo")
-    version = (a.version or bpr._plugin_version()).lstrip("v")
+    version = (a.version or bb._toolkit_version()).lstrip("v")   # TOOLKIT version (1.0+), not the plugin's
     date = a.date
     if a.channel == "nightly" and not date:
         import datetime

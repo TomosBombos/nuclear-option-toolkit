@@ -82,6 +82,28 @@ def _deployed_version(comp):
         return ""
 
 
+TOOLKIT_DEPLOYED = os.path.join(ROOT, "deployed_toolkit.json")
+
+
+def _toolkit_installed():
+    """The installed TOOLKIT version — stamped at install + bumped on apply. The single version the
+    updater compares against the latest release tag (releases are tagged by the toolkit version, e.g.
+    v1.0). Separate from deployed_plugin.json, which the bot owns for the plugin's own version."""
+    try:
+        with open(TOOLKIT_DEPLOYED, encoding="utf-8") as f:
+            return str((json.load(f) or {}).get("version", "") or "")
+    except (OSError, ValueError):
+        return ""
+
+
+def _set_toolkit_installed(version):
+    try:
+        with open(TOOLKIT_DEPLOYED, "w", encoding="utf-8") as f:
+            json.dump({"version": str(version).lstrip("v")}, f, indent=2)
+    except OSError:
+        pass
+
+
 def _vt(v):
     """Loose semver tuple for comparison; non-numeric parts ignored."""
     out = []
@@ -148,22 +170,19 @@ def check(components=("plugin", "bot"), channel_override=None, verbose=True):
         print("No %s release found for %s." % (channel, repo))
         return None
     latest = rel.get("tag_name") or rel.get("name") or ""
-    out = {"repo": repo, "channel": channel, "release": rel, "latest": latest, "components": {}}
-    if verbose:
-        print("Repo:     %s  (%s channel)" % (repo, channel))
-        print("Latest:   %s" % latest)
+    installed = _toolkit_installed()
+    newer = _vt(latest) > _vt(installed)
+    out = {"repo": repo, "channel": channel, "release": rel, "latest": latest,
+           "installed": installed, "newer": newer, "components": {}}
     for comp in components:
-        asset = COMPONENTS[comp]["asset"]
-        have = _deployed_version(comp)
-        present = _asset(rel, asset) is not None
-        newer = present and _vt(latest) > _vt(have)
-        out["components"][comp] = {"installed": have, "newer": newer, "in_release": present}
-        if verbose:
-            tag = ("<- UPDATE" if newer else ("(up to date)" if present else "(not in this release)"))
-            print("  %-7s installed %-10s  %s" % (comp, have or "(unknown)", tag))
-    if verbose and rel.get("body") and any(c["newer"] for c in out["components"].values()):
-        print("\nRelease notes:\n" + "\n".join("  " + ln for ln in rel["body"].splitlines()[:25]))
-        print("\nRun `python updater.py update --component all` to download + verify + stage.")
+        out["components"][comp] = {"in_release": _asset(rel, COMPONENTS[comp]["asset"]) is not None}
+    if verbose:
+        print("Repo:      %s  (%s channel)" % (repo, channel))
+        print("Installed: %s" % (installed or "(unknown)"))
+        print("Latest:    %s   %s" % (latest, "<-- UPDATE AVAILABLE" if newer else "(up to date)"))
+        if newer and rel.get("body"):
+            print("\nRelease notes:\n" + "\n".join("  " + ln for ln in rel["body"].splitlines()[:25]))
+            print("\nRun `python updater.py update --component all` to download + verify + stage.")
     return out
 
 
@@ -279,14 +298,15 @@ def update(components=("plugin",), channel_override=None, do_deploy=False, do_ap
     if not info:
         return
     rel, latest, repo = info["release"], info["latest"], info["repo"]
+    if not info.get("newer"):
+        print("Already up to date — installed %s, latest %s (%s channel)."
+              % (info.get("installed") or "?", latest, info["channel"]))
+        return
     did = []
     for comp in components:
         st = info["components"].get(comp, {})
         if not st.get("in_release"):
             print("- %s: not in the latest %s release — skipping." % (comp, info["channel"]))
-            continue
-        if not st.get("newer"):
-            print("- %s: already up to date (%s)." % (comp, st.get("installed")))
             continue
         asset = COMPONENTS[comp]["asset"]
         url = _asset(rel, asset)
@@ -307,6 +327,9 @@ def update(components=("plugin",), channel_override=None, do_deploy=False, do_ap
             print("plugin: run.bat not found — run your deploy command to apply it.")
     if "bot" in did and do_apply:
         _apply_bot(latest)
+    if did and (do_deploy or do_apply):
+        _set_toolkit_installed(latest)
+        print("Toolkit now marked as %s (what 'up to date' checks against)." % latest)
     if did and not (do_deploy or do_apply):
         print("\nStaged only. Apply when ready: plugin -> run.bat --deploy-plugin ; bot -> update --component bot --apply")
 
