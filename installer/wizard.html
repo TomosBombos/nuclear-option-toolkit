@@ -44,9 +44,9 @@ const TOKEN="__TOKEN__";
 // A pre-assembled bundle injects its type here; absent => the full multi-option wizard.
 let BUNDLE_TYPE="__BUNDLE_TYPE__"; if(BUNDLE_TYPE.indexOf("__")===0)BUNDLE_TYPE="";
 const BUNDLES={
-  pterodactyl:{steps:["Welcome","Server","Connection","Features","Install"],scenario:"external_linux"},
-  local:      {steps:["Welcome","Server","Connection","Features","Install"],scenario:"own_pc"},
-  manual:     {steps:["Welcome","Server","Connection","Features","Install"],scenario:"manual"},
+  pterodactyl:{steps:["Welcome","Server","Connection","Options","Install"],scenario:"external_linux"},
+  local:      {steps:["Welcome","Server","Connection","Options","Install"],scenario:"own_pc"},
+  manual:     {steps:["Welcome","Server","Connection","Options","Install"],scenario:"manual"},
 };
 const _B=BUNDLES[BUNDLE_TYPE]||{steps:["Welcome","Hosting","Server","Connection","Features","Files","Review"],scenario:"external_linux"};
 const S=_B.steps;
@@ -100,6 +100,7 @@ async function render(){
   else if(name==="Server"){ renderServer(p); }
   else if(name==="Connection"){ renderConnection(p); }
   else if(name==="Features"){ await renderFeatures(p); }
+  else if(name==="Options"){ await renderOptions(p); }
   else if(name==="Files"){ await renderFiles(p); }
   else if(name==="Review"){ renderReview(p); }
   else if(name==="Install"){ renderInstall(p); }
@@ -143,8 +144,8 @@ function renderConnection(p){
       +'<button class="go" onclick="testSftp(this)">Test SFTP</button> <span id="sftpmsg" class="msg"></span>'
       +'<div class="grp" style="margin-top:14px">Power control (restart the server)</div>'
       +fh('panel_url','Panel URL','https://panel.yourhost.net','text',
-          'Your panel\'s web address — lets the installer stop/start the server around the upload.',
-          'The URL in your browser when you\'re logged into the panel (just the <code>https://...</code> host part).')
+          'Your panel\'s base web address — lets the installer stop/start the server around the upload.',
+          'The address bar when you\'re logged into the panel, but <b>only up to the domain — delete everything from <code>/server</code> onward</b>. e.g. if you see <code>https://panel.host.net/server/abcd1234</code>, enter just <code>https://panel.host.net</code>. Keep the <code>https://</code>. (The <code>abcd1234</code> part is the Server ID field below.)')
       +fh('api_key','Pterodactyl CLIENT API key','ptlc_…','password',
           'A token that lets the toolkit power your server on/off. Must be a <b>client</b> key (starts <code>ptlc_</code>), not an application key.',
           'Panel → <b>Account → API Credentials → Create</b>. Copy the key it shows once.')
@@ -259,6 +260,26 @@ async function pickLogFile(btn){btn.disabled=true;
   let r;try{r=await api('/api/pick-file?initial='+encodeURIComponent(init));}catch(e){r={};}
   btn.disabled=false;
   if(r&&r.ok&&r.path){state.connection.log_path=r.path;render();}}
+
+async function renderOptions(p){
+  // Silently set the plugin to the full community defaults (the user tunes settings later in
+  // the web command centre). We still load the catalogue so the generated cfg is complete.
+  if(!state.catalogue.length){const r=await api('/api/catalogue');state.catalogue=r.settings||[];
+    for(const s of state.catalogue){if(s.type==='toggle' && state.features[s.key]===undefined){state.features[s.key]=(String(s.default).toLowerCase()==='true');}}
+  }
+  if(state.options===undefined)state.options={auto_update:true,leaderboard:true,advertise:true};
+  const o=state.options;
+  // Wire the two community toggles to the plugin-config keys the global-leaderboard code reads.
+  state.features['Global.Enabled']=!!o.leaderboard;
+  state.features['Global.ListServer']=!!o.advertise;
+  const tog=(k,label,desc)=>'<div class="feat"><div class="meta"><b>'+label+'</b><div class="hint">'+desc+'</div></div>'
+    +'<button class="tg '+(o[k]?'on':'off')+'" onclick="state.options[\''+k+'\']='+(!o[k])+';renderOptions(document.getElementById(\'panel\'))">'+(o[k]?'ON':'OFF')+'</button></div>';
+  p.innerHTML='<div class="card"><div class="hint">Your server ships ready-to-go with the full community setup — ranks, economy, skill ratings, team balance, anti-grief, the live map and more. You can fine-tune <b>every</b> plugin setting later in the web command centre, so there\'s nothing to configure here except these few choices:</div>'
+    +tog('auto_update','Automatic updates','Get new plugin + bot versions when they\'re released. (You still choose when to apply them.)')
+    +tog('leaderboard','Global cross-server leaderboard','Take part in the shared leaderboard across all community servers running this toolkit. Recommended.')
+    +tog('advertise','List my server publicly','Add my server to the public server directory on GitHub so players can find &amp; join it.')
+    +'<div class="hint" style="margin-top:10px">All three are optional and can be changed any time later.</div></div>';
+}
 
 const PRESETS={
   full:{name:'Full community',set:{}},   // all defaults (everything on)

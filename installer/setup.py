@@ -392,6 +392,22 @@ def _place_local_gameside(game_dir, platform):
     return placed
 
 
+def _apply_options(config, payload):
+    """Map the wizard's 3 simple Options toggles onto config flags. The actual advertise-upload,
+    global-leaderboard hook and auto-update pipelines are owned elsewhere (OPS) — this just
+    records the user's intent so those pipelines can read it."""
+    opts = payload.get("options") or {}
+    config.setdefault("update", {})
+    config["update"]["auto_check"] = bool(opts.get("auto_update", payload.get("auto_check", False)))
+    if not config["update"].get("github_repo"):
+        config["update"]["github_repo"] = payload.get("github_repo") or "TomosBombos/nuclear-option-toolkit"
+    config["update"].setdefault("channel", payload.get("channel", "stable"))
+    # The leaderboard + advertise toggles are written into the plugin cfg as Global.Enabled /
+    # Global.ListServer (which the global-leaderboard code reads), not here — see the wizard's
+    # Options step. We only record auto-update at config level.
+    return config
+
+
 def _save(payload):
     scenario = payload.get("scenario", "external_linux")
     conn = payload.get("connection", {})
@@ -456,6 +472,7 @@ def _save(payload):
         "sftp_pass": conn.get("sftp_pass", ""),
         "api_key": conn.get("api_key", ""),
     }
+    _apply_options(config, payload)
     _write_json_secure(CONFIG, config, secret=False)
     _write_json_secure(SECRETS, secret, secret=True)
     # also drop a ready-to-upload BepInEx cfg next to the config
@@ -779,6 +796,7 @@ def _write_admin_config(payload, conn, srv, features, gp, qp, relay_port):
     _sid = (srv.get("admin_sid") or "").strip()
     if _sid:
         config["server"]["admin_sids"] = [_sid]
+    _apply_options(config, payload)
     secret = {"sftp_pass": conn.get("sftp_pass", ""), "api_key": conn.get("api_key", "")}
     _write_json_secure(CONFIG, config, secret=False)
     _write_json_secure(SECRETS, secret, secret=True)

@@ -1,9 +1,6 @@
-# Nuclear Option — Community Server Toolkit
+# Nuke-Option — Community Server Toolkit
 
-Turn a vanilla *Nuclear Option* dedicated server into a managed community server:
-persistent ranks, a real-score economy, skill ratings, PvP team balance (with new-joiner
-& squad protection), anti-grief enforcement, a flood-disconnect guard, a live battle map,
-and a browser admin console where you can change every setting **live**.
+This feature set is for those wanting to easily manage their dedicated servers with some additional features that add a ranking system, improve performance and moderation tools. As well as some other things like a live map because why not?
 
 It's three cooperating pieces — a server-side **plugin** (BepInEx/Harmony), a **bot** that
 runs on your PC, and a **web command centre** in your browser. They talk only through the
@@ -16,11 +13,15 @@ plugin, all 18 missions, the bot, and the web command centre. Grab the one that 
 your server is hosted, unzip it, and run the installer inside it. The installer asks for your
 details (each field explains **what it is** and **where to find it**) and wires everything up.
 
-| Your setup | Download | What you do |
-|---|---|---|
-| **Pterodactyl panel** (hosted Linux) | **[⬇ Pterodactyl bundle](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-pterodactyl.zip)** | Unzip → run `install.bat` (or `./install.sh`) → enter your panel's SFTP + API details → it pushes the plugin, missions and config to your server over SFTP and makes it boot modded. Then launch the bot + dashboard. |
-| **Your own PC** (Windows / Linux) | **[⬇ Local bundle](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-local.zip)** | Unzip → run `install.bat` → it installs the dedicated server (SteamCMD), copies the toolkit in, and launches server + bot + dashboard together. |
-| **Hosting by hand / other** | **[⬇ Manual bundle](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-manual.zip)** | Unzip → follow `README.md` to drag the files into place (both BepInEx packs included); the installer writes your config. |
+> **Which is tested?** ✅ **Pterodactyl is working and tested end-to-end.** ⚠️ The **Local**
+> (own-PC) and **Manual** (drag-and-drop) options are built but only lightly tested so far —
+> they should work, but expect rough edges and please report anything that doesn't.
+
+| Your setup | Status | Download | What you do |
+|---|---|---|---|
+| **Pterodactyl panel** (hosted Linux) | ✅ Working | **[⬇ Pterodactyl bundle](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-pterodactyl.zip)** | Unzip → run `install.bat` (or `./install.sh`) → enter your panel's SFTP + API details → it pushes the plugin, missions and config to your server over SFTP and makes it boot modded. Then launch the bot + dashboard. |
+| **Your own PC** (Windows / Linux) | ⚠️ Beta (lightly tested) | **[⬇ Local bundle](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-local.zip)** | Unzip → run `install.bat` → it installs the dedicated server (SteamCMD), copies the toolkit in, and launches server + bot + dashboard together. |
+| **Hosting by hand / other** | ⚠️ Beta (lightly tested) | **[⬇ Manual bundle](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-manual.zip)** | Unzip → follow `README.md` to drag the files into place (both BepInEx packs included); the installer writes your config. |
 
 > All downloads live on the **[Releases page](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest)**.
 > You only need **Python 3.8+** installed first. Prefer to clone the repo and run the
@@ -152,11 +153,12 @@ Maintainers publish with `scripts/release.py` (`--with-bot`, `--channel`). See *
 ## Community Servers
 
 Servers running the toolkit that have opted into the public directory — find them by **name** in the
-in-game server browser (Nuclear Option has no direct-connect).
+in-game server browser (Nuclear Option has no direct-connect). **Status** refreshes about every 4 hours
+(a server shows online if it checked in on the latest update).
 
-| Server | Region |
-|--------|--------|
-| *coming soon* | |
+| Server | Region | Status |
+|--------|--------|--------|
+| *coming soon* | | |
 
 **Running a server?** Enable listing in the command centre's settings to appear here (name + region
 only — never your IP).
