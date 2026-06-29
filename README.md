@@ -132,19 +132,41 @@ More detail: **[src/installer/README.md](src/installer/README.md)**.
 > [open an issue](https://github.com/TomosBombos/nuclear-option-toolkit/issues) with what
 > you hit so we can harden it.
 
-## Updating (opt-in)
+## Updating
 
-Pull fixes when *you* choose — the **plugin and the bot**, on a **stable** or **nightly** channel:
+You're never auto-updated — you update when *you* want to. Two ways:
 
-```bash
-python src/installer/updater.py check                    # what's available on your channel?
-python src/installer/updater.py update --component all    # download + verify (SHA-256 + minisign) + stage
-```
+### Easy way — re-download and re-run the installer
 
-Pick your channel in `~/.nuke-option-toolkit/config.json` (`update.channel`: `"stable"` or
-`"nightly"`). **Verify-before-apply is mandatory** and nothing is applied until you choose to
-deploy (plugin → `run.bat --deploy-plugin`; bot → `update --component bot --apply`).
-Maintainers publish with `src/scripts/release.py` (`--with-bot`, `--channel`). See **[SECURITY.md](SECURITY.md)**.
+1. **Download the latest stable** for your server type:
+   - ⬇ **[Pterodactyl](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-pterodactyl.zip)**
+   - ⬇ **[Local](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-local.zip)**
+   - ⬇ **[Manual](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-manual.zip)**
+   - *(These links always point at the current **stable**. All versions: the [Releases page](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest).)*
+2. **Unzip it.**
+3. **Run the installer again** — `install.bat` (Windows) or `./install.sh` (macOS/Linux). It re-deploys the new plugin + bot and restarts. Your config, ranks and settings are kept.
+
+### In-place way — pull just the changed files (no re-download)
+
+From the folder where your toolkit lives:
+
+1. **Check what's available** on your channel:
+   ```bash
+   python installer/updater.py check
+   ```
+2. **Download + verify + stage** it (checks the SHA-256 and the signature before staging):
+   ```bash
+   python installer/updater.py update --component all
+   ```
+3. **Apply it** — nothing changes on your server until this step:
+   - **Plugin:** `run.bat --deploy-plugin` (Pterodactyl/external) or restart your server (local).
+   - **Bot:** `python installer/updater.py update --component bot --apply`, then restart the bot.
+
+*(From a git clone rather than a downloaded bundle, the path is `src/installer/updater.py`.)*
+
+**Channel:** in `~/.nuke-option-toolkit/config.json` set `update.channel` to `"stable"` (default —
+polished releases) or `"nightly"` (latest build, less tested). Every download is signature-checked
+before it can be applied — see **[SECURITY.md](SECURITY.md)**.
 
 ## Community Servers
 
