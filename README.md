@@ -9,19 +9,39 @@ It's three cooperating pieces: a server-side **plugin** (BepInEx/Harmony), a **b
 runs on your PC, and a **web command centre** in your browser. They talk only through the
 game's log + a relay + shared files, so any one can restart without taking the others down.
 
-## Quick start
+## Get started
 
+**Prerequisites:** [Python 3.8+](https://www.python.org/downloads/) (on Windows, tick
+*"Add Python to PATH"* during install). For the external / SFTP hosting options, also
+`pip install paramiko`.
+
+**1. Download the toolkit**
+
+With git:
+```bash
+git clone https://github.com/TomosBombos/nuclear-option-toolkit.git
+cd nuclear-option-toolkit
+```
+No git? On this page click the green **`< > Code ▾` → Download ZIP**, extract it, and open a
+terminal in the extracted folder.
+
+**2. Run the guided installer**
 ```bash
 python installer/setup.py
 ```
-
-A guided, **offline** wizard opens in your browser: it checks prerequisites, asks where your
-server runs (your own PC / external Linux / external Windows), takes your connection details,
-lets you pick which plugin features you want, and writes a clean config — your credentials
-stay on your machine and never enter the repo. See **[installer/README.md](installer/README.md)**.
+(On Windows you may need `py installer\setup.py`.) A wizard opens in your browser: it checks
+prerequisites, asks where your server runs (your own PC / external Linux-Pterodactyl /
+external Windows), takes your connection details, lets you pick which plugin features you
+want, fetches the right files, and writes a clean config. **Your credentials stay on your
+machine and never enter the repo.** More detail: **[installer/README.md](installer/README.md)**.
 
 > Prefer to wire it up by hand? Copy `run.bat.example` → `run.bat`, `apiKey.txt.example` →
 > `apiKey.txt`, `panel.txt.example` → `panel.txt`, fill in your values, then run `run.bat`.
+
+> ⚠️ **Early / iterating.** The guided installer is under active development. If a step
+> doesn't yet complete end-to-end on your setup, the manual path above works — please
+> [open an issue](https://github.com/TomosBombos/nuclear-option-toolkit/issues) with what
+> you hit so we can harden it.
 
 ## Documentation
 
@@ -45,14 +65,17 @@ stay on your machine and never enter the repo. See **[installer/README.md](insta
 
 ## Updating (opt-in)
 
-Once installed, pull plugin fixes when *you* choose:
+Pull fixes when *you* choose — the **plugin and the bot**, on a **stable** or **nightly** channel:
 
 ```bash
-python installer/updater.py check     # is there a newer plugin?
-python installer/updater.py update    # download + verify (SHA-256 + minisign) + stage it
+python installer/updater.py check                    # what's available on your channel?
+python installer/updater.py update --component all    # download + verify (SHA-256 + minisign) + stage
 ```
 
-Maintainers publish signed releases with `scripts/release.py`. See **[SECURITY.md](SECURITY.md)**.
+Pick your channel in `~/.nuke-option-toolkit/config.json` (`update.channel`: `"stable"` or
+`"nightly"`). **Verify-before-apply is mandatory** and nothing is applied until you choose to
+deploy (plugin → `run.bat --deploy-plugin`; bot → `update --component bot --apply`).
+Maintainers publish with `scripts/release.py` (`--with-bot`, `--channel`). See **[SECURITY.md](SECURITY.md)**.
 
 ## Status
 
