@@ -34,6 +34,12 @@ import sys
 import urllib.request
 import urllib.error
 
+for _s in (sys.stdout, sys.stderr):                   # never crash printing on a cp1252 console
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 USER_DIR = os.environ.get("NOST_DATA_DIR") or os.path.join(os.path.expanduser("~"), ".nuke-option-toolkit")
@@ -153,7 +159,7 @@ def check(components=("plugin", "bot"), channel_override=None, verbose=True):
         newer = present and _vt(latest) > _vt(have)
         out["components"][comp] = {"installed": have, "newer": newer, "in_release": present}
         if verbose:
-            tag = ("← UPDATE" if newer else ("(up to date)" if present else "(not in this release)"))
+            tag = ("<- UPDATE" if newer else ("(up to date)" if present else "(not in this release)"))
             print("  %-7s installed %-10s  %s" % (comp, have or "(unknown)", tag))
     if verbose and rel.get("body") and any(c["newer"] for c in out["components"].values()):
         print("\nRelease notes:\n" + "\n".join("  " + ln for ln in rel["body"].splitlines()[:25]))

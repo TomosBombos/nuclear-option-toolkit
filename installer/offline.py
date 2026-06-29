@@ -17,6 +17,12 @@ import json
 import os
 import sys
 
+for _s in (sys.stdout, sys.stderr):                   # never crash printing on a cp1252 console
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 MANIFEST = os.path.join(HERE, "sources.json")
 LOCKFILE = os.path.join(HERE, "sources.lock.json")

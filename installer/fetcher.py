@@ -25,6 +25,12 @@ import urllib.parse
 import urllib.request
 import urllib.error
 
+for _s in (sys.stdout, sys.stderr):                   # never crash printing on a cp1252 console
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 MANIFEST = os.path.join(HERE, "sources.json")
