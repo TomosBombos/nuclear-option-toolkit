@@ -2,6 +2,8 @@
 
 This feature set is for those wanting to easily manage their dedicated servers with some additional features that add a ranking system, improve performance and moderation tools. As well as some other things like a live map because why not?
 
+> *On the name: the command centre — and the project as a whole — goes by **Nuke-Option**. Under the hood the package keeps its original name, the **nuclear-option toolkit** (the repo, the file names, the bundles); renaming all of that now would break existing installs and download links, and frankly felt wrong this late. So "toolkit" stays under the hood while **Nuke-Option** is the face of it.*
+
 It's three cooperating pieces — a server-side **plugin** (BepInEx/Harmony), a **bot** that
 runs on your PC, and a **web command centre** in your browser. They talk only through the
 game's log, a relay, and shared files, so any one can restart without taking the others down.
@@ -174,11 +176,7 @@ Servers running the toolkit that have opted into the public directory. Find them
 in-game server browser (Nuclear Option has no direct-connect). This list updates automatically every hour.
 
 <!-- COMMUNITY-SERVERS:START -->
-**1 server** running the toolkit &nbsp; ([full directory ↗](https://tomosbombos.github.io/nuclear-option-servers/))
-
-| Server | Region | Plugin |
-|---|---|---|
-| Tomo's Co-Op/PvP Mission Vote \| OCE \| 60hz \| Ranked \| no-TKs | Oceania | v0.9.14 |
+_Loading the live list…_ &nbsp; ([full directory ↗](https://tomosbombos.github.io/nuclear-option-servers/))
 <!-- COMMUNITY-SERVERS:END -->
 
 **Running a server?** Enable *List Server Publicly* in the command centre's settings to appear here —
