@@ -104,6 +104,9 @@ def main(argv=None):
     ap.add_argument("--minisign", default=None, help="minisign binary (or NO_MINISIGN env / PATH)")
     ap.add_argument("--no-sign", action="store_true", help="skip signing (testing only)")
     ap.add_argument("--dry-run", action="store_true", help="build + sign, do NOT publish")
+    ap.add_argument("--keep-nightly", type=int, default=3,
+                    help="retain only the N most-recent nightly pre-releases (nightly channel; default 3)")
+    ap.add_argument("--no-prune", action="store_true", help="skip nightly retention pruning")
     a = ap.parse_args(argv)
 
     out = os.path.abspath(a.out)
@@ -175,6 +178,12 @@ def main(argv=None):
     for f in final:
         pb.upload_asset(token, rel, f)
     print("DONE. https://github.com/%s/releases/tag/%s" % (pb.REPO, tag))
+
+    # 5. retention: keep only the N most-recent nightlies (stable releases are never touched)
+    if a.channel == "nightly" and not a.no_prune:
+        print("[release] retention: keeping %d most-recent nightlies ..." % a.keep_nightly)
+        pruned = pb.prune_nightlies(token, keep=a.keep_nightly)
+        print("[release] pruned: %s" % (", ".join(pruned) if pruned else "(none)"))
     return 0
 
 

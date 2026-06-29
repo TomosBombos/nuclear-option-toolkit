@@ -92,9 +92,49 @@ def upload_asset(token, rel, path):
     print("  uploaded %s (%.1f MB)" % (name, len(raw) / 1e6))
 
 
+def list_all_releases(token, per_page=100):
+    st, rels = _req(token, "GET", "%s/repos/%s/releases?per_page=%d" % (API, REPO, per_page))
+    if st != 200:
+        raise SystemExit("list failed: HTTP %s %s" % (st, rels))
+    return rels
+
+
+def delete_release(token, rel):
+    """Delete a release AND its now-dangling git tag. Tolerant of already-gone."""
+    tag = rel.get("tag_name")
+    st, _ = _req(token, "DELETE", "%s/repos/%s/releases/%s" % (API, REPO, rel["id"]))
+    if st not in (200, 204, 404):
+        print("    (release delete HTTP %s for %s)" % (st, tag))
+    if tag:
+        st2, _ = _req(token, "DELETE", "%s/repos/%s/git/refs/tags/%s" % (API, REPO, tag))
+        if st2 not in (200, 204, 404, 422):
+            print("    (tag delete HTTP %s for %s)" % (st2, tag))
+    return st in (200, 204)
+
+
+def prune_nightlies(token, keep=3, dry_run=False):
+    """Keep the `keep` most-recent nightly PRE-releases; delete older ones (and their git tags).
+    Stable (non-prerelease) releases are NEVER touched. Returns the list of removed tags."""
+    nightly = [r for r in list_all_releases(token)
+               if r.get("prerelease") and "-nightly." in (r.get("tag_name") or "")]
+    nightly.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    doomed = nightly[keep:]
+    for r in doomed:
+        if dry_run:
+            print("  [prune] WOULD delete %s (created %s)" % (r.get("tag_name"), r.get("created_at")))
+        else:
+            print("  [prune] deleting %s" % r.get("tag_name"))
+            delete_release(token, r)
+    return [r.get("tag_name") for r in doomed]
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--prune-nightlies", type=int, metavar="KEEP", default=None,
+                    help="delete all but the KEEP most-recent nightly pre-releases, then exit")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="with --prune-nightlies: show what would be deleted, delete nothing")
     ap.add_argument("--tag")
     ap.add_argument("--name", default="")
     ap.add_argument("--notes", default="")
@@ -106,6 +146,12 @@ def main(argv=None):
     token = _token()
     if a.list:
         list_releases(token)
+        return 0
+    if a.prune_nightlies is not None:
+        pruned = prune_nightlies(token, keep=a.prune_nightlies, dry_run=a.dry_run)
+        print("%s %d nightl%s%s" % ("would prune" if a.dry_run else "pruned",
+              len(pruned), "y" if len(pruned) == 1 else "ies",
+              (": " + ", ".join(pruned)) if pruned else " (nothing to do)"))
         return 0
     if not (a.tag and a.dist and a.assets):
         raise SystemExit("need --tag, --dist and --assets (or use --list)")
