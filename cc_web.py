@@ -36,7 +36,7 @@ PENDING_DLL  = os.path.join(HERE, "pending_plugin.dll")     # a plugin update wa
 PENDING_META = os.path.join(HERE, "pending_plugin.json")    # sidecar: {version, note, sha256, staged_at}
 DEPLOYED_SHA = os.path.join(HERE, "deployed_plugin.sha256") # sha of the plugin currently deployed/live
 DEPLOYED_META = os.path.join(HERE, "deployed_plugin.json")  # {version, sha, deployed_at} written by the deploy job
-PORT = int(os.environ.get("PORT", os.environ.get("NOCC_PORT", "8770")))  # env-overridable; defaults to 8770
+PORT = int(((getattr(bot, "_TK_CFG", {}) or {}).get("web", {}) or {}).get("port") or os.environ.get("PORT") or os.environ.get("NOCC_PORT") or 8770)  # config web.port -> env -> 8770
 SETTINGS_CATALOGUE = os.path.join(HERE, "settings_catalogue.json")  # static metadata for the settings menu
 BOT_OVERRIDES = os.path.join(HERE, "bot_overrides.json")            # bot-owned setting overrides (current values)
 _last_dump_nudge = 0.0                                              # throttle the "ask the plugin to dump" nudge
@@ -453,6 +453,75 @@ def _pt_resources():
                 "uptime_s": round(u.get("uptime", 0) / 1000)}
     except Exception as e:                               # noqa: BLE001
         return {"configured": True, "err": str(e)}
+
+
+# ── local (own-PC) power: start/stop the dedicated server process ───────────────
+_local_proc = {"p": None}
+
+
+def _is_local_power():
+    return (((getattr(bot, "_TK_CFG", {}) or {}).get("server", {}) or {}).get("power") == "local")
+
+
+def _local_game_dir():
+    sv = (getattr(bot, "_TK_CFG", {}) or {}).get("server", {}) or {}
+    return sv.get("game_dir") or sv.get("local_game_dir") or ""
+
+
+def _server_alive():
+    import subprocess
+    import sys
+    try:
+        if sys.platform.startswith("win"):
+            out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq NuclearOptionServer.exe"],
+                                 capture_output=True, text=True, timeout=8).stdout
+            return "NuclearOptionServer.exe" in out
+        return subprocess.run(["pgrep", "-f", "NuclearOptionServer"], capture_output=True, timeout=8).returncode == 0
+    except Exception:                                    # noqa: BLE001
+        p = _local_proc["p"]
+        return bool(p and p.poll() is None)
+
+
+def _local_power(signal):
+    import subprocess
+    import sys
+    gd = _local_game_dir()
+    if not gd or not os.path.isdir(gd):
+        return False, "no local game dir configured"
+    if signal in ("stop", "kill", "restart"):
+        try:
+            if sys.platform.startswith("win"):
+                subprocess.run(["taskkill", "/F", "/IM", "NuclearOptionServer.exe"], capture_output=True, timeout=10)
+            else:
+                subprocess.run(["pkill", "-f", "NuclearOptionServer"], capture_output=True, timeout=10)
+        except Exception as e:                           # noqa: BLE001
+            if signal != "restart":
+                return False, str(e)
+        if signal != "restart":
+            return True, "server stopped"
+        time.sleep(2)
+    starter = os.path.join(gd, "StartServer.bat" if sys.platform.startswith("win") else "start_server.sh")
+    try:
+        if os.path.exists(starter):
+            _local_proc["p"] = (subprocess.Popen([starter], cwd=gd, creationflags=0x00000010)
+                                if sys.platform.startswith("win") else
+                                subprocess.Popen(["bash", starter], cwd=gd))
+        else:
+            exe = ""
+            for n in ("NuclearOptionServer.exe", "NuclearOptionServer.x86_64"):
+                if os.path.exists(os.path.join(gd, n)):
+                    exe = os.path.join(gd, n)
+                    break
+            if not exe:
+                return False, "server executable not found in " + gd
+            _local_proc["p"] = subprocess.Popen([exe, "-batchmode", "-nographics"], cwd=gd)
+        return True, "server started"
+    except Exception as e:                               # noqa: BLE001
+        return False, str(e)
+
+
+def _local_resources():
+    return {"configured": True, "local": True, "state": "running" if _server_alive() else "offline"}
 
 
 # ── routes ────────────────────────────────────────────────────────────────────
@@ -956,13 +1025,14 @@ def api_cmd():
 
 @app.route("/api/power", methods=["POST"])
 def api_power():
-    ok, msg = _pt_power((request.get_json(force=True, silent=True) or {}).get("signal", "").strip())
+    sig = (request.get_json(force=True, silent=True) or {}).get("signal", "").strip()
+    ok, msg = (_local_power(sig) if _is_local_power() else _pt_power(sig))
     return jsonify({"ok": ok, "message": msg})
 
 
 @app.route("/api/resources")
 def api_resources():
-    return jsonify(_pt_resources())
+    return jsonify(_local_resources() if _is_local_power() else _pt_resources())
 
 
 @app.route("/api/schedule")

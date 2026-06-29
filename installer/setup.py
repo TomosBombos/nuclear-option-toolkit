@@ -228,6 +228,44 @@ def _generate_launch(game_dir, platform, rcmd_port):
     return script, logp
 
 
+def _generate_start_everything(game_dir, platform, web_port):
+    """Own-PC: ONE launcher that (re)starts the server + bot + web CC and opens the dashboard,
+    exactly like the live server's START EVERYTHING (which starts bot + web CC)."""
+    if platform == "windows":
+        path = os.path.join(game_dir, "START EVERYTHING.bat")
+        body = ("@echo off\r\n"
+                "cd /d \"%~dp0\"\r\n"
+                "echo Starting your Nuclear Option community server (server + bot + web CC)...\r\n"
+                "powershell -NoProfile -Command \"Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'no_mapvote_bot.py|cc_web.py' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }\" 2>nul\r\n"
+                "tasklist /FI \"IMAGENAME eq NuclearOptionServer.exe\" | find /I \"NuclearOptionServer.exe\" >nul || start \"Nuclear Option - Server\" \"%~dp0StartServer.bat\"\r\n"
+                "timeout /t 5 >nul\r\n"
+                "start \"Nuke Option - Bot\" cmd /k python -u no_mapvote_bot.py\r\n"
+                "timeout /t 2 >nul\r\n"
+                "start \"Nuke Option - Web CC\" cmd /k python -u cc_web.py\r\n"
+                "timeout /t 3 >nul\r\n"
+                "start \"\" http://localhost:" + str(web_port) + "\r\n")
+    else:
+        path = os.path.join(game_dir, "start_everything.sh")
+        body = ("#!/usr/bin/env bash\n"
+                "cd \"$(dirname \"$0\")\"\n"
+                "pkill -f 'no_mapvote_bot.py|cc_web.py' 2>/dev/null || true\n"
+                "pgrep -f NuclearOptionServer >/dev/null || (bash ./start_server.sh &)\n"
+                "sleep 5\n"
+                "(python3 -u no_mapvote_bot.py &)\n"
+                "sleep 2\n"
+                "(python3 -u cc_web.py &)\n"
+                "sleep 3\n"
+                "(xdg-open http://localhost:" + str(web_port) + " 2>/dev/null || true)\n")
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(body)
+    if platform != "windows":
+        try:
+            os.chmod(path, 0o755)
+        except OSError:
+            pass
+    return path
+
+
 def _save(payload):
     scenario = payload.get("scenario", "external_linux")
     conn = payload.get("connection", {})
@@ -274,10 +312,16 @@ def _save(payload):
         plat = "windows" if _platform().startswith("win") else "linux"
         try:
             script, logp = _generate_launch(game_dir, plat, rcmd)
-            launch = {"script": script, "log": logp}
+            se = _generate_start_everything(game_dir, plat, int(payload.get("web_port") or 8770))
+            launch = {"script": script, "log": logp, "start_everything": se}
             config["server"]["log_path"] = logp
+            config["server"]["local_console_path"] = logp     # the bot tails this locally
             config["server"]["rcmd_host"] = "127.0.0.1"
             config["server"]["rcmd_port"] = rcmd
+            config["server"]["power"] = "local"               # web CC controls the local process
+            _sid = (srv.get("admin_sid") or "").strip()
+            if _sid:
+                config["server"]["admin_sids"] = [_sid]
         except OSError:
             launch = None
     # secrets.json — NEVER shared/committed (0600).
@@ -490,6 +534,22 @@ def _api_open_folder(payload):
         return {"ok": False, "error": str(e)}
 
 
+def _api_run_launcher(payload):
+    """Run a generated launcher (e.g. START EVERYTHING) on the user's machine."""
+    path = (payload.get("path") or "").strip()
+    if not path or not os.path.exists(path):
+        return {"ok": False, "error": "launcher not found: %s" % (path or "(empty)")}
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)                           # runs the .bat in its own window(s)
+        else:
+            import subprocess
+            subprocess.Popen(["bash", path], cwd=os.path.dirname(path))
+        return {"ok": True}
+    except Exception as e:                               # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+
+
 # ----------------------------- HTTP server -----------------------------
 class Handler(http.server.BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json"):
@@ -585,6 +645,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps(_api_install_steamcmd(payload)))
         if path == "/api/open-folder":
             return self._send(200, json.dumps(_api_open_folder(payload)))
+        if path == "/api/run-launcher":
+            return self._send(200, json.dumps(_api_run_launcher(payload)))
         if path == "/api/shutdown":
             self._send(200, json.dumps({"ok": True}))
             if _SERVER is not None:

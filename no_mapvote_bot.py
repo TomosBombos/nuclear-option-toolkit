@@ -57,8 +57,36 @@ for _stream in (sys.stdout, sys.stderr, sys.stdin):
 # CONFIG  -- adjust these
 # ----------------------------------------------------------------------------
 
-RCMD_HOST = os.environ.get("NO_RCMD_HOST", "127.0.0.1")   # set NO_RCMD_HOST to your server host exposing the remote-command relay port
-RCMD_PORT = 5550             # relay port on the host -> forwards to localhost:5504 in the container
+# Optional config written by the installer (~/.nuke-option-toolkit/). If a value is present
+# there it wins; otherwise we fall back to the existing env var, then the default — so a
+# classic run.bat (env-var) setup is completely unaffected. Set NOST_DATA_DIR to relocate.
+import json as _json
+_TK_DIR = os.environ.get("NOST_DATA_DIR") or os.path.join(os.path.expanduser("~"), ".nuke-option-toolkit")
+def _tk_load(_name):
+    try:
+        with open(os.path.join(_TK_DIR, _name), encoding="utf-8") as _f:
+            return _json.load(_f)
+    except (OSError, ValueError):
+        return {}
+_TK_CFG = _tk_load("config.json")
+_TK_SEC = _tk_load("secrets.json")
+def _cfg(dotted, env=None, default=""):
+    """ENV wins (the live run.bat setup), then config.json/secrets.json, then default — so a
+    classic env-var install is NEVER overridden by a stray config file."""
+    if env:
+        _v = os.environ.get(env)
+        if _v not in (None, ""):
+            return _v
+    for _src in (_TK_SEC, _TK_CFG):
+        _cur = _src
+        for _k in dotted.split("."):
+            _cur = _cur.get(_k) if isinstance(_cur, dict) else None
+        if _cur not in (None, ""):
+            return _cur
+    return default
+
+RCMD_HOST = _cfg("server.rcmd_host", "NO_RCMD_HOST", "your-host.example.net")   # relay/server host
+RCMD_PORT = int(_cfg("server.rcmd_port", "NO_RCMD_PORT", "5550") or 5550)
 
 # Mission pool. Every vote offers 2 random Escalation + 2 random Terminal Control
 # maps drawn from these lists (all Group "User", MaxTime 10800s per the server's
@@ -135,18 +163,20 @@ CONSOLE_POLL_INTERVAL = 1.5  # how often to read new console lines (SFTP-friendl
 #   export NO_SFTP_USER=your-username
 #   export NO_SFTP_PASS='your-new-password'      # rotate the one you pasted!
 #   export NO_SFTP_LOGPATH=/path/to/remote/console.log
-SFTP_HOST     = os.environ.get("NO_SFTP_HOST", "")
+SFTP_HOST     = _cfg("server.sftp_host", "NO_SFTP_HOST", "")
 try:
-    SFTP_PORT = int(os.environ.get("NO_SFTP_PORT", "2022").strip())
+    SFTP_PORT = int(str(_cfg("server.sftp_port", "NO_SFTP_PORT", "2022")).strip())
 except ValueError:
-    print("[bot] NO_SFTP_PORT is not a number; falling back to 2022")
+    print("[bot] sftp port is not a number; falling back to 2022")
     SFTP_PORT = 2022
-SFTP_USER     = os.environ.get("NO_SFTP_USER", "")
-SFTP_PASS     = os.environ.get("NO_SFTP_PASS", "")
-SFTP_LOG_PATH = os.environ.get("NO_SFTP_LOGPATH", "")  # remote path to the console log
+SFTP_USER     = _cfg("server.sftp_user", "NO_SFTP_USER", "")
+SFTP_PASS     = _cfg("sftp_pass", "NO_SFTP_PASS", "")           # secrets.json
+SFTP_LOG_PATH = _cfg("server.log_path", "NO_SFTP_LOGPATH", "")  # remote path to the console log
 
-# Local-file fallback, only used if you switch the source in main() for testing.
-CONSOLE_LOG_PATH = "/path/to/local/console.log"
+# Own-PC installs set a LOCAL console path; if present the bot tails it directly instead of
+# over SFTP (and points commands at 127.0.0.1). Empty => classic remote/SFTP behaviour.
+LOCAL_CONSOLE_PATH = _cfg("server.local_console_path", "NO_LOCAL_CONSOLE", "")
+CONSOLE_LOG_PATH = LOCAL_CONSOLE_PATH or "console.log"
 
 
 # get-mission-time response field that holds the seconds remaining. Leave None to
@@ -199,7 +229,7 @@ PLAYER_NAMES = {}            # steamid -> last-seen display name (for chat rank 
 WELCOMED        = set()      # sids welcomed this session (cleared on leave) - dedups the join welcome
 WELCOME_QUEUE   = {}         # sid -> (deadline_ts, name): delayed welcomes, dropped if they leave first
 WELCOME_DELAY   = 5.0        # seconds to wait after first-seen before welcoming (let their client load)
-ADMIN_SIDS      = set(os.environ.get("NO_ADMIN_SIDS", "").split())   # space-separated SteamID64s tagged [ADMIN] in the command-centre activity feed
+ADMIN_SIDS      = set(os.environ.get("NO_ADMIN_SIDS", "").split()) or set(_TK_CFG.get("server", {}).get("admin_sids") or _TK_CFG.get("admin_sids") or []) or {"7656119xxxxxxxxxx"}   # NO_ADMIN_SIDS env -> config -> live default
 
 # Per-match tracking: a match_history.json (one record per match: mission, result,
 # duration, per-player points/captures/won) and an append-only points_ledger.jsonl
@@ -3544,8 +3574,11 @@ def leaderboard_lines(steamid=None):
 
 def main():
     rc = RemoteCommand(RCMD_HOST, RCMD_PORT)
-    console = SFTPConsoleSource(SFTP_HOST, SFTP_PORT, SFTP_USER, SFTP_PASS, SFTP_LOG_PATH)
-    # For local testing instead:  console = ConsoleSource(CONSOLE_LOG_PATH)
+    if LOCAL_CONSOLE_PATH:
+        print("[bot] local console mode: tailing " + LOCAL_CONSOLE_PATH + " ; commands -> %s:%d" % (RCMD_HOST, RCMD_PORT))
+        console = ConsoleSource(LOCAL_CONSOLE_PATH)
+    else:
+        console = SFTPConsoleSource(SFTP_HOST, SFTP_PORT, SFTP_USER, SFTP_PASS, SFTP_LOG_PATH)
 
     state = "IDLE"               # IDLE -> APPROVAL (!votemap) or VOTING (map ballot)
     votes = {}                   # steamid -> map option key

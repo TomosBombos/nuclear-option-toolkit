@@ -111,24 +111,10 @@ def _require(text, old, new):
 
 
 def scrub_bot(text):
-    text = _require(
-        text,
-        'RCMD_HOST = "%s"   # server IP exposing the remote-command port' % REAL_IP,
-        'RCMD_HOST = os.environ.get("NO_RCMD_HOST", "127.0.0.1")   # set NO_RCMD_HOST to your server host exposing the remote-command relay port',
-    )
-    text = _require(
-        text,
-        "#   export NO_SFTP_HOST=%s" % REAL_HOST,
-        "#   export NO_SFTP_HOST=your-sftp-host.example.net",
-    )
-    text = _require(
-        text,
-        'ADMIN_SIDS      = {"%s"}   # Tomo - tagged [ADMIN] in the command-centre activity feed' % REAL_SID,
-        'ADMIN_SIDS      = set(os.environ.get("NO_ADMIN_SIDS", "").split())   # space-separated SteamID64s tagged [ADMIN] in the command-centre activity feed',
-    )
-    # remaining example SteamIDs in comments / replay-test strings
+    # The bot is config-driven (config.json/secrets.json -> env -> these defaults), so we only
+    # replace the real DEFAULT VALUES with placeholders. Anchor-free, so it survives bot
+    # refactors; the secret-scan gate is the backstop if anything were ever missed.
     text = text.replace(REAL_SID, "7656119xxxxxxxxxx")
-    # belt-and-suspenders: no real host/IP may survive
     text = text.replace(REAL_IP, "your-host.example.net")
     text = text.replace(REAL_HOST, "your-sftp-host.example.net")
     return text
