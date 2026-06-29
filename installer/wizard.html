@@ -256,7 +256,7 @@ async function renderFiles(p){
     +(state.mode==='offline'?'<label class="fl">Folder with your downloaded files</label><input id="offDir" placeholder="C:\\\\path\\\\to\\\\downloads" value="'+esc(state.offlineDir||'')+'" oninput="state.offlineDir=this.value">':'')
     +'<div class="row" style="margin-top:12px"><button class="go" onclick="fetchFiles(this)">'+(state.mode==='offline'?'Validate & stage files':'Download & stage files')+'</button> <span id="fetchMsg" class="msg"></span></div>'
     +'<div id="fetchOut" style="margin-top:8px"></div>'
-    +'<div class="hint" style="margin-top:8px">Note: the game server binaries come from Steam (SteamCMD app 3930080); on a Pterodactyl host the panel installs them. This step handles the loader + plugin + egg.</div></div>';
+    +'<div class="hint" style="margin-top:8px">This installs BepInEx (the mod loader), the NukeStats plugin, the relay, the bot + web command centre, and your generated config'+((state.scenario==='own_pc'&&state.server.dir)?(' into <code>'+esc(state.server.dir)+'</code>'):'')+'. The game binaries themselves come from SteamCMD (previous step) or the Pterodactyl host.</div></div>';
   if(state.mode==='online'){
     const pl=await api('/api/plan?option='+opt);
     $('#fileList').innerHTML=(pl.deps||[]).map(d=>`<div><b>${esc(d.name||d.id)}</b> — <span class="ok">${esc(d.version||'?')}</span> <span class="hint">${esc(d.note||d.url||'')}</span></div>`).join('');
@@ -269,7 +269,8 @@ async function renderFiles(p){
 }
 async function fetchFiles(btn){btn.disabled=true;$('#fetchMsg').textContent='working…';
   const opt=manifestOption();
-  let r;try{ r=await api('/api/fetch',{option:opt,offline_dir:state.mode==='offline'?(state.offlineDir||''):null}); }catch(e){ r={error:String(e)}; }
+  const dest=(state.scenario==='own_pc'&&state.server.dir)?state.server.dir:null;  // own-PC: install into the server folder
+  let r;try{ r=await api('/api/fetch',{option:opt,dest:dest,offline_dir:state.mode==='offline'?(state.offlineDir||''):null}); }catch(e){ r={error:String(e)}; }
   if(r.error){$('#fetchMsg').innerHTML='<span class="bad">✗ '+esc(r.error)+'</span>';btn.disabled=false;return;}
   $('#fetchMsg').innerHTML='<span class="ok">staged → '+esc(r.dest||'')+'</span>';
   $('#fetchOut').innerHTML=(r.results||[]).map(x=>'<div>'+(x.ok===true?'<span class="ok">✓</span>':x.ok===null?'<span class="info">—</span>':'<span class="bad">✗</span>')+' '+esc(x.id)+' <span class="hint">'+esc(x.placed||x.note||'')+'</span></div>').join('');
