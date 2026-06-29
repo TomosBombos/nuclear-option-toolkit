@@ -24,8 +24,21 @@ details (each field explains **what it is** and **where to find it**) and wires 
 | **Hosting by hand / other** | ⚠️ Beta (lightly tested) | **[⬇ Manual bundle](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-manual.zip)** | Unzip → follow `README.md` to drag the files into place (both BepInEx packs included); the installer writes your config. |
 
 > All downloads live on the **[Releases page](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest)**.
-> You only need **Python 3.8+** installed first. Prefer to clone the repo and run the
-> installer from source? See **[Get started](#get-started)** below.
+
+### How to run the installer
+
+1. **Install Python 3.8+** if you don't have it — <https://www.python.org/downloads/>. On Windows,
+   tick **“Add python.exe to PATH”** in the installer.
+2. **Download** the ZIP for your server type (above) and **unzip it** anywhere.
+3. **Run the installer** from inside the unzipped folder:
+   - **Windows** — double-click **`install.bat`**
+   - **macOS / Linux** — run **`./install.sh`** in a terminal
+   - *(either way it just runs `python installer/setup.py` — you can run that directly too)*
+4. A setup **wizard opens in your browser**. Work through it — every field explains **what it is**
+   and **where to find it** — then it wires everything up and you launch your server + dashboard.
+
+That's it. There's nothing to install globally and no config to hand-edit; the wizard does it all.
+(Cloning the repo instead of downloading a bundle? See **[Get started](#get-started)** below.)
 
 ## What it does
 

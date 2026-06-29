@@ -127,8 +127,8 @@ PVP_MISSIONS = [
 ]
 
 # The curated OFFICIAL mission pool this server ships (every mission in the stock MissionRotation). Any
-# mission present/enabled BEYOND this set = unofficial (uploaded or Steam Workshop) and, when ENABLED,
-# disqualifies the server from the global leaderboard. Editing an official mission's file also disqualifies.
+# mission present/enabled BEYOND this set = unofficial (uploaded or Steam Workshop). The mission audit flags
+# unofficial-enabled or edited-official missions so owners can see when the pool diverges from stock.
 OFFICIAL_MISSIONS = set(ESCALATION_MISSIONS) | set(TERMINAL_CONTROL_MISSIONS) | set(PVP_MISSIONS)
 
 # Weather/time variants treated as "dark". A single ballot may contain at most
@@ -470,10 +470,10 @@ def write_dashboard_state(*, state, server_up, online, votes, vote_ends_at,
             "reports": reports_state(),                          # anti-grief auto-kick/flag reports for the webcc Reports tab
             "server_config": server_config_state(),              # DedicatedServerConfig.json fields for the webcc Server Settings tab
             "sys_messages": sysmsg_state(),                       # built-in automated-message overrides for the webcc Messages tab
-            "global": list(GLOBAL_BOARD[:50]),                    # cross-server global board for the webcc Leaderboard (empty until GH sync is configured)
             "mission_audit": mission_audit_state(),               # official vs custom/workshop missions + integrity + eligibility (webcc Mission Pool)
             "votemap": votemap_cfg_state(),                       # dynamic vote-pool config (ballot size/mode/includes) for the webcc Votemap settings
             "banned_players": banned_players_state(),             # plugin_bans.txt -> webcc Moderation 'Banned' tab
+            "global_sync": global_sync_state(),                   # public-listing (server directory) status for the webcc
         }
         tmp = DASHBOARD_STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -790,8 +790,8 @@ def friendly_label(name):
 
 
 # --- Mission pool (votemap): owners toggle which missions appear in the vote (e.g. PvP-only, no Terminal).
-# Stored in mission_pool.json as the DISABLED set. Editable EVEN with the global leaderboard on (server
-# flavour, not competitive fairness), so it's owner=missionpool, not a gameplay-locked setting.
+# Stored in mission_pool.json as the DISABLED set. Server flavour, not a gameplay-locked setting, so it's
+# owner=missionpool.
 MISSION_POOL_FILE = os.path.join(_BASE_DIR, "mission_pool.json")
 _mission_disabled = set()
 
@@ -1803,13 +1803,7 @@ def ensure_player(steamid, name):
         return False
     rec = RANK_DATA.get(sid)
     if rec is None:
-        seed = _global_seed_points(sid)   # Feature B carryover: seed once from the global board (0 unless GH sync configured)
-        RANK_DATA[sid] = {"name": name or sid, "points": seed}
-        if seed > 0:
-            try:
-                activity(f"{name or sid}: seeded {seed:.0f} pts carried over from other servers", "RANK")
-            except Exception:             # noqa: BLE001
-                pass
+        RANK_DATA[sid] = {"name": name or sid, "points": 0.0}
         return True
     if name and rec.get("name") != name:
         rec["name"] = name
@@ -2548,7 +2542,7 @@ def skill_rating(rec):
 def skill_table():
     """[(sid, rec, P)] for every QUALIFIED player, sorted by rating descending."""
     out = []
-    for sid, rec in list(RANK_DATA.items()):   # snapshot: _board_json calls this from the publish thread
+    for sid, rec in list(RANK_DATA.items()):   # snapshot: the poll loop mutates RANK_DATA on another thread
         P = skill_rating(rec)
         if P is not None:
             out.append((sid, rec, P))
@@ -3088,106 +3082,68 @@ def admin_team(rc, cmd):
         activity(f"ADMIN moved {name} -> {faction}", "TEAM")
 
 
-# ===================== GLOBAL LEADERBOARD + SERVER DIRECTORY (opt-in GitHub publish) =====================
-# Owners opt in via the webcc settings (Global.Enabled / Global.ListServer / Global.Region — the plugin
-# reports these in PLUGIN_CFG). Every ~4h the bot publishes this server's DIRECTORY entry (+ its leaderboard
-# when Global.Enabled) to a shared public GitHub repo via the Contents API, and fetches the aggregated
-# global.json for !global. NEVER publishes IP/host/port/SteamIDs. INERT unless NO_GH_TOKEN + NO_GH_REPO are
-# set (in run.bat); HTTP runs off the poll thread. Contract: docs/GLOBAL_LEADERBOARD_CONTRACT.md.
+# ===================== PUBLIC SERVER DIRECTORY (opt-in GitHub "advertise server publicly") =====================
+# Owners opt in via the webcc settings (Global.ListServer + Global.Region — the plugin reports these in
+# PLUGIN_CFG). While listed, the bot publishes this server's DIRECTORY entry (name + region + plugin version,
+# NEVER IP/host/port/SteamIDs) to a shared public GitHub repo via the Contents API so players can find it by
+# name. INERT unless NO_GH_TOKEN + NO_GH_REPO are set (in run.bat); HTTP runs off the poll thread. NO cross-
+# server leaderboard, NO live online status. Contract: docs/GLOBAL_LEADERBOARD_CONTRACT.md (directory section).
 GH_TOKEN  = os.environ.get("NO_GH_TOKEN", "").strip()
 GH_REPO   = os.environ.get("NO_GH_REPO", "").strip()                 # "owner/name" of the shared public repo
 GH_BRANCH = os.environ.get("NO_GH_BRANCH", "main").strip() or "main"
 SERVER_NAME_OVERRIDE = os.environ.get("NO_SERVER_NAME", "").strip()  # TODO: read ServerName from DedicatedServerConfig (Part B)
-GLOBAL_PUSH_INTERVAL  = 4 * 3600
-GLOBAL_FETCH_INTERVAL = 1800
-_global_last_push = 0.0
-_global_last_fetch = 0.0
+GLOBAL_DIR_INTERVAL  = 10 * 60        # how often to CHECK whether the directory entry needs (re)publishing
+GLOBAL_DIR_KEEPALIVE = 6 * 3600       # re-publish at least this often even if unchanged (keeps `updated` fresh)
+_global_last_dir = 0.0
 _global_busy = [False]
-GLOBAL_BOARD = []
-GLOBAL_RANKS = {}   # sid -> {name, points} from the collated cross-server ranks file (Feature B carryover); empty until GH sync is configured
+_global_status_result = [None, None]   # (ok, ts) of the last directory publish; ts None = not yet attempted (-> webcc shows "pending")
+_last_dir_sig = [None, 0.0]            # (payload-sans-timestamp, last-PUT ts) -> commit only on change / keepalive
 SERVER_ID_FILE = os.path.join(_BASE_DIR, "global_server_id.txt")
+GLOBAL_OPTIN_FILE = os.path.join(_BASE_DIR, "global_optin.json")   # last-known opt-in -> directory survives a bot restart / empty server
 
 
-def _player_gid(sid):
-    """Opaque cross-server player id = short SALTED SHA-256 of the SteamID. The salt (NO_GH_SALT,
-    shared across same-provider servers) maps the same player to the same gid everywhere WITHOUT any
-    server ever publishing a raw SteamID -- honoring the names-only privacy contract. Carryover only."""
-    import hashlib
-    salt = os.environ.get("NO_GH_SALT", "")
-    return hashlib.sha256((salt + "|" + str(sid)).encode("utf-8")).hexdigest()[:16]
-
-
-def _global_seed_points(sid):
-    """Feature B cross-server CARRYOVER -- merge rule = SEED ON FIRST JOIN (owner-chosen): a brand-new
-    local player is seeded ONCE with their global points so progression carries between servers; after
-    that, local computation is authoritative and untouched. Returns 0 (no-op) unless GH sync is
-    configured AND the collated ranks/global.json has this player's HASHED id. Only ensure_player's
-    rec-is-None path calls this, so it can NEVER overwrite an existing local rank.
-    PRIVACY: keyed on _player_gid (salted hash), NEVER a raw SteamID. The collation tool must publish
-    ranks/global.json = {"players":[{"gid","name","points"}]} (gid only, no SteamID) -- coordinated
-    with the github/productization fork; inert until that file + GH env exist (see memory)."""
-    try:
-        if not GH_REPO:
-            return 0.0
-        e = GLOBAL_RANKS.get(_player_gid(sid))
-        if not e:
-            return 0.0
-        return round(max(0.0, float(e.get("points", 0))), 1)
-    except Exception:                          # noqa: BLE001
-        return 0.0
-_GAMEPLAY_KEYS_CACHE = [0.0, frozenset()]
 _GLOBAL_REGIONS = frozenset({"OCE", "NA", "EU", "SA", "AS", "AF", "ME", "Other"})
-# Fail-CLOSED fallback for the gameplay lock if settings_catalogue.json can't be read (keep in sync with
-# the catalogue's gameplay=true keys).
-_GAMEPLAY_FALLBACK = frozenset({
-    "Scoring.WinPoints", "Scoring.FirstPlace", "Scoring.SecondPlace", "Scoring.ThirdPlace",
-    "Skill.CaptureBonus", "Skill.WinBonus", "Skill.LossBonus", "Skill.BalanceBySkill",
-    "START_BONUS_PTS", "START_BONUS_WINDOW", "KILL_BONUS", "UNDERDOG_PER_PLAYER",
-    "Mission.PvpStartingRank", "MISSION_MAX_TIME", "Forfeit.Enabled", "Forfeit.CooldownSeconds",
-    "Balance.Enforce", "Balance.MaxDifference", "Balance.AutoMove", "Balance.MoveOnlyUnspawned",
-    "Balance.RecheckSeconds", "Balance.MoveDebounce", "Balance.GraceSeconds", "Balance.MinPlayers",
-    "Balance.WarnSeconds", "Balance.MoveExemptGames", "Balance.NewJoinerSeconds", "Squad.MaxSize",
-    "AILimit.Enforce", "AILimit.PerTeamAICap", "AILimit.TotalAircraftCap", "AILimit.StuckSeconds",
-    "AILimit.StuckRadiusMetres", "PvE.TimeoutForceDefeat", "PvP.TimeoutResult", "Match.TimeoutLeadSeconds",
-})
 
 
 def _utcnow():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _gsan(s, n=24):
-    """Sanitize an externally-sourced string (from the public global.json) before it reaches game chat:
-    drop control chars + < > | (which would inject rich-text tags / x1f message-splits) and length-cap."""
-    return "".join(c for c in str(s) if c >= " " and c not in "<>|")[:n]
-
-
-def _gameplay_keys():
-    """Catalogue keys with gameplay=true (cached; reloaded when the catalogue changes). Drives the lock.
-    Falls back to a hardcoded set if the catalogue can't be read, so the lock fails CLOSED, not open."""
-    p = os.path.join(_BASE_DIR, "settings_catalogue.json")
+def _load_optin():
     try:
-        mt = os.path.getmtime(p)
-        if mt != _GAMEPLAY_KEYS_CACHE[0]:
-            with open(p, encoding="utf-8") as f:
-                d = json.load(f)
-            _GAMEPLAY_KEYS_CACHE[0] = mt
-            _GAMEPLAY_KEYS_CACHE[1] = frozenset(s["key"] for s in d.get("settings", []) if s.get("gameplay"))
+        with open(GLOBAL_OPTIN_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
     except (OSError, ValueError):
+        return {}
+
+
+def _save_optin(d):
+    try:
+        with open(GLOBAL_OPTIN_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except OSError:
         pass
-    return _GAMEPLAY_KEYS_CACHE[1] or _GAMEPLAY_FALLBACK
 
 
 def _global_cfg():
-    """The opt-in state the plugin reports in PLUGIN_CFG (region validated against the known set)."""
+    """The public-listing opt-in (list + region). Source of truth = what the plugin reports in PLUGIN_CFG
+    (Global.ListServer / Global.Region), persisted to global_optin.json so the directory survives a bot
+    restart or an empty server (when the plugin isn't reporting) -> we can still delist on opt-out."""
     def _b(k):
         v = PLUGIN_CFG.get(k)
         return v is True or str(v).lower() in ("1", "true", "on", "yes")
-    region = str(PLUGIN_CFG.get("Global.Region", "") or "").strip()
-    if region not in _GLOBAL_REGIONS:
-        region = "Other"
-    en = _b("Global.Enabled")
-    return {"enabled": en, "list": en or _b("Global.ListServer"), "region": region}
+    if any(k in PLUGIN_CFG for k in ("Global.ListServer", "Global.Region")):
+        region = str(PLUGIN_CFG.get("Global.Region", "") or "").strip()
+        if region not in _GLOBAL_REGIONS:
+            region = "Other"
+        d = {"list": _b("Global.ListServer"), "region": region}
+        if _load_optin() != d:
+            _save_optin(d)                       # remember the latest opt-in for restart / empty-server
+        return d
+    p = _load_optin()                            # plugin hasn't reported yet -> last-known persisted state
+    region = p.get("region", "Other")
+    return {"list": bool(p.get("list")), "region": region if region in _GLOBAL_REGIONS else "Other"}
 
 
 def _server_id():
@@ -3210,7 +3166,21 @@ def _server_id():
 
 
 def _server_name():
-    return SERVER_NAME_OVERRIDE or "Nuclear Option server"
+    """Public-directory name: the NO_SERVER_NAME override, else the live ServerName from
+    DedicatedServerConfig.json (cached by the Server Settings tab; refreshed once if not yet
+    loaded), else a generic default. So the listing matches what players see in the browser."""
+    if SERVER_NAME_OVERRIDE:
+        return SERVER_NAME_OVERRIDE
+    try:
+        nm = (_srvcfg_cache.get("values") or {}).get("ServerName")
+        if not nm:
+            refresh_server_config()                  # one SFTP read; then cached
+            nm = (_srvcfg_cache.get("values") or {}).get("ServerName")
+        if nm:
+            return str(nm)
+    except Exception:                                # noqa: BLE001
+        pass
+    return "Nuclear Option server"
 
 
 def _plugin_version():
@@ -3259,96 +3229,75 @@ def _gh_put_file(path, content_str, message):
     return pst in (200, 201)
 
 
-def _board_json():
-    """Top-25 by points + top-25 by skill for THIS server (in-game names only — never SteamIDs).
-    Snapshots RANK_DATA first (the poll loop mutates it on another thread)."""
-    snap = list(RANK_DATA.values())
-    pts = sorted(((r.get("name", ""), r.get("points", 0)) for r in snap if r.get("points", 0) > 0),
-                 key=lambda x: x[1], reverse=True)[:25]
-    top_points = [{"name": n, "points": round(p, 1), "rank": RANKS[rank_index_for(p)][2]} for n, p in pts]
-    tbl = skill_table()
-    top_skill = [{"name": rec.get("name", ""), "pts_per_life": round(P, 1), "skill": round(skill_ranking(P, tbl), 1)}
-                 for _sid, rec, P in tbl[:25]]
-    return top_points, top_skill
+def _gh_delete(path):
+    """Best-effort delete of a repo file (GET sha -> DELETE). Never raises; returns True on success.
+    Used to remove this server's directory entry when it opts out of public listing."""
+    st, cur = _gh_api("GET", "/repos/%s/contents/%s?ref=%s" % (GH_REPO, path, GH_BRANCH))
+    if st != 200 or not isinstance(cur, dict) or not cur.get("sha"):
+        return False
+    dst, _ = _gh_api("DELETE", "/repos/%s/contents/%s" % (GH_REPO, path),
+                     {"message": "remove %s @ %s" % (path, _utcnow()), "branch": GH_BRANCH, "sha": cur["sha"]})
+    return dst in (200, 201)
 
 
-def global_publish_tick():
+def global_dir_tick():
+    """Publish the public DIRECTORY entry servers/<id>.json while listed (name + region + plugin version;
+    NEVER IP/host/port/SteamIDs, no live status). Commits only when something changed (or a keepalive is
+    due) so the repo isn't churned. On opt-out it deletes the listing so the public page drops it (one-shot)."""
     if not (GH_TOKEN and GH_REPO):
         return True
     gc = _global_cfg()
     if not gc["list"]:
+        if _last_dir_sig[0] is not None:          # was listed this session -> opted out: remove the public listing now (one-shot)
+            if _gh_delete("servers/%s.json" % _server_id()):
+                activity("Delisted from the public server directory", "BOT")
+            _last_dir_sig[0] = None
         return True
     sid, region = _server_id(), gc["region"]
-    directory = {"server_id": sid, "name": _server_name(), "region": region, "uses_nukeoption": True,
-                 "plugin_version": _plugin_version(), "global_leaderboard": gc["enabled"], "updated": _utcnow()}
+    directory = {
+        "server_id":       sid,
+        "name":            _server_name(),
+        "region":          region,
+        "uses_nukeoption": True,
+        "plugin_version":  _plugin_version(),
+        "updated":         _utcnow(),
+    }
+    sig = json.dumps({k: v for k, v in directory.items() if k != "updated"}, sort_keys=True)
+    now = time.time()
+    if sig == _last_dir_sig[0] and (now - _last_dir_sig[1]) < GLOBAL_DIR_KEEPALIVE:
+        return True                               # unchanged + keepalive not yet due -> skip the commit
+    first = _last_dir_sig[0] is None
     ok = _gh_put_file("servers/%s.json" % sid, json.dumps(directory, indent=1),
-                      "directory %s @ %s" % (directory["name"], _utcnow()))
-    if gc["enabled"]:
-        tp, ts = _board_json()
-        board = {"server_id": sid, "name": directory["name"], "region": region, "updated": _utcnow(),
-                 "top_points": tp, "top_skill": ts}
-        ok = _gh_put_file("leaderboards/%s/%s.json" % (region, sid), json.dumps(board, indent=1),
-                          "leaderboard %s @ %s" % (directory["name"], _utcnow())) and ok
-    activity("Published to the global leaderboard/directory (%s)" % region if ok
-             else "Global publish FAILED - check NO_GH_TOKEN / repo permissions", "BOT" if ok else "!")
+                      "list %s (%s) @ %s" % (directory["name"], region, _utcnow()))
+    _global_status_result[0], _global_status_result[1] = ok, now
+    if ok:
+        _last_dir_sig[0], _last_dir_sig[1] = sig, now
+        if first:
+            activity("Listed on the public server directory (%s)" % region, "BOT")
+    else:
+        activity("Public directory update FAILED - check NO_GH_TOKEN / repo permissions", "!")
     return ok
 
 
-def global_fetch_tick():
-    global GLOBAL_BOARD, GLOBAL_RANKS
-    if not GH_REPO:
-        return
-    import urllib.request
-    import ssl
-    url = "https://raw.githubusercontent.com/%s/%s/global.json" % (GH_REPO, GH_BRANCH)
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "nukeoption-bot"})
-        with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=15) as r:
-            data = json.loads(r.read().decode("utf-8") or "null")
-        if isinstance(data, dict) and isinstance(data.get("top_points"), list):
-            GLOBAL_BOARD = [e for e in data["top_points"] if isinstance(e, dict)][:50]
-    except Exception:                          # noqa: BLE001
-        pass
-    # Feature B carryover: also pull the collated HASHED-id ranks (produced by the collation tool);
-    # gid-keyed (never raw SteamIDs). 404/absent until the carryover pipeline exists -> GLOBAL_RANKS empty (inert).
-    try:
-        rurl = "https://raw.githubusercontent.com/%s/%s/ranks/global.json" % (GH_REPO, GH_BRANCH)
-        rreq = urllib.request.Request(rurl, headers={"User-Agent": "nukeoption-bot"})
-        with urllib.request.urlopen(rreq, context=ssl.create_default_context(), timeout=15) as rr:
-            rdata = json.loads(rr.read().decode("utf-8") or "null")
-        plist = rdata.get("players") if isinstance(rdata, dict) else None
-        if isinstance(plist, list):
-            GLOBAL_RANKS = {str(p.get("gid")): {"name": p.get("name"), "points": p.get("points", 0)}
-                            for p in plist if isinstance(p, dict) and p.get("gid")}
-    except Exception:                          # noqa: BLE001
-        pass
-
-
 def global_tick():
-    """Poll-loop hook: self-rate-limits + offloads the (blocking) HTTP to a one-shot daemon thread."""
-    global _global_last_push, _global_last_fetch
-    if not (GH_TOKEN or GH_REPO):
+    """Poll-loop hook: self-rate-limit + offload the (blocking) HTTP to a one-shot daemon thread.
+    Publishes the public directory entry on a slow cadence (on change / keepalive)."""
+    global _global_last_dir
+    if not (GH_TOKEN and GH_REPO):
         return                                     # opted out entirely -> never touch throttles / spawn a thread
     if _global_busy[0]:
         return
     now = time.time()
-    do_push = (now - _global_last_push) >= GLOBAL_PUSH_INTERVAL
-    do_fetch = (now - _global_last_fetch) >= GLOBAL_FETCH_INTERVAL
-    if not (do_push or do_fetch):
+    if (now - _global_last_dir) < GLOBAL_DIR_INTERVAL:
         return
-    if do_push:
-        _global_last_push = now
-    if do_fetch:
-        _global_last_fetch = now
+    _global_last_dir = now
     _global_busy[0] = True
 
     def _work():
-        global _global_last_push
+        global _global_last_dir
         try:
-            if do_push and global_publish_tick() is False:
-                _global_last_push = time.time() - GLOBAL_PUSH_INTERVAL + 600   # failed -> retry in ~10 min, not 4h
-            if do_fetch:
-                global_fetch_tick()
+            if global_dir_tick() is False:
+                _global_last_dir = time.time() - GLOBAL_DIR_INTERVAL + 120   # failed -> retry in ~2 min
         except Exception as e:                 # noqa: BLE001
             print("[global] tick error:", e)
         finally:
@@ -3357,24 +3306,21 @@ def global_tick():
     threading.Thread(target=_work, daemon=True).start()
 
 
-def global_lines():
-    """!global: the cross-server top players (from the fetched global.json)."""
-    if not GH_REPO:
-        return ["<color=#FFD200>Global leaderboard:</color> not enabled on this server."]
-    if not GLOBAL_BOARD:
-        return ["<color=#FFD200>Global leaderboard:</color> updating - check back soon (refreshes ~every 30 min)."]
-    out = ["<color=#FFD200>=== GLOBAL TOP PILOTS (all servers) ===</color>"]
-    for i, e in enumerate(GLOBAL_BOARD[:10], 1):
-        if not isinstance(e, dict):
-            continue
-        nm = _gsan(e.get("name", "?")) or "?"
-        rg = _gsan(e.get("region", ""), 8)
-        try:
-            pts = _pts(float(e.get("points", 0)))
-        except (TypeError, ValueError):
-            pts = "?"
-        out.append("  %d. %s - %s%s" % (i, nm, pts, (" <color=#7f9fbf>[" + rg + "]</color>") if rg else ""))
-    return out
+def global_sync_state():
+    """Read-only snapshot of the public-listing state for the webcc (NO secrets: the repo owner/name is
+    public, the token is never exposed). `configured` is false until NO_GH_TOKEN+NO_GH_REPO are set."""
+    gc = _global_cfg()
+    configured = bool(GH_TOKEN and GH_REPO)
+    return {
+        "configured":  configured,
+        "repo":        GH_REPO or None,            # public owner/name (never the token)
+        "page":        ("https://github.com/%s" % GH_REPO) if GH_REPO else None,
+        "branch":      GH_BRANCH,
+        "list":        gc["list"],
+        "region":      gc["region"],
+        "server_id":   _server_id() if configured else None,
+        "last_status": {"ok": _global_status_result[0], "ts": _global_status_result[1]},
+    }
 
 
 def set_cfg_dispatch(rc, key, value, owner):
@@ -3386,10 +3332,6 @@ def set_cfg_dispatch(rc, key, value, owner):
     owner = str(owner).strip().lower()
     val = str(value).strip()
     try:
-        # Global Leaderboard lock (good-faith): while it's ON, gameplay settings can't be changed here.
-        if key in _gameplay_keys() and _global_cfg()["enabled"]:
-            activity(f"settings: {key} is locked (Global Leaderboard on)", "!")
-            return {"ok": False, "error": "locked - turn off the Global Leaderboard to change gameplay settings"}
         if owner == "plugin":
             safek = key.replace("|", "").replace("\n", " ").replace("\r", " ")
             safev = val.replace("|", "").replace("\n", " ").replace("\r", " ")
@@ -3492,6 +3434,25 @@ def whisper(rc, sid, *lines):
     activity(f"replied to {nm}: {summary}{extra}", "CHAT")   # [BOT] line - the reply logs ONCE, here
 
 
+def tell_player(sid, *lines):
+    """Send a PRIVATE (client-side) reply to ONE player via the plugin's TellPlayer (the 'tell' verb) --
+    the same mechanism !spec / team-moves use, so only that player sees it. NO all-chat fallback: the whole
+    point is to keep long/noisy replies (e.g. !help) out of public chat. The asker must be online (plugin
+    commands need a player present), which they are when they just typed the command.
+    Lines are joined with U+2028 (LINE SEPARATOR) into ONE message, NOT \\x1f-split into many: the plugin
+    splits the body on \\x1f and sends one RpcTargetServerMessage per piece, and a rapid 12-message burst
+    didn't render -- a single message does. U+2028 survives the file command-channel (File.ReadAllLines
+    only breaks on \\r/\\n) and renders as a line break client-side, so the whole reply arrives as one
+    multi-line message with the colours intact."""
+    sid = str(sid or "").replace("|", "")
+    parts = [str(l).replace("|", "/") for l in lines if l is not None]
+    if not sid or not parts:
+        return
+    _drop_plugin_cmd("tell|" + sid + "|" + "\u2028".join(parts))
+    nm = PLAYER_NAMES.get(sid) or RANK_DATA.get(sid, {}).get("name") or sid
+    activity(f"private reply to {nm} ({len(parts)} lines, one message)", "PM")
+
+
 def help_lines():
     return [
         "<color=#FFFF00>=== SERVER COMMANDS ===</color>",
@@ -3500,7 +3461,6 @@ def help_lines():
         "<color=#55FF55>!skill</color> - your skill rating (points per life) + next pilot up",
         "<color=#55FF55>!points</color> - points you've earned this life + last life",
         "<color=#55FF55>!leaderboard</color> - top pilots by points and by skill",
-        "<color=#55FF55>!global</color> - the cross-server global leaderboard (if enabled)",
         "<color=#55FF55>!spec</color> - leave your team and go to spectator",
         "<color=#55FF55>!balance</color> - how PvP team balancing works",
         "<color=#55FF55>!squadup <player></color> - team up with friends (up to 4) for PvP: they reply !y, and auto-balance keeps you on the same side (persists across matches; !squadup leave to exit, !squadup to see your squad)",
@@ -3782,11 +3742,6 @@ def main():
                     whisper(rc, steamid, *leaderboard_lines(steamid))
                     continue
 
-                # cross-server global leaderboard (private)
-                if low == "!global":
-                    whisper(rc, steamid, *global_lines())
-                    continue
-
                 # why do I have these points? (audit, private)
                 if low == "!why":
                     rows = recent_ledger_for(steamid, 4)
@@ -3831,7 +3786,9 @@ def main():
                             f"<color=#9fd6b0>Last life: {last_str} pts</color>")
                     continue
 
-                # command help (private to asker)
+                # command help. NOTE: ideally private/client-side (TODO: handle natively in the plugin like
+                # !spec -- the bot-relayed plugin 'tell' verb logs "delivering" but doesn't render, while
+                # !spec's TellPlayer does; pending a plugin redeploy). For now it goes to chat so it WORKS.
                 if low == "!help":
                     whisper(rc, steamid, *help_lines())
                     continue
@@ -4008,7 +3965,7 @@ def main():
                     print(f"[milestone] check error: {e}")
             try:
                 check_schedule(rc)            # fire any due scheduled restarts/updates (warns players first)
-                global_tick()                 # opt-in global leaderboard/directory publish + fetch (self-throttled; HTTP off-thread)
+                global_tick()                 # opt-in public server-directory publish (self-throttled; HTTP off-thread)
             except Exception as e:            # never let a schedule hiccup break the main loop
                 print(f"[sched] check error: {e}")
         if now - last_state_write >= STATE_WRITE_INTERVAL:
@@ -5137,7 +5094,7 @@ def _srvcfg_panel_mirror(key, old, new):
         return {"mirrored": False, "reason": f"put failed (key may be read-only): {e}"}
 
 
-# ── Mission audit: official vs custom/workshop missions + integrity + global-leaderboard eligibility ──
+# ── Mission audit: official vs custom/workshop missions + integrity (pool-divergence status) ──
 # Missions live in DedicatedServerConfig.MissionDirectory as <name>/<name>.json (Group "User"), plus any
 # {Group:"Workshop",Name:<id>} rotation entries. OFFICIAL_MISSIONS = the curated pool this server ships;
 # anything else present/enabled = unofficial. Official mission JSONs are hashed vs a trust-on-first-use
@@ -5148,7 +5105,7 @@ _mission_audit_cache = {"ts": 0.0, "data": {"loaded": False}}
 
 def refresh_mission_audit():
     """SFTP-read the mission layout, hash official mission files vs the baseline, classify official vs
-    unofficial, and compute global-leaderboard eligibility. Cached in _mission_audit_cache. Read-only."""
+    unofficial, and compute pool status (`eligible` = all-official & unedited). Cached. Read-only."""
     import hashlib
     d = {"loaded": True, "official": [], "unofficial": [], "edited": [], "missing": [],
          "mission_dir": "", "eligible": True, "reasons": [], "error": None}
@@ -5286,7 +5243,7 @@ def _mission_rotation_mutate(mutate):
 
 def mission_set_enabled(group, name, on, max_time=10800.0):
     """Add (on) or remove (off) a mission from the live MissionRotation. Enabling an unofficial mission
-    makes the server ineligible for the global leaderboard (surfaced by the next mission audit)."""
+    makes the pool diverge from stock (surfaced by the next mission audit)."""
     group = str(group or "User"); name = str(name or "")
     if not name:
         return {"ok": False, "error": "no mission name"}
@@ -5310,7 +5267,7 @@ def mission_set_enabled(group, name, on, max_time=10800.0):
 
 def mission_add_workshop(workshop_id, max_time=10800.0):
     """Add a Steam Workshop mission ({Group:Workshop,Name:<id>}) to the rotation -- the server
-    auto-downloads it on the next start. This enables it, so it disqualifies the global leaderboard."""
+    auto-downloads it on the next start. This enables it, so the pool diverges from stock."""
     wid = str(workshop_id or "").strip()
     if not re.fullmatch(r"\d{5,20}", wid):
         return {"ok": False, "error": "workshop id must be numeric"}
@@ -5319,7 +5276,7 @@ def mission_add_workshop(workshop_id, max_time=10800.0):
 
 def mission_upload(name, files):
     """SFTP-write an uploaded mission folder into MissionDirectory/<name>/. Adds it OFF (not in the
-    rotation) so eligibility is preserved until the owner enables it. files=[{path, b64}]. Read of the
+    rotation) until the owner enables it. files=[{path, b64}]. Read of the
     config is SFTP; writes are confined to MissionDirectory/<sanitized name>/."""
     import base64
     name = re.sub(r"[^A-Za-z0-9 ._-]", "", (name or "").strip())
