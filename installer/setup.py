@@ -313,27 +313,54 @@ def _platform():
         "linux_x64" if sys.platform.startswith("linux") else "unknown")
 
 
+def _pick_folder(initial=""):
+    """Open a NATIVE folder chooser on the user's machine (the wizard runs locally).
+    Returns {ok, path}. Falls back gracefully if tkinter isn't available (e.g. headless)."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:                                    # noqa: BLE001
+        return {"ok": False, "error": "no native folder picker on this machine — type the path"}
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.askdirectory(initialdir=(initial or os.path.expanduser("~")),
+                                       title="Choose a folder")
+        try:
+            root.destroy()
+        except Exception:                                # noqa: BLE001
+            pass
+        return {"ok": True, "path": path or ""}
+    except Exception as e:                               # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+
+
 def _api_install_server(payload):
     """Install the official dedicated server via SteamCMD into the chosen folder.
-    Launches detached (new console / logfile) so the multi-GB download never blocks."""
+    Downloads SteamCMD FIRST if the user doesn't already have it, then launches the
+    multi-GB game install detached (new console / logfile) so the wizard never blocks."""
     if not (_steamcmd and _fetcher):
         return {"ok": False, "error": "installer modules unavailable"}
     install_dir = (payload.get("dir") or "").strip()
     if not install_dir:
-        return {"ok": False, "error": "choose an install folder first"}
+        return {"ok": False, "error": "choose an install folder first (use Browse...)"}
     plat = str(payload.get("platform") or _platform())
     platform = "windows" if plat.startswith("win") else "linux"
+    sc_base = os.path.join(USER_DIR, "steamcmd")
     try:
-        sc = _steamcmd.ensure_steamcmd(os.path.join(USER_DIR, "steamcmd"), platform, _fetcher)
+        had = bool(_steamcmd.find_steamcmd(sc_base, platform))
+        sc = _steamcmd.ensure_steamcmd(sc_base, platform, _fetcher)   # downloads it if missing
         if not sc:
-            return {"ok": False, "error": "could not download/locate SteamCMD"}
+            return {"ok": False, "error": "could not download SteamCMD (check your internet connection)"}
         cmd, where = _steamcmd.launch_install(sc, install_dir)
-        note = ("SteamCMD launched in a new console window. " if where == "console"
-                else "SteamCMD launched (logging to %s). " % where)
-        return {"ok": True, "cmd": " ".join(cmd), "where": where,
-                "note": note + "It downloads several GB — when it finishes, click 'Check install'."}
+        steam_note = ("Downloaded SteamCMD. " if not had else "Using the SteamCMD already on this PC. ")
+        launch_note = ("The game server is now downloading in a new console window. " if where == "console"
+                       else "The game server is downloading (log: %s). " % where)
+        return {"ok": True, "cmd": " ".join(cmd), "where": where, "downloaded_steamcmd": not had,
+                "note": steam_note + launch_note + "It's several GB — when it finishes, click 'Check install'."}
     except Exception as e:                               # noqa: BLE001
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": "install failed: %s" % e}
 
 
 # ----------------------------- HTTP server -----------------------------
@@ -391,6 +418,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             d = (parse_qs(urlparse(self.path).query).get("dir") or [""])[0]
             exe = _steamcmd.server_exe(d) if _steamcmd else ""
             return self._send(200, json.dumps({"dir": d, "present": bool(exe), "exe": exe}))
+        if path == "/api/pick-folder":
+            from urllib.parse import urlparse, parse_qs
+            ini = (parse_qs(urlparse(self.path).query).get("initial") or [""])[0]
+            return self._send(200, json.dumps(_pick_folder(ini)))
         return self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):

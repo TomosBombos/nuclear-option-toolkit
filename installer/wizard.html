@@ -138,13 +138,13 @@ function renderServer(p){
     if(sv.mode==='install'){
       html+='<label class="fl">Where to install it <span class="hint">— a new/empty folder; SteamCMD will create it</span></label>'
         +'<div class="row"><div style="flex:1"><input type="text" value="'+v('dir')+'" placeholder="C:\\\\NuclearOptionServer" oninput="state.server.dir=this.value"></div>'
-        +'<button class="go" onclick="installServer(this)">Install now</button> <button onclick="checkServer(this)">Check install</button></div>'
+        +'<button onclick="pickServerDir(this)">Browse…</button> <button class="go" onclick="installServer(this)">Install now</button> <button onclick="checkServer(this)">Check install</button></div>'
         +'<div id="instMsg" class="msg"></div>'
         +'<div class="hint">SteamCMD opens in its own window and downloads several GB — leave it running, then click <b>Check install</b>.</div>';
     }else{
       html+='<label class="fl">Existing server folder</label>'
         +'<div class="row"><div style="flex:1"><input type="text" value="'+v('dir')+'" placeholder="C:\\\\path\\\\to\\\\NuclearOptionServer" oninput="state.server.dir=this.value"></div>'
-        +'<button class="go" onclick="detectServer(this)">Detect</button> <button onclick="checkServer(this)">Check folder</button></div>'
+        +'<button onclick="pickServerDir(this)">Browse…</button> <button class="go" onclick="detectServer(this)">Detect</button> <button onclick="checkServer(this)">Check folder</button></div>'
         +'<div id="svMsg" class="msg"></div><div id="instMsg" class="msg"></div>';
     }
     if(sv.installed){
@@ -181,6 +181,11 @@ async function checkServer(btn){btn.disabled=true;const m=document.getElementByI
   let r;try{r=await api('/api/server-status?dir='+encodeURIComponent(state.server.dir||''));}catch(e){r={};}
   if(r&&r.present){state.server.installed=true;state.server.exe=r.exe;render();}
   else{state.server.installed=false;if(m)m.innerHTML='<span class="warn">not found yet — if SteamCMD is still downloading, wait and click Check again</span>';btn.disabled=false;}}
+async function pickServerDir(btn){btn.disabled=true;
+  let r;try{r=await api('/api/pick-folder?initial='+encodeURIComponent(state.server.dir||''));}catch(e){r={};}
+  btn.disabled=false;
+  if(r&&r.ok&&r.path){state.server.dir=r.path;render();}
+  else if(r&&r.error){const m=document.getElementById('svMsg')||document.getElementById('instMsg');if(m)m.innerHTML='<span class="warn">'+esc(r.error)+'</span>';}}
 
 const PRESETS={
   full:{name:'Full community',set:{}},   // all defaults (everything on)
