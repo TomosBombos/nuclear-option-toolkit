@@ -93,12 +93,13 @@ function renderConnection(p){
   const f=(k,label,ph,type='text')=>`<label class="fl">${label}</label><input type="${type}" value="${v(k)}" placeholder="${ph||''}" oninput="state.connection['${k}']=this.value">`;
   let html='<div class="card">';
   if(state.scenario==='own_pc'){
+    if(state.server.dir && !state.connection.log_path){ state.connection.log_path = state.server.dir.replace(/[\\/]+$/,'') + '\\logs\\console.log'; }
     html+='<div class="hint" style="margin-bottom:6px">Own-PC hosting: the bot reads the local server log and controls the local process. (Your server folder + ports were set in the previous step.)</div>'
       +'<label class="fl">Server log file</label>'
       +'<div class="row"><div style="flex:1"><input type="text" value="'+v('log_path')+'" placeholder="console.log" oninput="state.connection.log_path=this.value"></div><button onclick="pickLogFile(this)">Browse…</button></div>'
-      +'<div class="hint">The console log the server writes (it carries chat + the plugin\'s data). With our launch settings it lands at <code>logs/console.log</code> inside your server folder — click <b>Browse…</b> to pick it (the picker opens in your server folder).</div>'
+      +'<div class="hint"><b>This file doesn\'t exist until the server runs</b> — so on <b>Save</b> the installer creates the <code>logs</code> folder, an empty <code>console.log</code>, and a <b>StartServer</b> launcher in your server folder. We\'ve pre-filled the path above; run StartServer once and the bot reads it. (Browse… only after that if you want a different file.)</div>'
       +'<label class="fl">RemoteCommand port</label><input type="number" value="'+v('rcmd_port')+'" placeholder="5504" oninput="state.connection.rcmd_port=this.value">'
-      +'<div class="hint">The port the game server opens for admin commands — you launch the server with <code>-ServerRemoteCommands &lt;port&gt;</code> (default 5504). On your own PC the bot reaches it over <b>127.0.0.1</b>, so you do <b>not</b> need to open or forward this port.</div>';
+      +'<div class="hint">The port the game server opens for admin commands — the StartServer launcher passes <code>-ServerRemoteCommands &lt;port&gt;</code> (default 5504). On your own PC the bot reaches it over <b>127.0.0.1</b>, so you do <b>not</b> need to open or forward this port.</div>';
     state.power='local';
   } else {
     html+='<div class="hint" style="margin-bottom:6px">SFTP is used to tail the log + deploy the plugin. Power control is optional (Pterodactyl / manual).</div>'
@@ -300,7 +301,9 @@ async function saveAll(btn){btn.disabled=true;$('#savemsg').textContent='writing
       +'<div>• config: <code>'+esc(r.config_path)+'</code></div>'
       +'<div>• secrets (0600, never commit): <code>'+esc(r.secrets_path)+'</code></div>'
       +(r.cfg_path?'<div>• generated plugin cfg: <code>'+esc(r.cfg_path)+'</code></div>':'')
-      +'<div class="hint" style="margin-top:10px">Next: launch the bot + web command centre (the launcher will read this config), then open the web CC to fine-tune any setting live. '
+      +((r.dedicated_config&&r.dedicated_config.length)?'<div>• server config (ports/name): <code>'+esc(r.dedicated_config[r.dedicated_config.length-1])+'</code></div>':'')
+      +(r.launch?'<div>• launcher: <code>'+esc(r.launch.script)+'</code></div><div>• server log: <code>'+esc(r.launch.log)+'</code></div>':'')
+      +'<div class="hint" style="margin-top:10px">Next: '+(r.launch?'run the <b>StartServer</b> launcher above in your server folder to start the modded server (it creates the log), then ':'')+'launch the bot + web command centre (they read this config), then open the web CC to fine-tune any setting live. '
       +(state.github_repo?'Use the GitHub updater to pull plugin fixes when you choose.':'Add a GitHub repo later to enable opt-in plugin updates.')+'</div>';
   } else {$('#savemsg').innerHTML='<span class="bad">✗ '+esc(r.error||'failed')+'</span>';}
   btn.disabled=false;

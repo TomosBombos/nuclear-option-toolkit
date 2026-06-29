@@ -184,6 +184,44 @@ def _render_plugin_cfg(features):
     return "\n".join(lines)
 
 
+def _generate_launch(game_dir, platform, rcmd_port):
+    """Own-PC install: create logs/console.log + a StartServer launcher in the game folder so
+    the server boots modded (BepInEx) and writes the log the bot reads. Returns (script, log)."""
+    logs = os.path.join(game_dir, "logs")
+    os.makedirs(logs, exist_ok=True)
+    logp = os.path.join(logs, "console.log")
+    if not os.path.exists(logp):
+        open(logp, "a").close()                          # so the path exists immediately
+    if platform == "windows":
+        script = os.path.join(game_dir, "StartServer.bat")
+        body = ("@echo off\r\n"
+                "cd /d \"%~dp0\"\r\n"
+                "if not exist logs mkdir logs\r\n"
+                "echo Starting Nuclear Option (modded) - logs\\console.log\r\n"
+                "NuclearOptionServer.exe -batchmode -nographics -logFile logs\\console.log -ServerRemoteCommands %s\r\n"
+                "pause\r\n" % rcmd_port)
+    else:
+        script = os.path.join(game_dir, "start_server.sh")
+        body = ("#!/usr/bin/env bash\n"
+                "cd \"$(dirname \"$0\")\"\n"
+                "mkdir -p logs\n"
+                "chmod +x ./NuclearOptionServer.x86_64 ./libdoorstop.so 2>/dev/null || true\n"
+                "export LD_LIBRARY_PATH=\"$(pwd):$(pwd)/linux64:$LD_LIBRARY_PATH\"\n"
+                "export DOORSTOP_ENABLED=1\n"
+                "export DOORSTOP_TARGET_ASSEMBLY=\"$(pwd)/BepInEx/core/BepInEx.Preloader.dll\"\n"
+                "export LD_PRELOAD=\"$(pwd)/libdoorstop.so:$LD_PRELOAD\"\n"
+                "./NuclearOptionServer.x86_64 -batchmode -nographics -logFile logs/console.log -ServerRemoteCommands %s\n"
+                % rcmd_port)
+    with open(script, "w", encoding="utf-8", newline="") as f:
+        f.write(body)
+    if platform != "windows":
+        try:
+            os.chmod(script, 0o755)
+        except OSError:
+            pass
+    return script, logp
+
+
 def _save(payload):
     scenario = payload.get("scenario", "external_linux")
     conn = payload.get("connection", {})
@@ -222,6 +260,20 @@ def _save(payload):
         "install_mode": srv.get("mode", ""),       # install | existing
         "game_dir": game_dir,
     })
+    # own-PC: create the log + a StartServer launcher in the game folder, so the server
+    # boots modded and writes the log the bot reads — and the log path exists immediately.
+    launch = None
+    if scenario == "own_pc" and game_dir and os.path.isdir(game_dir):
+        rcmd = int(conn.get("rcmd_port") or 5504)
+        plat = "windows" if _platform().startswith("win") else "linux"
+        try:
+            script, logp = _generate_launch(game_dir, plat, rcmd)
+            launch = {"script": script, "log": logp}
+            config["server"]["log_path"] = logp
+            config["server"]["rcmd_host"] = "127.0.0.1"
+            config["server"]["rcmd_port"] = rcmd
+        except OSError:
+            launch = None
     # secrets.json — NEVER shared/committed (0600).
     secret = {
         "sftp_pass": conn.get("sftp_pass", ""),
@@ -251,7 +303,7 @@ def _save(payload):
         except ValueError as e:
             dsc.append("PORTS INVALID: %s" % e)
     return {"ok": True, "config_path": CONFIG, "secrets_path": SECRETS, "cfg_path": cfg_path,
-            "dedicated_config": dsc}
+            "dedicated_config": dsc, "launch": launch}
 
 
 def _api_plan(option):
