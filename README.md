@@ -39,23 +39,6 @@ details (each field explains **what it is** and **where to find it**) and wires 
 
 → Full plain-English tour: **[docs/FEATURES.md](docs/FEATURES.md)**
 
-## Global Leaderboard
-
-The top-ranked pilots across every server running the toolkit.
-*(Goes live here once the shared cross-server board is up — it's being stood up now.)*
-
-| Points | Rank | Name | Server |
-|--------|------|------|--------|
-| *coming soon* | | | |
-| | | | |
-| | | | |
-| | | | |
-| | | | |
-
-The full board is also available in game with `!global`. **Running a server?** Turn on the global
-leaderboard in the command centre's settings to contribute — only player names, points, region, and
-your server name are published (never IPs or SteamIDs).
-
 ## Documentation
 
 | Doc | What it covers |
@@ -152,16 +135,14 @@ Maintainers publish with `src/scripts/release.py` (`--with-bot`, `--channel`). S
 
 ## Community Servers
 
-Servers running the toolkit that have opted into the public directory — find them by **name** in the
-in-game server browser (Nuclear Option has no direct-connect). **Status** refreshes about every 4 hours
-(a server shows online if it checked in on the latest update).
+Servers running the toolkit that have opted into the public directory. Find them by **name** in the
+in-game server browser (Nuclear Option has no direct-connect).
 
-| Server | Region | Status |
-|--------|--------|--------|
-| *coming soon* | | |
+👉 **[Browse the live community server directory](https://tomosbombos.github.io/nuclear-option-servers/)**
 
-**Running a server?** Enable listing in the command centre's settings to appear here (name + region
-only — never your IP).
+**Running a server?** Enable *List Server Publicly* in the command centre's settings to appear there —
+only your server's name, region, and plugin version are published (never your IP). Setup steps:
+[docs/SERVERS.md](docs/SERVERS.md).
 
 ## License
 
