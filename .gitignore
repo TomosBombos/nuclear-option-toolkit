@@ -1,0 +1,72 @@
+# ───────────────────────────────────────────────────────────────────
+#  Credential-free + PII-free repo. NOTHING below may ever be committed.
+#  (See docs/PRE_UPLOAD_CHECKLIST.md — start a FRESH repo, scrub first.)
+# ───────────────────────────────────────────────────────────────────
+
+# secrets / credentials
+run.bat
+apiKey.txt
+panel.txt
+secrets.json
+*.key
+*.pem
+*.minisig
+.minisign/
+scripts/scrub_targets.json
+
+# runtime state / PII (SteamIDs, names, chat)
+*.log
+*.jsonl
+ranks*.json*
+match_history.json
+dashboard_state.json
+schedule.json
+command_centre_settings.json
+console_filters.json
+plugin_commands.txt
+plugin_ranks.txt
+plugin_skill.txt
+plugin_bans.txt
+plugin_squads.txt
+bot_overrides.json
+*.done
+*.bak
+
+# user-installed config (lives in ~/.nuke-option-toolkit, but ignore here too)
+config.json
+
+# deploy state / binaries
+deployed_plugin.*
+pending_plugin.*
+release_out/
+*.dll
+
+# machine-generated dev dumps / harness
+docs/_*.json
+.claude/
+__pycache__/
+*.pyc
+
+# bulk / backups / build
+archive/
+backups/
+_server_backup/
+map_backup_*/
+mapdata/
+NukeStats/libs/
+NukeStats/bin/
+NukeStats/obj/
+NukeStats/bepinex_pack/
+
+# un-ignore the published templates + the trusted public key
+!run.bat.example
+!apiKey.txt.example
+!panel.txt.example
+!anz.nukestats.cfg.example
+!config.example.json
+!installer/trusted.pub
+!scripts/scrub_targets.example.json
+
+# --- hardening (build_public_repo.py) ---
+*.lnk
+installer/sources.lock.json

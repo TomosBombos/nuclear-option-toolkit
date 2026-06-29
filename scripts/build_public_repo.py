@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""Build a clean-room PUBLIC release tree of the Nuclear Option toolkit.
+
+Copies ONLY whitelisted files into a fresh destination folder, applies a fixed
+set of scrub transforms (strip the real host / server IP / admin SteamID, fix the
+doc preambles + plugin-version drift, reword the not-yet-shipped trust-key claim),
+writes a hardened .gitignore, then runs a secret/PII scan over the result. It
+refuses to finish (exit 2) if the scan finds a hard secret, and warns (exit 0) on
+softer hits.
+
+KEY PROPERTIES
+  * The LIVE working files are NEVER modified — every transform runs on the COPIES.
+  * No real secret/PII literal lives in THIS file. The real SteamID/IP/host that
+    the scrubber must find-and-replace are read from scripts/scrub_targets.json
+    (gitignored, never published). A published scrub_targets.example.json shows
+    the shape so a forker can scrub their own deployment the same way.
+
+Usage:
+    cp scripts/scrub_targets.example.json scripts/scrub_targets.json   # then fill in
+    python scripts/build_public_repo.py --dest ../nuclear-option-toolkit
+    python scripts/build_public_repo.py --dest /tmp/pub --force        # overwrite
+    python scripts/build_public_repo.py --dest /tmp/pub --strict       # warns fail too
+
+After it succeeds:
+    cd <dest> && git init && git add -A && git commit -m "Initial public release"
+"""
+import argparse
+import fnmatch
+import json
+import os
+import re
+import shutil
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+
+# ---------------------------------------------------------------------------
+# WHITELIST — exactly what the public repo contains. Everything else is excluded
+# by omission (deny-by-default). See docs/PUBLIC_REPO_MANIFEST.md for the rationale.
+# ---------------------------------------------------------------------------
+ROOT_FILES = [
+    # docs
+    "README.md", "SECURITY.md", "SERVER_DOCUMENTATION.md", "LICENSE",
+    # runtime / product source
+    "no_mapvote_bot.py", "cc_web.py", "command_centre.py", "map_atlas.py",
+    "webcc.html", "settings_catalogue.json",
+    # map assets (rendered PNGs the web map needs)
+    "heartland_map.png", "ignus_map.png",
+    # launchers / helper bats (no secrets — verified)
+    "webcc.bat", "commandcentre.bat", "deploy.bat", "endmission.bat",
+    "say.bat", "status.bat", "run_keepalive.bat",
+    # config TEMPLATES (the real run.bat/apiKey.txt/panel.txt are gitignored)
+    "run.bat.example", "apiKey.txt.example", "panel.txt.example",
+    "anz.nukestats.cfg.example", "config.example.json",
+]
+
+# Whole-subtree includes, each minus the listed glob excludes (paths relative to
+# the subtree root, forward-slashes). Excluded dirs are pruned for speed.
+TREE_INCLUDES = {
+    "docs":       ["_*.json"],                                    # drop machine dumps
+    "installer":  ["__pycache__/*", "sources.lock.json"],         # local install state
+    "scripts":    ["__pycache__/*", "scrub_targets.json"],        # never ship real targets
+    "NukeStats":  ["libs/*", "bin/*", "obj/*", "bepinex_pack/*"],  # proprietary/build
+    "map-build":  ["__pycache__/*"],
+    "relay":      [],                                            # localhost->WAN remote-command relay
+    "START HERE": ["*.lnk"],                                      # machine-specific shortcut
+}
+
+# Real secret/PII anchors are loaded from scrub_targets.json at runtime, NOT hardcoded.
+REAL_SID = REAL_IP = REAL_HOST = None
+# Live plugin version, read from the plugin source so the docs never drift.
+PLUGIN_VERSION = None
+
+
+def _plugin_version():
+    p = os.path.join(ROOT, "NukeStats", "NukeStatsPlugin.cs")
+    with open(p, encoding="utf-8") as f:
+        m = re.search(r'Version\s*=\s*"([0-9][0-9.]*)"', f.read())
+    if not m:
+        raise SystemExit("could not read plugin Version from NukeStatsPlugin.cs")
+    return m.group(1)
+
+
+def _load_targets():
+    p = os.path.join(HERE, "scrub_targets.json")
+    if not os.path.exists(p):
+        raise SystemExit(
+            "missing scripts/scrub_targets.json\n"
+            "  -> copy scripts/scrub_targets.example.json to scripts/scrub_targets.json\n"
+            "     and fill in your real admin SteamID, server IP, and SFTP host.\n"
+            "     (it is gitignored and never published)")
+    with open(p, encoding="utf-8") as f:
+        d = json.load(f)
+    for k in ("real_sid", "real_ip", "real_host"):
+        if not d.get(k):
+            raise SystemExit("scrub_targets.json missing '%s'" % k)
+    return d["real_sid"], d["real_ip"], d["real_host"]
+
+
+# ---------------------------------------------------------------------------
+# SCRUB transforms — keyed by dest-relative path (forward slashes).
+# _require() raises if the expected anchor is gone (so we never silently ship an
+# un-scrubbed file after the source changes upstream).
+# ---------------------------------------------------------------------------
+def _require(text, old, new):
+    if old not in text:
+        raise AssertionError("scrub anchor not found (file changed?): %r" % (old[:70]))
+    return text.replace(old, new)
+
+
+def scrub_bot(text):
+    text = _require(
+        text,
+        'RCMD_HOST = "%s"   # server IP exposing the remote-command port' % REAL_IP,
+        'RCMD_HOST = os.environ.get("NO_RCMD_HOST", "127.0.0.1")   # set NO_RCMD_HOST to your server host exposing the remote-command relay port',
+    )
+    text = _require(
+        text,
+        "#   export NO_SFTP_HOST=%s" % REAL_HOST,
+        "#   export NO_SFTP_HOST=your-sftp-host.example.net",
+    )
+    text = _require(
+        text,
+        'ADMIN_SIDS      = {"%s"}   # Tomo - tagged [ADMIN] in the command-centre activity feed' % REAL_SID,
+        'ADMIN_SIDS      = set(os.environ.get("NO_ADMIN_SIDS", "").split())   # space-separated SteamID64s tagged [ADMIN] in the command-centre activity feed',
+    )
+    # remaining example SteamIDs in comments / replay-test strings
+    text = text.replace(REAL_SID, "7656119xxxxxxxxxx")
+    # belt-and-suspenders: no real host/IP may survive
+    text = text.replace(REAL_IP, "your-host.example.net")
+    text = text.replace(REAL_HOST, "your-sftp-host.example.net")
+    return text
+
+
+def scrub_plugin(text):
+    text = _require(
+        text,
+        'Config.Bind("Admin", "SteamIds", "%s",' % REAL_SID,
+        'Config.Bind("Admin", "SteamIds", "",',
+    )
+    if REAL_SID in text:
+        raise AssertionError("plugin still contains a real SteamID after scrub")
+    return text
+
+
+def strip_preamble(text):
+    """Drop any leaked agent-preamble lines before the first '# ' H1 heading."""
+    lines = text.splitlines(keepends=True)
+    for i, ln in enumerate(lines):
+        if ln.startswith("# "):
+            return "".join(lines[i:])
+    raise AssertionError("no H1 heading found to anchor preamble strip")
+
+
+def scrub_architecture(text):
+    if "0.9.5" not in text:
+        raise AssertionError("ARCHITECTURE.md: expected 0.9.5 version refs to fix")
+    return text.replace("0.9.5", PLUGIN_VERSION)
+
+
+def scrub_design_history(text):
+    return _require(text, "The newest layer (v0.9.5) adds", "The v0.9.5 layer adds")
+
+
+def scrub_security(text):
+    old = ("The matching **public key ships with the toolkit** as "
+           "`installer/trusted.pub` (and is baked into the frozen launcher). "
+           "This is the trust root.")
+    new = ("The matching **public key ships with the toolkit** as "
+           "`installer/trusted.pub` **from the first signed release onward** "
+           "(and is baked into the frozen launcher). This is the trust root. "
+           "*(Until that first signed release `trusted.pub` is absent, and the "
+           "updater refuses to stage a binary unless you pass "
+           "`--i-understand-unsigned`.)*")
+    return _require(text, old, new)
+
+
+SCRUBS = {
+    "no_mapvote_bot.py": scrub_bot,
+    "NukeStats/NukeStatsPlugin.cs": scrub_plugin,
+    "docs/INSTALL_SOURCES.md": strip_preamble,
+    "docs/SETTINGS_AND_INSTALL_V2.md": strip_preamble,
+    "docs/PRODUCTIZATION_PLAN.md": strip_preamble,
+    "docs/ARCHITECTURE.md": scrub_architecture,
+    "docs/DESIGN_HISTORY.md": scrub_design_history,
+    "SECURITY.md": scrub_security,
+}
+
+# ---------------------------------------------------------------------------
+# Secret/PII scan (the gate). Generic detectors are static; the two host/IP
+# specific detectors are built from the loaded targets so no literal lives here.
+# ---------------------------------------------------------------------------
+HARD_GENERIC = [
+    ("Pterodactyl client key", re.compile(r"ptlc_[A-Za-z0-9]{20,}")),
+    ("Pterodactyl application key", re.compile(r"ptla_[A-Za-z0-9]{20,}")),
+    ("Real SteamID64", re.compile(r"7656119\d{10}")),
+    ("Private key block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("Non-placeholder SFTP password",
+     re.compile(r"""NO_SFTP_PASS\s*=\s*["'](?!your-|<|\s)[^"']{4,}""")),
+]
+WARN = [
+    ("Possible IPv4", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
+    ("Possible email", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
+]
+IP_ALLOW = {"127.0.0.1", "0.0.0.0", "255.255.255.255"}
+BINARY_EXT = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".pyc", ".dll", ".zip",
+              ".gz", ".lnk", ".pdf"}
+
+
+def _host_patterns(real_host):
+    pats = [re.escape(real_host)]
+    parts = real_host.split(".")
+    if len(parts) >= 2 and len(parts[-2]) >= 4:
+        pats.append(r"\b%s\b" % re.escape(parts[-2]))   # the distinctive node label
+    return "|".join(pats)
+
+
+def _hard_patterns():
+    specific = [
+        ("Known real server IP", re.compile(re.escape(REAL_IP))),
+        ("Known real SFTP host", re.compile(_host_patterns(REAL_HOST))),
+    ]
+    return HARD_GENERIC + specific
+
+
+def _redact(s):
+    return s[:6] + "***" if len(s) > 6 else "***"
+
+
+def scan(dest):
+    hard_patterns = _hard_patterns()
+    hard_hits, warn_hits = [], []
+    for base, dirs, files in os.walk(dest):
+        if ".git" in dirs:
+            dirs.remove(".git")
+        for fn in files:
+            if os.path.splitext(fn)[1].lower() in BINARY_EXT:
+                continue
+            fp = os.path.join(base, fn)
+            rel = os.path.relpath(fp, dest).replace("\\", "/")
+            try:
+                with open(fp, encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+            except OSError:
+                continue
+            for i, line in enumerate(lines, 1):
+                for kind, rx in hard_patterns:
+                    for m in rx.finditer(line):
+                        hard_hits.append((rel, i, kind, _redact(m.group(0))))
+                for kind, rx in WARN:
+                    for m in rx.finditer(line):
+                        val = m.group(0)
+                        if kind == "Possible IPv4" and val in IP_ALLOW:
+                            continue
+                        warn_hits.append((rel, i, kind, val))
+    return hard_hits, warn_hits
+
+
+# ---------------------------------------------------------------------------
+# Copy helpers
+# ---------------------------------------------------------------------------
+def _excluded(rel, patterns):
+    return any(fnmatch.fnmatch(rel, p) for p in patterns)
+
+
+def copy_root_files(dest, copied):
+    for name in ROOT_FILES:
+        src = os.path.join(ROOT, name)
+        if not os.path.exists(src):
+            raise SystemExit("MISSING whitelisted file: %s" % name)
+        shutil.copy2(src, os.path.join(dest, name))
+        copied.append(name)
+
+
+def copy_trees(dest, copied):
+    for sub, excludes in TREE_INCLUDES.items():
+        src_root = os.path.join(ROOT, sub)
+        if not os.path.isdir(src_root):
+            raise SystemExit("MISSING whitelisted dir: %s" % sub)
+        for base, dirs, files in os.walk(src_root):
+            relbase = os.path.relpath(base, src_root).replace("\\", "/")
+            relbase = "" if relbase == "." else relbase + "/"
+            dirs[:] = [d for d in dirs
+                       if not _excluded(relbase + d + "/*", excludes)
+                       and not _excluded(relbase + d, excludes)]
+            for fn in files:
+                rel = relbase + fn
+                if _excluded(rel, excludes):
+                    continue
+                out = os.path.join(dest, sub, *rel.split("/"))
+                os.makedirs(os.path.dirname(out), exist_ok=True)
+                shutil.copy2(os.path.join(base, fn), out)
+                copied.append(sub + "/" + rel)
+
+
+def apply_scrubs(dest):
+    applied = []
+    for rel, func in SCRUBS.items():
+        fp = os.path.join(dest, *rel.split("/"))
+        if not os.path.exists(fp):
+            raise SystemExit("scrub target not copied: %s" % rel)
+        with open(fp, encoding="utf-8") as f:
+            text = f.read()
+        text = func(text)
+        with open(fp, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        applied.append(rel)
+    return applied
+
+
+def harden_gitignore(dest):
+    with open(os.path.join(ROOT, ".gitignore"), encoding="utf-8") as f:
+        t = f.read()
+    t = t.replace("ranks*.json\n", "ranks*.json*\n")          # close the .bak gap
+    block = ("\n# --- hardening (build_public_repo.py) ---\n"
+             "*.bak\n*.pem\n*.minisig\n*.lnk\n"
+             "console_filters.json\n"
+             "scripts/scrub_targets.json\n"
+             "installer/sources.lock.json\n")
+    if "# --- hardening" not in t:
+        t += block
+    with open(os.path.join(dest, ".gitignore"), "w", encoding="utf-8", newline="") as f:
+        f.write(t)
+
+
+def post_checks(dest, warnings):
+    readme = os.path.join(dest, "README.md")
+    with open(readme, encoding="utf-8") as f:
+        rt = f.read()
+    if os.path.exists(os.path.join(dest, "LICENSE")):
+        rt = rt.replace("See `LICENSE` (TBD before public release).",
+                        "See [`LICENSE`](LICENSE).")
+        with open(readme, "w", encoding="utf-8", newline="") as f:
+            f.write(rt)
+    else:
+        warnings.append("No LICENSE file — README still says 'LICENSE (TBD)'. "
+                        "Add one (plan recommends GPL-3.0-or-later) before publishing.")
+    if not os.path.exists(os.path.join(dest, "installer", "trusted.pub")):
+        warnings.append("installer/trusted.pub absent — generate+commit the minisign "
+                        "public key before the first SIGNED release, or the updater can "
+                        "only stage with --i-understand-unsigned.")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dest", required=True, help="output folder for the clean public tree")
+    ap.add_argument("--force", action="store_true", help="overwrite an existing dest")
+    ap.add_argument("--strict", action="store_true", help="treat WARN hits as failures too")
+    a = ap.parse_args()
+
+    global REAL_SID, REAL_IP, REAL_HOST, PLUGIN_VERSION
+    REAL_SID, REAL_IP, REAL_HOST = _load_targets()
+    PLUGIN_VERSION = _plugin_version()
+
+    dest = os.path.abspath(a.dest)
+    if os.path.abspath(ROOT) == dest or dest.startswith(os.path.abspath(ROOT) + os.sep):
+        raise SystemExit("dest must be OUTSIDE the source repo (never build in place)")
+    if os.path.exists(dest):
+        if not a.force:
+            raise SystemExit("dest exists; pass --force to overwrite: %s" % dest)
+        shutil.rmtree(dest)
+    os.makedirs(dest)
+
+    copied, warnings = [], []
+    copy_root_files(dest, copied)
+    copy_trees(dest, copied)
+    applied = apply_scrubs(dest)
+    harden_gitignore(dest)
+    post_checks(dest, warnings)
+
+    hard, warn = scan(dest)
+
+    print("=" * 64)
+    print("BUILD: %s" % dest)
+    print("  files copied : %d" % len(copied))
+    print("  scrubs applied: %d  (%s)" % (len(applied), ", ".join(applied)))
+    print("  .gitignore   : hardened (ranks*.json* / *.bak / console_filters.json / *.pem / *.minisig)")
+    print("  plugin version: %s (ARCHITECTURE.md synced to source)" % PLUGIN_VERSION)
+    print("-" * 64)
+    if warn:
+        print("WARN (%d) - review, usually benign (localhost, doc IPs, example emails):" % len(warn))
+        for rel, ln, kind, val in warn[:40]:
+            print("  ~ %-26s %s:%d  %s" % (kind, rel, ln, val))
+        if len(warn) > 40:
+            print("  ... +%d more" % (len(warn) - 40))
+    for w in warnings:
+        print("WARN  %s" % w)
+    print("-" * 64)
+    if hard:
+        print("FAIL - %d HARD secret/PII hit(s) WOULD be published:" % len(hard))
+        for rel, ln, kind, val in hard:
+            print("  !! %-26s %s:%d  %s" % (kind, rel, ln, val))
+        print("=" * 64)
+        sys.exit(2)
+    if a.strict and warn:
+        print("FAIL (--strict) - %d WARN hit(s)." % len(warn))
+        sys.exit(2)
+    print("CLEAN - no hard secrets. Ready for:  cd %s && git init && git add -A" % a.dest)
+    print("=" * 64)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "scenario": "external_linux",
+  "server": {
+    "sftp_host": "your-host.example.net",
+    "sftp_port": 2022,
+    "sftp_user": "your-user",
+    "log_path": "/home/container/console.log",
+    "rcmd_host": "your-host.example.net",
+    "rcmd_port": 5550,
+    "panel_url": "https://panel.yourhost.example",
+    "server_id": "abcd1234",
+    "local_game_dir": "",
+    "power": "pterodactyl"
+  },
+  "web": {
+    "port": 8770
+  },
+  "features": {
+    "Chat.Reformat": true,
+    "Chat.RankInName": true,
+    "Chat.ProfanityFilter": true,
+    "Balance.Enforce": true,
+    "Balance.AutoMove": true,
+    "Balance.MoveOnlyUnspawned": true,
+    "Skill.BalanceBySkill": true,
+    "Forfeit.Enabled": true,
+    "KillFeed.Custom": true,
+    "PvE.TimeoutForceDefeat": false,
+    "Cleanup.DismountedPilots": true,
+    "Teamkill.Enforce": true,
+    "AILimit.Enforce": true,
+    "Flood.Enforce": true,
+    "Flood.LogDrops": true,
+    "Flood.DropDeadNetIdRpcs": true,
+    "DedicatedServerConfig.VoteKick": false
+  },
+  "update": {
+    "github_repo": "TomosBombos/nuclear-option-toolkit",
+    "channel": "stable",
+    "auto_check": false
+  }
+}

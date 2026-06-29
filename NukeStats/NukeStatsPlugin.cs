@@ -1,0 +1,3832 @@
+/*
+ * NukeStats - server-side BepInEx plugin for Nuclear Option.
+ *
+ *  1) Stats sensor: emits each player's real PlayerScore/PlayerRank/Teamkills as
+ *     "[NOSTATS] {json}" lines on stdout (-> console.log, which the external bot tails).
+ *  2) End-of-game awards: on FactionHQ.DeclareEndGame("Victory") it determines the
+ *     winning faction authoritatively (no faction-0 guessing) and emits award events:
+ *     +WinPoints to every player on the winning side, and placement bonuses
+ *     (1st/2nd/3rd by PlayerScore). The bot applies these to ranks.json.
+ *  3) Chat reformat: rewrites player chat as "[Name - Rank] message" in the rank's
+ *     colour, by rerouting it through a server message (the normal path renders
+ *     "Name:" + faction colour CLIENT-side and strips rich text, so it can't be
+ *     restyled in place). Rank label+colour come from plugin_ranks.txt, which the
+ *     bot writes to the container.
+ *  4) Profanity gate: the in-game filter doesn't work, so before chat broadcasts we
+ *     scan it; if any token is a racist slur (leet/spacing/repeat-normalised), the
+ *     WHOLE message is replaced with a canned line. Ordinary swearing is left alone.
+ *  5) Team control: PvP auto-balance (move the rank-optimal unspawned player when a side
+ *     is >MaxDifference ahead) + admin in-game chat commands (!move/!spec/!join/!balance,
+ *     authorised by plugin_admins.txt) and a public !autobalance explainer.
+ *
+ * Member names confirmed by decompiling Assembly-CSharp.dll (ilspycmd). Tunables live
+ * in BepInEx/config/anz.nukestats.cfg. Items marked VERIFY are runtime-confirmed at deploy.
+ */
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using System.Text.RegularExpressions;
+using BepInEx;
+using BepInEx.Configuration;
+using BepInEx.Logging;
+using HarmonyLib;
+using Mirage;
+using NuclearOption.Chat;
+using NuclearOption.Networking;
+using NuclearOption.SavedMission;
+using UnityEngine;
+
+namespace NukeStats
+{
+    [BepInPlugin(Guid, "NukeStats", Version)]
+    public class NukeStatsPlugin : BaseUnityPlugin
+    {
+        public const string Guid = "anz.nukestats";
+        public const string Version = "0.9.14";
+        internal static ManualLogSource Log;
+        internal static NukeStatsPlugin Instance;
+
+        // Tunable without rebuilding (BepInEx/config/anz.nukestats.cfg)
+        internal static ConfigEntry<bool> ReformatChat;
+        internal static ConfigEntry<int> WinPoints, FirstPlace, SecondPlace, ThirdPlace;
+        internal static ConfigEntry<float> SnapshotSeconds;
+        internal static ConfigEntry<bool> EnforceBalance;        // PvP team-balance block-join
+        internal static ConfigEntry<int> BalanceMaxDiff;
+        internal static ConfigEntry<bool> RankInName;            // embed [RANK] into the player's chat name (restores native TTS)
+        internal static ConfigEntry<bool> ProfanityFilter;       // replace whole messages that contain a racist slur
+        internal static ConfigEntry<bool> CustomKillFeed;        // suppress the native flood; announce streaks + ship sinks instead
+        internal static ConfigEntry<bool> CleanupPilots;         // periodically despawn old dismounted pilots
+        internal static ConfigEntry<int> PilotLifetime;          // seconds a dismounted pilot may linger before cleanup
+        internal static ConfigEntry<bool> AiLimit;               // AI aircraft limiter (perf precaution)
+        internal static ConfigEntry<bool> TimeoutForceDefeat;    // PvE: force human defeat on mission-timer expiry
+        internal static ConfigEntry<bool> PvpTimeoutResult;      // PvP: on timeout the higher total in-game score wins (tie = draw)
+        internal static ConfigEntry<int>  TimeoutLeadSeconds;    // fire the timeout resolution this many seconds BEFORE MaxTime (so the map vote runs before rotation)
+        internal static ConfigEntry<bool>   GlobalEnabled, GlobalListServer;  // opt-in: global leaderboard / public server directory
+        internal static ConfigEntry<string> GlobalRegion;                     // server region for the leaderboard + directory
+        internal static ConfigEntry<int> AiPerTeamCap, AiTotalCap, AiStuckSeconds, AiStuckRadius;
+        internal static ConfigEntry<int> PvpStartingRank;        // PvP (both factions joinable): floor every player's start to this in-game rank (0 = off)
+        internal static ConfigEntry<bool> ForfeitEnabled;        // PvP: allow a team to vote to surrender via !forfeit
+        internal static ConfigEntry<int>  ForfeitCooldownSeconds; // seconds before a team can START another forfeit vote
+        internal static ConfigEntry<bool> FloodEnforce;          // per-player rate limit on fleet move-orders (anti mass-DC)
+        internal static ConfigEntry<int>  FloodPerSec, FloodBurst;
+        internal static ConfigEntry<bool> FloodLogDrops, FloodDropDeadNet;
+        internal static ConfigEntry<bool> MirageRaiseSendBuffer;  // anti mass-DC Layer C: raise the reliable-send-buffer cap
+        internal static ConfigEntry<int>  MirageSendBufferLimit;  // target for MaxReliablePacketsInSendBufferPerConnection
+        internal static ConfigEntry<string> CommandPolicy, CommandAllowedJsonKeys;  // restrict which units can be CmdSetDestination'd
+        internal static ConfigEntry<bool>   CommandDiagLog;
+        internal static ConfigEntry<float> SwapAltitude;         // !swapteam/!forceteamswap: Cricket spawn altitude (world-Y m)
+        ChatManager Cm;                                          // cached from the chat hook, for messaging a player
+
+        // sid -> (short label, hex colour, full rank name), pushed by the bot as plugin_ranks.txt.
+        // label (ABBR) is used for the kill-feed/radar tag; full is used for the CHAT name tag.
+        static readonly Dictionary<string, (string label, string color, string full)> RankMap =
+            new Dictionary<string, (string, string, string)>();
+        static long _rankFileTicks = -1;
+        static string RankFilePath => Path.Combine(Paths.GameRootPath, "plugin_ranks.txt");
+
+        // RankInName bookkeeping: the player's REAL name (sans our "[RANK] " prefix), and a
+        // set of SteamIDs whose first "joined the game" message has already been shown (so the
+        // extra JoinMessage our rename triggers is suppressed). Both pruned when a player leaves.
+        static readonly Dictionary<string, string> RawNames = new Dictionary<string, string>();
+        // dismounted-pilot cleanup: pilot -> first time we saw it (Time.time)
+        static readonly Dictionary<PilotDismounted, float> PilotSeen = new Dictionary<PilotDismounted, float>();
+        static float _nextPilotSweep;
+
+        Harmony _harmony;
+        float _lastEnd = -999f;
+        readonly Dictionary<string, float> _chatThrottle = new Dictionary<string, float>();
+
+        void Awake()
+        {
+            Instance = this; Log = Logger;
+            _cfgFile = Config;   // cache the ConfigFile NOW — it survives the GameObject being destroyed, whereas Instance.Config later reads as Unity-null
+            try { DontDestroyOnLoad(gameObject); } catch { }   // try to survive scene loads on the dedicated server
+            ReformatChat    = Config.Bind("Chat", "Reformat", true,
+                "Rewrite player chat as [Name - Rank] in the player's rank colour.");
+            WinPoints       = Config.Bind("Scoring", "WinPoints", 200, "Points to each player on the winning side.");
+            FirstPlace      = Config.Bind("Scoring", "FirstPlace", 500, "Bonus to the top scorer of the match.");
+            SecondPlace     = Config.Bind("Scoring", "SecondPlace", 250, "Bonus to 2nd place.");
+            ThirdPlace      = Config.Bind("Scoring", "ThirdPlace", 100, "Bonus to 3rd place.");
+            SnapshotSeconds = Config.Bind("Stats", "SnapshotSeconds", 10f, "Seconds between full per-player snapshots.");
+            EnforceBalance  = Config.Bind("Balance", "Enforce", true,
+                "PvP only: keeps the two teams' sizes close so one side doesn't badly outnumber the other. If a " +
+                "team is more than 'Max Team Size Gap' players ahead, extra players are stopped from joining it " +
+                "(and, with Auto-Move on, the rank/skill-optimal player is moved to the smaller side).");
+            BalanceMaxDiff  = Config.Bind("Balance", "MaxDifference", 2,
+                "Max allowed team-size difference; balancing only triggers when a side is MORE than this many ahead (2 => a 2-player gap is allowed, only a 3+ gap acts). Higher = fewer/less-twitchy moves.");
+            AutoMove        = Config.Bind("Balance", "AutoMove", true,
+                "PvP only: when a side is more than MaxDifference ahead, MOVE the rank-optimal player to the smaller side (false = block-join only).");
+            MoveOnlyUnspawned = Config.Bind("Balance", "MoveOnlyUnspawned", true,
+                "Auto-balance only moves players who are NOT currently flying (i.e. in the spawn menu).");
+            RecheckSeconds  = Config.Bind("Balance", "RecheckSeconds", 6,
+                "Seconds between auto-balance checks.");
+            MoveDebounce    = Config.Bind("Balance", "MoveDebounce", 20,
+                "Minimum seconds between auto-balance moves (anti-churn).");
+            BalanceGraceSeconds = Config.Bind("Balance", "GraceSeconds", 180,
+                "LEGACY (superseded by WarnSeconds; no longer used). Was the silent hold before a balance move.");
+            BalanceMinPlayers = Config.Bind("Balance", "MinPlayers", 6,
+                "Auto-balance NEVER triggers unless at least this many HUMANS are on the server. Small lobbies are "
+                + "left completely alone (no move, no warning).");
+            BalanceWarnSeconds = Config.Bind("Balance", "WarnSeconds", 300,
+                "When teams become unbalanced (and >= MinPlayers are on), broadcast a warning and WAIT this many "
+                + "seconds before moving anyone, giving the gap time to self-correct. Default 300 = a 5-minute warning. "
+                + "The timer resets if teams even out (so each fresh imbalance gets its own 5-min warning).");
+            BalanceMoveExemptGames = Config.Bind("Balance", "MoveExemptGames", 2,
+                "Once auto-balance moves a player, don't move them again for this many GAMES (2 = at most once per 2 games). "
+                + "Spreads the burden so the same person isn't repeatedly the one moved.");
+            BalanceNewJoinerSeconds = Config.Bind("Balance", "NewJoinerSeconds", 900,
+                "STRONGEST auto-balance protection: never move a player who connected less than this many seconds ago "
+                + "(default 900 = 15 min). A new joiner is moved ONLY if every other non-exempt player on the bigger side "
+                + "is also a new joiner. Resets if they leave and rejoin; after a server restart everyone counts as new "
+                + "until the window elapses. 0 = off.");
+            SquadMaxSize = Config.Bind("Squad", "MaxSize", 4,
+                "Maximum number of players in a !squadup group. Squadmates get a WEAK auto-balance immunity (moved only "
+                + "if no unprotected non-exempt player is available - weaker than new-joiner protection).");
+            SquadInviteSeconds = Config.Bind("Squad", "InviteSeconds", 90,
+                "Seconds a !squadup invite stays open for the invited player to accept with !y.");
+            PvpStartingRank = Config.Bind("Mission", "PvpStartingRank", 3,
+                "PvP matches only (both factions joinable - Escalation & Terminal Control): every player starts at "
+                + "AT LEAST this in-game rank (applied on top of the mission's own playerStartingRank, incl. the built-in "
+                + "PvP maps we can't edit). 0 = off. Co-op/PvE is unaffected (uses the mission file's playerStartingRank).");
+            ForfeitEnabled  = Config.Bind("Forfeit", "Enabled", true,
+                "PvP only: a team can vote to SURRENDER the match via !forfeit (loss for them, win for the other team). "
+                + "Needs a majority of the team to agree.");
+            ForfeitCooldownSeconds = Config.Bind("Forfeit", "CooldownSeconds", 90,
+                "Seconds before a team can START another forfeit vote (anti-spam). The vote window is min(60, this).");
+            SwapAltitude    = Config.Bind("Swap", "Altitude", 2500f,
+                "!swapteam / !forceteamswap: world-Y altitude (metres) at which the brief CI-22 Cricket is spawned "
+                + "before ejecting. ~2500 m clears all terrain at the chosen out-of-the-way coords; raise to 3000 if any embed/crash is seen.");
+            AdminSteamIds   = Config.Bind("Admin", "SteamIds", "",
+                "Comma-separated SteamIDs allowed to use the IN-GAME team commands (!move/!spec/!join/!balance). " +
+                "The public !autobalance explainer works for everyone; command-centre moves don't need this.");
+            RankInName      = Config.Bind("Chat", "RankInName", true,
+                "Embed the player's rank into their NAME (e.g. '[ACM] Brick') instead of rerouting " +
+                "chat. Lets native chat + the game's text-to-speech work. Overrides Reformat when true.");
+            ProfanityFilter = Config.Bind("Chat", "ProfanityFilter", true,
+                "If a chat message contains a racist slur (leet/spacing/repeats normalised away), " +
+                "replace the WHOLE message with a canned line. Ordinary swearing is NOT filtered.");
+            CustomKillFeed  = Config.Bind("KillFeed", "Custom", true,
+                "Suppress the native global kill feed (it floods with AI units; personal 'you killed X' " +
+                "is unaffected) and instead announce kill STREAKS (N confirmed kills, colour escalates at " +
+                "5/10/25/50) and CARRIER/DESTROYER sinks. Also drops the player name from the unit label " +
+                "(radar/map) so a pilot's name shows once, via their chat name.");
+            CaptureSkillBonus = Config.Bind("Skill", "CaptureBonus", 250,
+                "NuclearSkill: extra skill points for capturing a base (added to that life's score).");
+            WinSkillBonus   = Config.Bind("Skill", "WinBonus", 200,
+                "NuclearSkill: skill points added to a WINNER's final life at match end (before the 5s auto-eject).");
+            LossSkillBonus  = Config.Bind("Skill", "LossBonus", 50,
+                "NuclearSkill: skill points added to a LOSER's final life at match end (before the 5s auto-eject).");
+            BalanceBySkill  = Config.Bind("Skill", "BalanceBySkill", true,
+                "NuclearSkill: auto-balance by skill rating (plugin_skill.txt) instead of server rank.");
+            TimeoutForceDefeat = Config.Bind("PvE", "TimeoutForceDefeat", false,
+                "PvE co-op: when the mission timer expires and humans haven't won, declare the human team " +
+                "DEFEATED (the AI faction 'wins') instead of silently rotating. No effect in PvP. " +
+                "Default OFF until observed on a live timeout - flip to true in the config once verified.");
+            PvpTimeoutResult = Config.Bind("PvP", "TimeoutResult", true,
+                "PvP: when the mission timer expires with no winner, decide the match by TOTAL in-game score - the " +
+                "higher-scoring team wins (an exact tie is a draw) instead of rotating with no result. " +
+                "Off = the match just rotates. No effect in PvE/co-op.");
+            TimeoutLeadSeconds = Config.Bind("Match", "TimeoutLeadSeconds", 120,
+                "Fire the timeout resolution (PvE defeat or PvP score result) this many seconds BEFORE the mission's " +
+                "MaxTime, so the match ends with time to spare and the map vote can run before the game auto-rotates. " +
+                "120 = 2 min early. 0 = exactly at MaxTime (the map may rotate before the vote).");
+            GlobalEnabled = Config.Bind("Global", "Enabled", false,
+                "Opt in to the cross-server GLOBAL LEADERBOARD: the bot publishes this server's rankings to the shared " +
+                "GitHub repo every ~4h, and gameplay settings are LOCKED (so all participating servers play by the same " +
+                "rules). Off = local leaderboard only, all settings editable.");
+            GlobalRegion = Config.Bind("Global", "Region", "",
+                "This server's region for the global leaderboard + the public server directory " +
+                "(OCE/NA/EU/SA/AS/AF/ME/Other). Required when Global Leaderboard or List Server is on.");
+            GlobalListServer = Config.Bind("Global", "ListServer", false,
+                "Opt in to the public SERVER DIRECTORY on GitHub: list this server by name + region (never the IP) so " +
+                "players can discover it and find it by name in-game. Does not require the leaderboard.");
+            CleanupPilots   = Config.Bind("Cleanup", "DismountedPilots", true,
+                "Periodically despawn dismounted (ejected) pilots that have lingered on the map, to cut clutter and load.");
+            PilotLifetime   = Config.Bind("Cleanup", "PilotLifetimeSeconds", 300,
+                "Seconds a dismounted pilot may linger before it is cleaned up (captures/rescues usually happen well within this).");
+            TeamkillEnforce = Config.Bind("Teamkill", "Enforce", true,
+                "Auto-punish friendly fire (destroying a friendly player's aircraft/vehicle/building). Per match: " +
+                "1st = eject + private warning, 2nd = kick (+ in-game rank reset on rejoin), 3rd = ban. Bans persist (plugin_bans.txt).");
+            AiLimit         = Config.Bind("AILimit", "Enforce", true,
+                "Performance precaution: cap AI aircraft and clear stuck ones. ONLY ever removes AI aircraft, never players.");
+            AiPerTeamCap    = Config.Bind("AILimit", "PerTeamAICap", 32,
+                "Max AI aircraft flying per faction. The excess (grounded/lowest first) is destroyed.");
+            AiTotalCap      = Config.Bind("AILimit", "TotalAircraftCap", 64,
+                "Max TOTAL aircraft (AI + players, all sides). When exceeded, AI is removed from the side with the " +
+                "MOST aircraft until at/under the cap -- a player is never force-ejected, only AI.");
+            AiStuckSeconds  = Config.Bind("AILimit", "StuckSeconds", 45,
+                "A GROUNDED AI aircraft that has not moved for this many seconds is cleared (frees a clogged runway). 0 = off.");
+            AiStuckRadius   = Config.Bind("AILimit", "StuckRadiusMetres", 25,
+                "Movement radius (metres) under which a grounded AI counts as 'not moving' for the stuck check.");
+            FloodEnforce    = Config.Bind("Flood", "Enforce", true,
+                "Per-player rate limit on fleet move-orders (UnitCommand.CmdSetDestination). Stops a runaway/held-key/macro "
+                + "order spam from flooding the reliable send buffer and mass-disconnecting the whole lobby at match start. "
+                + "ONLY drops the offending connection's EXCESS orders server-side; never kicks, never touches other players.");
+            FloodPerSec     = Config.Bind("Flood", "FleetOrdersPerSec", 3,
+                "Sustained fleet move-orders accepted per second per player (token refill). A human commander issues well "
+                + "under 1/s; the observed flood was ~19/s. 3/s leaves a large safety margin.");
+            FloodBurst      = Config.Bind("Flood", "FleetOrderBurst", 6,
+                "Max burst of fleet orders before excess is dropped (token-bucket capacity). The bucket starts FULL, so a "
+                + "player's first orders are never dropped.");
+            FloodLogDrops   = Config.Bind("Flood", "LogDrops", true,
+                "Log (throttled, at most once per 5s per player) the name/SteamID of a player whose orders are being dropped.");
+            FloodDropDeadNet = Config.Bind("Flood", "DropDeadNetIdRpcs", true,
+                "Defence-in-depth: silently drop ServerRpcs aimed at a netId with no live object (already-destroyed/unknown). "
+                + "The game drops these anyway, but first LOGS each one + pushes an error to the sender + builds a network "
+                + "reader -- under a flood (a client re-firing at a just-destroyed unit) that storm exhausts the ByteBuffer "
+                + "pool and overflows send buffers. Dropping silently removes the amplifier. Patches a private Mirage method; "
+                + "fail-open (auto-disables if it can't bind, leaving the CmdSetDestination throttle as the primary guard).");
+            CommandPolicy = Config.Bind("Command", "Policy", "HeliDroppedOnly",
+                "Which units players may order via CmdSetDestination (unit move-commands). One of: "
+                + "All (any commandable unit) | RateLimitOnly (alias of All) | "
+                + "HeliDroppedOnly (ONLY player-deployed ground vehicles -- the Hexhound SAM/GMG, AA, APC, LAC "
+                + "SAM/AT, AT trucks dropped or sling-loaded from a UH-190/Tarantula; blocks mission/AI ground "
+                + "units, ships, missiles) | AllowlistTypes (all ground vehicles, or only those whose jsonKey is "
+                + "in Command.AllowedJsonKeys) | Disabled (no unit can be commanded by anyone). The per-player "
+                + "rate limit (Flood.*) ALWAYS applies on top. LIVE-tunable; an unknown/unresolved value fails "
+                + "OPEN (treated as All) so a typo never breaks commanding.");
+            CommandAllowedJsonKeys = Config.Bind("Command", "AllowedJsonKeys", "",
+                "Only used when Policy=AllowlistTypes. Comma-separated UnitDefinition.jsonKey values to allow "
+                + "(case-insensitive). EMPTY = allow ALL ground vehicles. Discover the exact jsonKeys with "
+                + "Command.DiagLog=true, then paste them here, e.g. \"hexhound_sam,lac_at,apc\".");
+            CommandDiagLog = Config.Bind("Command", "DiagLog", false,
+                "Log the resolved unit type (Class/jsonKey), player-deployed owner state, and the ALLOW/DROP "
+                + "decision for each command order (drops throttled ~once/5s per player). Turn ON briefly to "
+                + "discover unit jsonKeys / confirm what's being blocked, then OFF (verbose).");
+            MirageRaiseSendBuffer = Config.Bind("Mirage", "RaiseReliableSendBuffer", true,
+                "Anti mass-DC (Layer C): raise Mirage's per-connection reliable-send-buffer cap "
+                + "(MaxReliablePacketsInSendBufferPerConnection, game default 3000) so a transient fleet-order / dead-netId "
+                + "RPC burst on a busy server is ABSORBED and drained instead of overflowing into a BufferFullException that "
+                + "cascades a lobby-wide disconnect. Mutates the one Config at host start (BEFORE the Peer is built), so it "
+                + "takes effect on the NEXT match host. ONLY raises a buffer ceiling -- never kicks, never touches gameplay. "
+                + "Fail-open (auto-disables if the host/config site can't be resolved; Layers A/B still apply).");
+            MirageSendBufferLimit = Config.Bind("Mirage", "ReliableSendBufferLimit", 12000,
+                "Layer C target for MaxReliablePacketsInSendBufferPerConnection (default 12000 = 4x the game's 3000). Higher "
+                + "absorbs bigger bursts but costs more memory per connection and a dead-slow client buffers longer before "
+                + "it's finally dropped. Clamped to never go BELOW the game default 3000 (and never LOWERS an already-higher "
+                + "value). Try 24000 (8x) if a burst still overflows. Live-tunable via the webcc settings menu, but only "
+                + "applies at the NEXT match host.");
+            GriefAutoKick = Config.Bind("Grief", "AutoKick", true,
+                "Anti-grief: automatically KICK a single player who is mass-commanding units to brick the server (the "
+                + "reliable-buffer flood that mass-disconnects everyone). Kicks the OFFENDER, not the lobby, and emits a "
+                + "report to the webcc Reports tab. Two-factor by default (see RequireActiveFlooding) so a legit "
+                + "base-builder is not kicked. Set false to disable detection+report+kick entirely. LIVE-tunable.");
+            GriefOwnedThreshold = Config.Bind("Grief", "OwnedUnitThreshold", 12,
+                "Auto-kick when a player owns MORE than this many live ground vehicles (their heli-dropped SAMs/AA/APC/"
+                + "etc.) AND is actively flooding move-orders. The owner's '>10 units' rule; 12 leaves headroom for a "
+                + "legit multi-SAM setup.");
+            GriefRequireFlooding = Config.Bind("Grief", "RequireActiveFlooding", true,
+                "Two-factor safety (recommended ON): only auto-kick if the player is ALSO sustained-flooding move-orders "
+                + "(a macro/held-key/loop), not merely owning many units sitting idle. A normal 'select all + move once' "
+                + "burst never trips it. Set false for the literal 'owns > threshold units -> kick' rule (more aggressive).");
+            GriefFloodPerSec = Config.Bind("Grief", "FloodOrdersPerSec", 3,
+                "The sustained move-order rate (orders/second per player) that counts as 'flooding'; must be held ~4s "
+                + "(2 scan windows). A legit commander issues well under 1/s, and the game caps a connection's ACCEPTED "
+                + "orders at ~5/s, so 3/s sustained = deliberate macro/click-spam. Lower = more aggressive.");
+            GriefHardBan = Config.Bind("Grief", "HardBan", false,
+                "If true, a tripped offender is also BANNED (plugin_bans.txt, kicked on rejoin), not just kicked once. "
+                + "Default false = kick only (recoverable). You can always ban from the Reports tab.");
+            GriefReportOnly = Config.Bind("Grief", "ReportOnly", false,
+                "If true, DETECT + REPORT to the Reports tab but do NOT kick. Use for a night to validate the threshold "
+                + "against real play before enabling the kick. Default false = actually kick.");
+            GriefExemptAdmins = Config.Bind("Grief", "ExemptAdmins", true,
+                "Never auto-kick a player whose SteamID is in [Admin] SteamIds (an admin may legitimately mass-command "
+                + "units for a scenario). Set false to include admins (e.g. to self-test the detector).");
+
+            LoadBans();
+            LoadSquads();
+
+            _harmony = new Harmony(Guid);
+            try
+            {
+                _harmony.PatchAll();
+                var mine = _harmony.GetPatchedMethods().ToList();
+                Log.LogInfo($"[diag] patched {mine.Count} method(s): " +
+                    string.Join(", ", mine.Select(m => (m.DeclaringType != null ? m.DeclaringType.Name : "?") + "." + m.Name)));
+            }
+            catch (Exception e) { Log.LogError("PatchAll failed: " + e); }
+
+            // Flood guard Layer B: silently drop ServerRpcs aimed at a dead/unknown netId (kills the
+            // "Spawned object not found" log + sender SetError + ByteBuffer-pool storm that overflows
+            // reliable send buffers and mass-disconnects the lobby). Manual patch because
+            // Mirage.RemoteCalls.RpcHandler is internal and HandleRpc is private ([AggressiveInlining]).
+            // Fail-open: if it can't bind, Layer A (the CmdSetDestination throttle) still applies.
+            try
+            {
+                var rpcHandlerT = AccessTools.TypeByName("Mirage.RemoteCalls.RpcHandler");
+                var handleRpc = rpcHandlerT != null ? AccessTools.Method(rpcHandlerT, "HandleRpc") : null;
+                if (handleRpc != null)
+                {
+                    _harmony.Patch(handleRpc, prefix: new HarmonyMethod(
+                        typeof(DeadNetIdDropPatch).GetMethod("Prefix", BindingFlags.Static | BindingFlags.NonPublic)));
+                    Log.LogInfo("[diag] HandleRpc patched (flood guard B: dead-netId drop)");
+                }
+                else Log.LogWarning("[flood] RpcHandler.HandleRpc not found; dead-netId drop disabled (Layer A still active)");
+            }
+            catch (Exception e) { Log.LogError("[flood] HandleRpc patch failed (Layer A still active): " + e); }
+
+            // Flood guard Layer C: raise Mirage's per-connection reliable-send-buffer cap so a transient
+            // fleet-order / dead-netId RPC burst is ABSORBED and drained instead of overflowing into a
+            // BufferFullException -> lobby-wide mass-DC. Mutates the single Mirage.SocketLayer.Config at its
+            // one creation site (NetworkManagerNuclearOption.ConfigureNetwork), after it's assigned to
+            // Server.PeerConfig and BEFORE NetworkServer.StartServer builds the Peer. Reflective: no hard
+            // SocketLayer reference. Fail-open: unresolved type/method -> warn + skip (Layers A/B still apply).
+            try
+            {
+                if (MirageRaiseSendBuffer != null && MirageRaiseSendBuffer.Value)
+                {
+                    var nmnoT = AccessTools.TypeByName("NuclearOption.Networking.NetworkManagerNuclearOption");
+                    var configure = nmnoT != null ? AccessTools.Method(nmnoT, "ConfigureNetwork") : null;
+                    if (configure != null)
+                    {
+                        _harmony.Patch(configure, postfix: new HarmonyMethod(
+                            typeof(MirageBufferRaisePatch).GetMethod("Postfix", BindingFlags.Static | BindingFlags.NonPublic)));
+                        Log.LogInfo("[diag] ConfigureNetwork patched (flood guard C: raise reliable send buffer)");
+                    }
+                    else Log.LogWarning("[flood] NetworkManagerNuclearOption.ConfigureNetwork not found; send-buffer raise disabled (Layers A/B still active)");
+                }
+            }
+            catch (Exception e) { Log.LogError("[flood] ConfigureNetwork patch failed (Layers A/B still active): " + e); }
+
+            Log.LogInfo($"NukeStats {Version} loaded (+ team balance: autobalance fires ONLY on a LEAVE, then WARNS and waits before moving; protection tiers = new joiners (<{(BalanceNewJoinerSeconds!=null?BalanceNewJoinerSeconds.Value:900)}s, strongest) > squads > then the best skill-evening pick; join-the-fuller-side = INSTANT spectate, no warning; + PvP !forfeit team-surrender vote (cd {ForfeitCooldownSeconds.Value}s); + PvP start-rank floor={PvpStartingRank.Value}; + admin !setrank/!setfunds/!addfunds; + live-map entity feed: AI aircraft + ships, heli/plane; + AI aircraft limiter: per-team {AiPerTeamCap.Value}/total {AiTotalCap.Value} caps + {AiStuckSeconds.Value}s stuck-runway clear @5s scan; AI-only, never players; SKILL = PERSISTENT points-per-death: life ends ONLY on death/air-eject, survives disconnect + match-end (no match-end eject), balance/admin moves are life-NEUTRAL, captures emit capbonus; strategic-strike announce removed; PvP balance: joinable-only team detect [spectate-move]; radar/spotting + jamming score SUPPRESSED [anti-exploit]; FLOOD GUARD: A=per-player CmdSetDestination rate-limit {(FloodPerSec!=null?FloodPerSec.Value:3)}/s burst {(FloodBurst!=null?FloodBurst.Value:6)} [drop excess, no kick], B=silent-drop ServerRpc to dead netId [{(FloodDropDeadNet!=null&&FloodDropDeadNet.Value?"on":"off")}] -> stops match-start mass-DC; autobalance: never under MinPlayers={(BalanceMinPlayers!=null?BalanceMinPlayers.Value:6)} + {(BalanceWarnSeconds!=null?BalanceWarnSeconds.Value:300)}s WARNED hold, then MOVES the picked player via the swap mechanic (landed Cricket); admin !swapteam/!forceteamswap [team swap + Cricket spawn HIGH over open ocean + eject -> UI reset, life/points-neutral]; + !squadup friend groups (max {SquadMax}, persist across matches, protected from auto-balance below new joiners); + LIVE CONFIG (webcc settings menu via setcfg/dumpcfg -> live ConfigEntry edit + Config.Save)). RankFile={RankFilePath}");
+            DumpCfg();   // emit an initial [NOSTATS] cfg snapshot so the webcc settings menu has live values on load
+            try { var tgo = new GameObject("NukeStatsTicker"); DontDestroyOnLoad(tgo); tgo.AddComponent<Ticker>(); Log.LogInfo("[diag] NukeStatsTicker up (drives PollCommands when the server is empty)"); }
+            catch (Exception e) { Log?.LogError("ticker create: " + e); }
+        }
+
+        // Deliberately NO OnDestroy/UnpatchSelf: on this dedicated server the manager
+        // GameObject is destroyed shortly after load, and unpatching there was REMOVING
+        // every hook (the debug trace showed the methods re-patched with 0 prefixes right
+        // after we applied them). Harmony patches are static and live for the process, so
+        // we never unpatch — the hooks then survive even if this object is destroyed.
+
+        // Periodic full-player snapshot. On this dedicated server the manager
+        // GameObject is destroyed shortly after Awake, so our own Update() never ticks
+        // (verified: 0 "snap" lines reach console.log). We therefore ALSO drive the
+        // snapshot from a Harmony hook on FactionHQ.Update -- a method the server really
+        // calls every frame during a live mission (see HQTickPatch). A shared static
+        // Time.time gate means whichever path fires, we emit exactly one snapshot per
+        // SnapshotSeconds.
+        static float _nextSnapShared;
+        static int _snapDiag;
+
+        internal static void MaybeSnapshot()
+        {
+            try
+            {
+                float now = Time.time;
+                if (now < _nextSnapShared) return;
+                float iv = (SnapshotSeconds != null) ? Mathf.Max(2f, SnapshotSeconds.Value) : 10f;
+                _nextSnapShared = now + iv;
+                if (_snapDiag < 5)   // first few snapshots: confirm it runs + player count
+                {
+                    try { Log?.LogInfo($"[diag] snapshot #{_snapDiag}: {Humans().Count} player(s)"); } catch { }
+                    _snapDiag++;
+                }
+                EmitAll("snap");
+                PruneLeavers();                      // forget RankInName bookkeeping for players who left
+            }
+            catch (Exception e) { Log?.LogError("MaybeSnapshot: " + e); }
+        }
+
+        // Drop RankInName/JoinMessage state for SteamIDs no longer present, so a genuine
+        // rejoin gets a fresh "joined" message and the dictionaries don't grow unbounded.
+        static void PruneLeavers()
+        {
+            try
+            {
+                if (RawNames.Count == 0) return;
+                var present = new HashSet<string>();
+                foreach (var p in Humans()) present.Add(Sid(p));
+                foreach (var sid in new List<string>(RawNames.Keys))
+                    if (!present.Contains(sid)) RawNames.Remove(sid);
+            }
+            catch (Exception e) { Log?.LogError("PruneLeavers: " + e); }
+        }
+
+        // ---------------- flood guard: per-player fleet-order rate limit (Layer A) ----------------
+        // A single client spamming UnitCommand.CmdSetDestination (held key / macro / a UI loop
+        // re-firing at a destroyed unit) overflows every client's reliable send buffer at match
+        // start and mass-disconnects the lobby. We cap accepted orders per SENDER with a leaky
+        // token bucket; excess orders are dropped server-side (the client is unharmed, and the next
+        // accepted waypoint supersedes any dropped one). Called from FleetOrderFloodPatch.
+        static readonly Dictionary<string, (float tokens, float last)> _orderBucket =
+            new Dictionary<string, (float, float)>();
+        static readonly Dictionary<string, float> _orderDropLog = new Dictionary<string, float>();
+
+        // true = ALLOW this fleet order, false = DROP it. Keyed on SteamID (one bucket per player).
+        internal static bool AllowFleetOrder(Player player)
+        {
+            try
+            {
+                if (FloodEnforce == null || !FloodEnforce.Value || player == null) return true;
+                string id = Sid(player);
+                if (string.IsNullOrEmpty(id)) return true;                 // can't key -> never punish
+                float now = Time.time;
+                float cap  = Mathf.Max(1f, FloodBurst  != null ? FloodBurst.Value  : 6);
+                float rate = Mathf.Max(0.5f, FloodPerSec != null ? FloodPerSec.Value : 3);
+                if (!_orderBucket.TryGetValue(id, out var b)) b = (cap, now);   // new player: bucket starts FULL
+                float tokens = Mathf.Min(cap, b.tokens + (now - b.last) * rate);
+                if (tokens >= 1f) { _orderBucket[id] = (tokens - 1f, now); return true; }
+                _orderBucket[id] = (tokens, now);                          // empty: keep the clock moving
+                if (FloodLogDrops != null && FloodLogDrops.Value)
+                {
+                    if (!_orderDropLog.TryGetValue(id, out var t) || now - t > 5f)
+                    {
+                        _orderDropLog[id] = now;
+                        Log?.LogWarning($"[flood] rate-dropping fleet orders from {player.PlayerName} ({id}) -> exceeded {rate}/s (burst {cap})");
+                    }
+                }
+                return false;
+            }
+            catch (Exception e) { Log?.LogError("AllowFleetOrder: " + e); return true; }
+        }
+
+        // COMMAND POLICY: which units may be ordered via CmdSetDestination, ON TOP of the per-sender rate limit.
+        // true = ALLOW (still subject to the rate limit), false = DROP this order outright. `cmd` is the
+        // UnitCommand component, which lives on the SAME GameObject as the commanded unit (only GroundVehicle/
+        // Ship/Missile are ICommandable). GroundVehicle.Networkowner = the deploying Player on a heli drop/sling,
+        // null for mission/AI spawns -> the clean "player-deployed" discriminator. Default "All" = no filtering
+        // (current behaviour). LIVE-tunable; fail-OPEN on any ambiguity (the rate limit is the real flood guard).
+        static readonly Dictionary<string, float> _cmdPolicyDropLog = new Dictionary<string, float>();
+        static HashSet<string> _allowedKeysCache; static string _allowedKeysRaw;
+
+        internal static bool AllowCommandTarget(UnitCommand cmd, Player player)
+        {
+            try
+            {
+                string mode = CommandPolicy != null ? (CommandPolicy.Value ?? "All").Trim() : "All";
+                if (mode.Length == 0
+                    || string.Equals(mode, "All", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(mode, "RateLimitOnly", StringComparison.OrdinalIgnoreCase))
+                    return true;
+                if (string.Equals(mode, "Disabled", StringComparison.OrdinalIgnoreCase))
+                    return DropCmd(player, cmd, "policy=Disabled");
+
+                Unit unit = cmd != null ? cmd.GetComponent<Unit>() : null;
+                if (unit == null)   // resolve failure -> ALLOW (never break legit commanding); the rate limit still guards
+                {
+                    if (CommandDiagLog != null && CommandDiagLog.Value)
+                        Log?.LogInfo("[cmdpolicy] unresolved target (no Unit on UnitCommand) -> ALLOW (fail-open)");
+                    return true;
+                }
+                GroundVehicle gv = unit as GroundVehicle;
+
+                if (string.Equals(mode, "HeliDroppedOnly", StringComparison.OrdinalIgnoreCase))
+                {
+                    bool ok = false; try { ok = gv != null && gv.Networkowner != null; } catch { ok = false; }
+                    if (CommandDiagLog != null && CommandDiagLog.Value)
+                        Log?.LogInfo($"[cmdpolicy] HeliDroppedOnly target={Describe(unit)} gv={(gv != null)} owned={(gv != null && SafeOwner(gv) != null)} -> {(ok ? "ALLOW" : "DROP")}");
+                    return ok ? true : DropCmd(player, cmd, "not a player-deployed ground unit");
+                }
+                if (string.Equals(mode, "AllowlistTypes", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (gv == null) return DropCmd(player, cmd, "not a GroundVehicle");
+                    string keys = CommandAllowedJsonKeys != null ? (CommandAllowedJsonKeys.Value ?? "") : "";
+                    if (string.IsNullOrWhiteSpace(keys)) return true;   // empty list => all ground vehicles allowed
+                    if (!ReferenceEquals(keys, _allowedKeysRaw))        // rebuild cache only when the config string changes
+                    {
+                        _allowedKeysRaw = keys;
+                        _allowedKeysCache = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var k in keys.Split(',')) { var t = k.Trim(); if (t.Length > 0) _allowedKeysCache.Add(t); }
+                    }
+                    string jk = gv.definition != null ? gv.definition.jsonKey : null;
+                    bool ok = jk != null && _allowedKeysCache.Contains(jk);
+                    if (CommandDiagLog != null && CommandDiagLog.Value)
+                        Log?.LogInfo($"[cmdpolicy] AllowlistTypes jsonKey={jk} -> {(ok ? "ALLOW" : "DROP")}");
+                    return ok ? true : DropCmd(player, cmd, $"jsonKey '{jk}' not in allowlist");
+                }
+                if (CommandDiagLog != null && CommandDiagLog.Value)
+                    Log?.LogWarning($"[cmdpolicy] unknown Command.Policy '{mode}' -> ALLOW (fail-open)");
+                return true;
+            }
+            catch (Exception e) { Log?.LogError("AllowCommandTarget: " + e); return true; }   // fail-open on any error
+        }
+
+        static bool DropCmd(Player player, UnitCommand cmd, string why)
+        {
+            try
+            {
+                string id = player != null ? Sid(player) : null;
+                float now = Time.time;
+                if (!string.IsNullOrEmpty(id) && (!_cmdPolicyDropLog.TryGetValue(id, out var t) || now - t > 5f))
+                {
+                    _cmdPolicyDropLog[id] = now;
+                    string what = "?"; try { var u = cmd != null ? cmd.GetComponent<Unit>() : null; what = Describe(u); } catch { }
+                    Log?.LogInfo($"[cmdpolicy] dropped order from {(player != null ? player.PlayerName : "?")} on {what} ({why})");
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        static Player SafeOwner(GroundVehicle gv) { try { return gv.Networkowner; } catch { return null; } }
+
+        static string Describe(Unit u)
+        {
+            if (u == null) return "null";
+            try
+            {
+                string jk = u.definition != null ? u.definition.jsonKey : null;
+                string nm = u.definition != null ? u.definition.unitName : u.unitName;
+                return $"{u.GetType().Name}/{jk ?? nm ?? "?"}";
+            }
+            catch { return u.GetType().Name; }
+        }
+
+        // Layer B bookkeeping: count silently-dropped dead-netId ServerRpcs (the log/alloc amplifier),
+        // surfaced occasionally so admins can see the guard working without re-introducing the spam.
+        static int _deadNetDrops; static float _deadNetLog = -999f;
+        internal static void NoteDeadNetIdDrop()
+        {
+            try
+            {
+                _deadNetDrops++;
+                float now = Time.time;
+                if (now - _deadNetLog > 30f)
+                {
+                    _deadNetLog = now;
+                    Log?.LogInfo($"[flood] dead-netId ServerRpc drops so far: {_deadNetDrops} (silently absorbed; no log/alloc storm)");
+                }
+            }
+            catch { }
+        }
+
+        void Update() { MaybeSnapshot(); }   // a no-op if this object never ticks
+
+        // -------- player enumeration (humans only; SteamID filters out AI/unjoined) --------
+        static string Sid(Player p) { try { return p.SteamID.ToString(); } catch { return ""; } }
+
+        // PERF: FindObjectsOfType<Player> is expensive and Humans() is called many times
+        // per HQ tick (SkillTick/TkTick/PollCommands/FindPlayerBySid/snapshot/balance...).
+        // Cache it for the current frame (Time.time is constant within a frame) so the
+        // scene scan runs once per frame instead of a dozen+ times.
+        static List<Player> _humansCache;
+        static float _humansCacheTime = -1f;
+        static List<Player> Humans()
+        {
+            float now = Time.time;
+            if (_humansCache != null && _humansCacheTime == now) return _humansCache;
+            var ok = new List<Player>();
+            // Use the GAME's own player registry (UnitRegistry.playerLookup) - the same source
+            // ChatManager uses for chat delivery, so these Player objects have a valid .Owner
+            // (FindObjectsOfType returned copies whose .Owner was null in the poll context, so
+            // whispers/TellPlayer silently no-op'd). Fall back to a scene scan if it's empty.
+            try
+            {
+                foreach (var p in UnitRegistry.playerLookup.Values)
+                {
+                    if (p == null) continue;
+                    string id = Sid(p);
+                    if (!string.IsNullOrEmpty(id) && id != "0") ok.Add(p);
+                }
+            }
+            catch (Exception e) { Log?.LogError("Humans/playerLookup: " + e); }
+            if (ok.Count == 0)
+                foreach (var p in UnityEngine.Object.FindObjectsOfType<Player>())
+                {
+                    if (p == null) continue;
+                    string id = Sid(p);
+                    if (!string.IsNullOrEmpty(id) && id != "0") ok.Add(p);
+                }
+            _humansCache = ok; _humansCacheTime = now;
+            return ok;
+        }
+
+        static string Fac(Player p)
+        {
+            try { return p.HQ != null && p.HQ.faction != null ? p.HQ.faction.factionName : ""; }
+            catch { return ""; }
+        }
+
+        // The plane the player is currently in (their live Aircraft), or the airframe
+        // they have selected if not spawned. Empty string => in menu / between spawns.
+        static string Plane(Player p)
+        {
+            try
+            {
+                var ac = p.Aircraft;
+                if (ac != null)
+                {
+                    var d = ac.definition;
+                    if (d != null && !string.IsNullOrEmpty(d.unitName)) return d.unitName;
+                }
+            }
+            catch { }
+            try
+            {
+                var af = p.AirframeInUse;            // OwnedAirframe? - selected airframe
+                if (af.HasValue && af.Value.Definition != null
+                    && !string.IsNullOrEmpty(af.Value.Definition.unitName))
+                    return af.Value.Definition.unitName;
+            }
+            catch { }
+            return "";
+        }
+
+        // -------- emit [NOSTATS] lines --------
+        // Use UnityEngine.Debug.Log so the line lands in Unity's -logFile
+        // (/logs/console.log) which the external bot tails. (Console.WriteLine only
+        // reaches process stdout, NOT the -logFile, so the bot wouldn't see it.)
+        static void Out(string json) => Debug.Log("[NOSTATS] " + json);
+
+        internal static void EmitAll(string type)
+        {
+            try
+            {
+                foreach (var p in Humans()) EmitOne(p, type);
+                if (type == "end") Out("{\"t\":\"end\"}");
+            }
+            catch (Exception e) { Log?.LogError("EmitAll: " + e); }
+        }
+
+        internal static void EmitOne(Player p, string type)
+        {
+            if (p == null) return;
+            try
+            {
+                string id = Sid(p);
+                if (string.IsNullOrEmpty(id) || id == "0") return;
+                var sb = new StringBuilder(160);
+                sb.Append("{\"t\":\"").Append(type).Append("\",\"id\":\"").Append(id).Append("\"");
+                sb.Append(",\"n\":\"").Append(Esc(RawNameOf(p))).Append("\"");
+                sb.Append(",\"f\":\"").Append(Esc(Fac(p))).Append("\"");
+                sb.Append(",\"s\":").Append(Num(p.PlayerScore));
+                sb.Append(",\"rk\":").Append(Num(p.PlayerRank));
+                sb.Append(",\"tk\":").Append(Num(p.Teamkills));
+                sb.Append(",\"ac\":\"").Append(Esc(Plane(p))).Append("\"");
+                sb.Append('}');
+                Out(sb.ToString());
+            }
+            catch (Exception e) { Log?.LogError("EmitOne: " + e); }
+        }
+
+        // -------- live map: fast (~2s) position tick. One compact line of every FLYING player's
+        // world x/z. Cheap enough to run far more often than the full 10s snapshot. A player with no
+        // fresh pos = not flying -> the command centre shows them as dead/ejected until they respawn. --------
+        static float _nextPos;
+        internal static void PosTick()
+        {
+            float now = Time.time;
+            if (now < _nextPos) return;
+            _nextPos = now + 2f;
+            try
+            {
+                var sb = new StringBuilder(256);
+                sb.Append("{\"t\":\"pos\",\"p\":[");
+                bool first = true;
+                foreach (var p in Humans())
+                {
+                    Aircraft ac = null; try { ac = p.Aircraft; } catch { }
+                    if (ac == null) continue;                              // only flying players
+                    string id = Sid(p);
+                    if (string.IsNullOrEmpty(id) || id == "0") continue;
+                    var gp = ac.GlobalPosition();
+                    if (!first) sb.Append(',');
+                    first = false;
+                    sb.Append("{\"id\":\"").Append(id).Append("\",\"x\":").Append((int)gp.x).Append(",\"z\":").Append((int)gp.z)
+                      .Append(",\"k\":\"").Append(AcKind(ac)).Append("\"}");
+                }
+                sb.Append("]}");
+                Out(sb.ToString());
+            }
+            catch (Exception e) { Log?.LogError("PosTick: " + e); }
+        }
+
+        // ======================= AI AIRCRAFT LIMITER =======================
+        // Performance precaution against AI over-spawning / clogging runways. Checked ~every 3s.
+        // It ONLY ever removes AI aircraft (ac.Player == null) -- a player is never touched.
+        //   A) per-side AI cap: each faction may have at most AiPerTeamCap (32) AI flying.
+        //   B) total cap: total aircraft (AI + players, all sides) must not exceed AiTotalCap (64);
+        //      when over, AI is removed from the side with the MOST aircraft (never a player).
+        //   C) stuck: a GROUNDED AI that hasn't moved > AiStuckRadius for AiStuckSeconds (45s) is
+        //      cleared, to free a clogged runway. Independent of the caps.
+        // Removal = Aircraft.DisableUnit() (the game's own destroy path -> explode + despawn, synced
+        // to clients), falling back to ejection if that ever throws. A per-tick budget smooths the ramp.
+        const int AiMaxRemovalsPerTick = 12;
+        static float _nextAiTick;
+        sealed class AiTrack { public Vector3 anchor; public float since; }
+        static readonly Dictionary<int, AiTrack> _aiStuck = new Dictionary<int, AiTrack>();
+
+        static Vector3 AcPos(Aircraft ac) { try { var g = ac.GlobalPosition(); return new Vector3(g.x, g.y, g.z); } catch { return Vector3.zero; } }
+        static float AcAlt(Aircraft ac) { try { return ac.GlobalPosition().y; } catch { return 99999f; } }
+        static bool IsGrounded(Aircraft ac) { try { return ac.IsLanded(); } catch { return false; } }
+
+        internal static void AiLimitTick()
+        {
+            if (AiLimit == null || !AiLimit.Value) return;
+            float now = Time.time;
+            if (now < _nextAiTick) return;
+            _nextAiTick = now + 5f;   // 5s (was 3s): with mission AI caps now below the 32 limiter cap the
+                                      // limiter rarely acts, so this full-scene FindObjectsOfType<Aircraft>
+                                      // scan can run less often - fewer frame hitches + less GC. The 45s
+                                      // stuck-runway timer means 5s reaction granularity is still fine.
+            try
+            {
+                var sides   = new Dictionary<FactionHQ, List<Aircraft>>();   // every aircraft, per side
+                var aiSides = new Dictionary<FactionHQ, List<Aircraft>>();   // AI only, per side
+                var live = new HashSet<int>();
+                foreach (var ac in UnityEngine.Object.FindObjectsOfType<Aircraft>())
+                {
+                    if (ac == null) continue;
+                    FactionHQ hq = null; try { hq = ac.NetworkHQ; } catch { }
+                    if (hq == null) continue;
+                    Player pl = null; try { pl = ac.Player; } catch { }
+                    if (!sides.TryGetValue(hq, out var L)) { sides[hq] = L = new List<Aircraft>(); aiSides[hq] = new List<Aircraft>(); }
+                    L.Add(ac);
+                    if (pl == null)                                          // AI aircraft (no human pilot)
+                    {
+                        aiSides[hq].Add(ac);
+                        int id = ac.GetInstanceID(); live.Add(id);
+                        Vector3 pos = AcPos(ac);
+                        float r = AiStuckRadius.Value;
+                        if (!_aiStuck.TryGetValue(id, out var t)) _aiStuck[id] = new AiTrack { anchor = pos, since = now };
+                        else if ((pos - t.anchor).sqrMagnitude > r * r) { t.anchor = pos; t.since = now; }
+                    }
+                }
+                if (_aiStuck.Count > 0)                                      // forget aircraft that no longer exist
+                {
+                    var goneIds = new List<int>();
+                    foreach (var k in _aiStuck.Keys) if (!live.Contains(k)) goneIds.Add(k);
+                    foreach (var k in goneIds) _aiStuck.Remove(k);
+                }
+
+                var removed = new HashSet<Aircraft>();
+                int budget = AiMaxRemovalsPerTick;
+                void Remove(Aircraft ac, string why)
+                {
+                    if (ac == null || budget <= 0 || removed.Contains(ac)) return;
+                    if (ac.Player != null) return;                          // SAFETY: never remove a player's aircraft
+                    removed.Add(ac); budget--;
+                    try { ac.DisableUnit(); }
+                    catch (Exception e) { try { ac.StartEjectionSequence(); } catch { } Log?.LogWarning("[ailimit] DisableUnit fell back to eject: " + e.Message); }
+                    Log?.LogInfo("[ailimit] cleared AI aircraft (" + why + ")");
+                }
+                IEnumerable<Aircraft> Removable(List<Aircraft> ai, int n) =>
+                    ai.Where(a => a != null && a.Player == null && !removed.Contains(a)).OrderBy(AcAlt).Take(n);
+
+                // RULE C: stuck grounded AI (independent of the caps)
+                int stuckSec = AiStuckSeconds.Value;
+                if (stuckSec > 0)
+                    foreach (var ai in aiSides.Values)
+                        foreach (var ac in ai)
+                        {
+                            if (ac == null || removed.Contains(ac)) continue;
+                            int id = ac.GetInstanceID();
+                            if (_aiStuck.TryGetValue(id, out var t) && now - t.since >= stuckSec && IsGrounded(ac))
+                            { Remove(ac, "stuck " + stuckSec + "s on the ground"); _aiStuck.Remove(id); }
+                        }
+
+                // RULE A: per-side AI cap
+                int perCap = AiPerTeamCap.Value;
+                if (perCap > 0)
+                    foreach (var kv in aiSides)
+                    {
+                        int n = kv.Value.Count(a => a != null && !removed.Contains(a)) - perCap;
+                        if (n > 0) foreach (var ac in Removable(kv.Value, n)) Remove(ac, "team AI cap " + perCap);
+                    }
+
+                // RULE B: total aircraft cap -> trim AI from the busiest side (never a player)
+                int totalCap = AiTotalCap.Value;
+                if (totalCap > 0)
+                {
+                    int Eff(FactionHQ h) => sides[h].Count(a => a != null && !removed.Contains(a));
+                    int total = 0; foreach (var h in sides.Keys) total += Eff(h);
+                    while (total > totalCap && budget > 0)
+                    {
+                        FactionHQ busiest = null; int best = -1;
+                        foreach (var h in sides.Keys)
+                        {
+                            if (!aiSides[h].Any(a => a != null && a.Player == null && !removed.Contains(a))) continue;
+                            int e = Eff(h);
+                            if (e > best) { best = e; busiest = h; }
+                        }
+                        if (busiest == null) break;                         // no removable AI anywhere
+                        var victim = Removable(aiSides[busiest], 1).FirstOrDefault();
+                        if (victim == null) break;
+                        Remove(victim, "total cap " + totalCap);
+                        total--;
+                    }
+                }
+
+                EmitAir(sides, aiSides, removed);
+                EmitEntities(sides, removed);
+            }
+            catch (Exception e) { Log?.LogError("AiLimitTick: " + e); }
+        }
+
+        // -------- live map entity feed: per-entity world positions for the command-centre map.
+        // Runs once per AiLimitTick (~5s), right after EmitAir. Two arrays:
+        //   "a" = AI aircraft only (ac.Player==null, not removed this tick) -> {i,x,z,f,k,g}
+        //         i=GetInstanceID (client interpolation key), f=faction, k=plane/heli, g=grounded
+        //   "s" = all ships (one FindObjectsOfType<Ship> scan) -> {i,x,z,f,c} where c=class
+        // Everything is guarded per-unit: a throw skips that one unit, never the whole feed. --------
+        static void EmitEntities(Dictionary<FactionHQ, List<Aircraft>> sides, HashSet<Aircraft> removed)
+        {
+            try
+            {
+                var sb = new StringBuilder(512);
+                sb.Append("{\"t\":\"ent\",\"a\":[");
+                bool first = true;
+                foreach (var kv in sides)
+                {
+                    string fn = ""; try { fn = kv.Key.faction != null ? kv.Key.faction.factionName : ""; } catch { }
+                    foreach (var ac in kv.Value)
+                    {
+                        try
+                        {
+                            if (ac == null || removed.Contains(ac)) continue;
+                            if (ac.Player != null) continue;                  // AI aircraft only
+                            try { if (ac.disabled) continue; } catch { }      // skip mid-despawn ghosts
+                            var gp = ac.GlobalPosition();
+                            if (!first) sb.Append(',');
+                            first = false;
+                            sb.Append("{\"i\":").Append(ac.GetInstanceID())
+                              .Append(",\"x\":").Append((int)gp.x).Append(",\"z\":").Append((int)gp.z)
+                              .Append(",\"f\":\"").Append(Esc(fn)).Append("\"")
+                              .Append(",\"k\":\"").Append(AcKind(ac)).Append("\"")
+                              .Append(",\"g\":").Append(IsGrounded(ac) ? 1 : 0).Append('}');
+                        }
+                        catch { }                                             // fail-safe: skip this aircraft
+                    }
+                }
+                sb.Append("],\"s\":[");
+                first = true;
+                foreach (var sh in UnityEngine.Object.FindObjectsOfType<Ship>())
+                {
+                    try
+                    {
+                        if (sh == null) continue;
+                        try { if (sh.disabled) continue; } catch { }          // skip mid-despawn ghosts
+                        FactionHQ hq = null; try { hq = sh.NetworkHQ; } catch { }
+                        if (hq == null) continue;                             // skip ships with no side
+                        string fn = ""; try { fn = hq.faction != null ? hq.faction.factionName : ""; } catch { }
+                        var gp = sh.GlobalPosition();
+                        if (!first) sb.Append(',');
+                        first = false;
+                        sb.Append("{\"i\":").Append(sh.GetInstanceID())
+                          .Append(",\"x\":").Append((int)gp.x).Append(",\"z\":").Append((int)gp.z)
+                          .Append(",\"f\":\"").Append(Esc(fn)).Append("\"")
+                          .Append(",\"c\":\"").Append(ShipClass(sh)).Append("\"}");
+                    }
+                    catch { }                                                 // fail-safe: skip this ship
+                }
+                sb.Append("]}");
+                Out(sb.ToString());
+            }
+            catch (Exception e) { Log?.LogError("EmitEntities: " + e); }
+        }
+
+        // plane vs heli, cached per AircraftDefinition. A heli has a CompoundHeloController in
+        // its hierarchy; failing that we fall back to a known heli jsonKey set.
+        static readonly Dictionary<AircraftDefinition, string> _acKindCache = new Dictionary<AircraftDefinition, string>();
+        static readonly HashSet<string> _heliKeys = new HashSet<string> { "AttackHelo1", "QuadVTOL1" };
+        static string AcKind(Aircraft ac)
+        {
+            try
+            {
+                AircraftDefinition def = null; try { def = ac.definition; } catch { }
+                if (def != null && _acKindCache.TryGetValue(def, out var cached)) return cached;
+                string kind = "p";
+                try { if (ac.GetComponentInChildren<CompoundHeloController>() != null) kind = "h"; } catch { }
+                if (kind == "p" && def != null) { try { if (_heliKeys.Contains(def.jsonKey)) kind = "h"; } catch { } }
+                if (def != null) _acKindCache[def] = kind;
+                return kind;
+            }
+            catch { return "p"; }
+        }
+
+        // ship class string for the map, cached per ShipDefinition.
+        static readonly Dictionary<ShipDefinition, string> _shipClassCache = new Dictionary<ShipDefinition, string>();
+        static string ShipClass(Ship sh)
+        {
+            try
+            {
+                var def = sh.definition as ShipDefinition;
+                if (def == null) return "corvette";
+                if (_shipClassCache.TryGetValue(def, out var cached)) return cached;
+                string cls;
+                switch (def.shipType)
+                {
+                    case ShipType.CV:  case ShipType.LHA: cls = "carrier";   break;
+                    case ShipType.DDG:                    cls = "destroyer"; break;
+                    case ShipType.FFG:                    cls = "argus";     break;
+                    case ShipType.FFL:                    cls = "corvette";  break;
+                    case ShipType.LFD: case ShipType.LC:  cls = "cursor";    break;
+                    default:                              cls = "corvette";  break;
+                }
+                _shipClassCache[def] = cls;
+                return cls;
+            }
+            catch { return "corvette"; }
+        }
+
+        // live AI/player aircraft counts for the web command centre (per side + totals + caps)
+        static void EmitAir(Dictionary<FactionHQ, List<Aircraft>> sides,
+                            Dictionary<FactionHQ, List<Aircraft>> aiSides, HashSet<Aircraft> removed)
+        {
+            try
+            {
+                var sb = new StringBuilder(192);
+                sb.Append("{\"t\":\"air\",\"s\":[");
+                bool first = true; int totAi = 0, totPl = 0;
+                foreach (var kv in sides)
+                {
+                    int ai = aiSides[kv.Key].Count(a => a != null && !removed.Contains(a));
+                    int pl = kv.Value.Count(a => a != null && a.Player != null && !removed.Contains(a));
+                    totAi += ai; totPl += pl;
+                    string fn = ""; try { fn = kv.Key.faction != null ? kv.Key.faction.factionName : ""; } catch { }
+                    if (!first) sb.Append(',');
+                    first = false;
+                    sb.Append("{\"n\":\"").Append(Esc(fn)).Append("\",\"ai\":").Append(ai).Append(",\"pl\":").Append(pl).Append('}');
+                }
+                sb.Append("],\"ai\":").Append(totAi).Append(",\"pl\":").Append(totPl)
+                  .Append(",\"teamcap\":").Append(AiPerTeamCap.Value).Append(",\"totcap\":").Append(AiTotalCap.Value).Append('}');
+                Out(sb.ToString());
+            }
+            catch (Exception e) { Log?.LogError("EmitAir: " + e); }
+        }
+        // ===================== end AI AIRCRAFT LIMITER =====================
+
+        // -------- PvP team-balance: the other faction + a per-player message --------
+        internal static FactionHQ OtherHQ(FactionHQ target)
+        {
+            try
+            {
+                foreach (var hq in UnityEngine.Object.FindObjectsOfType<FactionHQ>())
+                    if (hq != null && hq != target) return hq;
+            }
+            catch { }
+            return null;
+        }
+
+        internal void TellPlayer(Player p, string msg)
+        {
+            try
+            {
+                var cm = Cm ?? (Cm = UnityEngine.Object.FindObjectOfType<ChatManager>());   // cache for callers before any chat
+                if (cm != null && p != null && p.Owner != null) cm.RpcTargetServerMessage(p.Owner, msg, false);
+            }
+            catch (Exception e) { Log?.LogError("TellPlayer: " + e); }
+        }
+
+        // -------- player-vs-player kill (for the +bonus + "splashed" announce) --------
+        // FactionHQ.ReportKillAction(killer, target, factor) fires for every kill a player
+        // scores. We only report it when the TARGET is a human's aircraft on the OPPOSING
+        // side (target.Player != null) -> i.e. a player downed an enemy player.
+        internal static void OnKill(Player killer, object targetObj)
+        {
+            try
+            {
+                if (killer == null) return;
+                string kid = Sid(killer);
+                if (string.IsNullOrEmpty(kid) || kid == "0") return;
+                if (targetObj is PilotDismounted) return;                   // hide ejected/rescued pilots entirely
+
+                if (CustomKillFeed != null && CustomKillFeed.Value)
+                {
+                    RegisterStreakKill(killer);                              // count EVERY (non-pilot) kill toward the 5s streak
+                    if (targetObj is Ship sunk) MaybeAnnounceShipSink(killer, sunk);   // carrier/destroyer callout
+                }
+
+                var ac = targetObj as Aircraft;          // players fly aircraft; AI aircraft have no Player
+                if (ac == null) return;
+                Player victim = ac.Player;
+                if (victim == null) return;
+                string vid = Sid(victim);
+                if (string.IsNullOrEmpty(vid) || vid == "0" || vid == kid) return;     // human victim, not self
+                if (killer.HQ != null && victim.HQ != null && killer.HQ == victim.HQ) return;  // enemy team only
+                Out("{\"t\":\"kill\",\"kid\":\"" + kid + "\",\"kn\":\"" + Esc(RawNameOf(killer)) +
+                    "\",\"vid\":\"" + vid + "\",\"vn\":\"" + Esc(RawNameOf(victim)) + "\"}");
+            }
+            catch (Exception e) { Log?.LogError("OnKill: " + e); }
+        }
+
+        // ======== custom kill feed: streak callouts + capital-ship sinks (native feed suppressed) ========
+        sealed class KStreak { public float first, last; public int count, tier; }
+        static readonly Dictionary<string, KStreak> _streaks = new Dictionary<string, KStreak>(StringComparer.Ordinal);
+        static readonly Dictionary<int, float> _sunkShips = new Dictionary<int, float>();
+        const float STREAK_WINDOW = 5f, STREAK_SETTLE = 0.8f;
+
+        // Strategic-launcher (piledriver / ballistic / cruise) shot-downs spam the feed;
+        // coalesce a burst into ONE summary line.
+        static int _stratStrikes;
+        static float _stratLast;
+        static bool IsStrategicLauncher(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            string n = name.ToLowerInvariant();
+            return n.Contains("piledriver") || n.Contains("launcher") || n.Contains("ballistic")
+                || n.Contains("strategic") || n.Contains("cruise");
+        }
+        internal static void PumpStrategic()
+        {
+            // Strategic-strike announce REMOVED (2026-06-24, user: "didn't work how I'd hoped").
+            // Keep draining the counter so it can't accumulate; broadcast nothing.
+            if (_stratStrikes != 0) _stratStrikes = 0;
+        }
+
+        static int StreakTier(int n) => n >= 50 ? 4 : n >= 25 ? 3 : n >= 10 ? 2 : n >= 5 ? 1 : 0;
+        static string TierColour(int t) => t >= 4 ? "#FF1493" : t == 3 ? "#FF3B3B" : t == 2 ? "#FF8C00" : "#FFD200";
+
+        // faction colour for a player's NAME in the kill feed (blue Boscali / red Primeva).
+        static string FactionColour(Player p)
+        {
+            try
+            {
+                string f = (p != null && p.HQ != null && p.HQ.faction != null) ? p.HQ.faction.factionName : "";
+                f = (f ?? "").ToLowerInvariant();
+                if (f.StartsWith("bosc") || f == "bdf") return "#5BA3FF";
+                if (f.StartsWith("prim") || f == "pala") return "#FF6B5B";
+            }
+            catch { }
+            return "#CFCFCF";
+        }
+
+        // "[ABBR] Name" - rank tag in the RANK colour, name in the player's TEAM colour.
+        static string RankNameTag(Player p)
+        {
+            string raw = SafeText(RawNameOf(p));
+            string fc = FactionColour(p);
+            LoadRankMap();
+            if (RankMap.TryGetValue(Sid(p), out var rc) && !string.IsNullOrEmpty(rc.label))
+                return $"<color={rc.color}>[{rc.label}]</color> <color={fc}>{raw}</color>";
+            return $"<color={fc}>{raw}</color>";
+        }
+
+        // Count one kill (any unit) toward the killer's rolling 5s streak.
+        static void RegisterStreakKill(Player p)
+        {
+            string sid = Sid(p);
+            if (string.IsNullOrEmpty(sid) || sid == "0") return;
+            float now = Time.time;
+            if (!_streaks.TryGetValue(sid, out var s)) { _streaks[sid] = new KStreak { first = now, last = now, count = 1, tier = 0 }; return; }
+            if (now - s.first > STREAK_WINDOW) { s.first = now; s.count = 1; s.tier = 0; }   // window closed -> fresh streak
+            else s.count++;
+            s.last = now;
+        }
+
+        // Off HQTick: once a burst settles (~0.8s), announce the exact count at each NEW tier (5/10/25/50).
+        internal static void PumpKillStreaks()
+        {
+            if (_streaks.Count == 0) return;
+            float now = Time.time;
+            List<string> drop = null;
+            foreach (var kv in _streaks)
+            {
+                var s = kv.Value;
+                int tier = StreakTier(s.count);
+                if (s.count >= 5 && now - s.last >= STREAK_SETTLE && tier > s.tier)
+                {
+                    s.tier = tier;                                           // mark first so we don't repeat this tier
+                    var p = FindPlayerBySid(kv.Key);
+                    if (p != null)
+                    {
+                        string n = s.count >= 50 ? "50+" : s.count.ToString();
+                        Instance?.BroadcastAll($"<color={TierColour(tier)}>{n}</color> <color=#FFFFFF>confirmed kills for</color> {RankNameTag(p)}<color=#FFFFFF>!</color>");
+                        Log?.LogInfo($"[killfeed] streak {s.count} for {RawNameOf(p)} (tier {tier})");
+                    }
+                }
+                if (now - s.last > 8f) (drop ?? (drop = new List<string>())).Add(kv.Key);   // stale cleanup
+            }
+            if (drop != null) foreach (var k in drop) _streaks.Remove(k);
+        }
+
+        // Carrier / destroyer sink -> one celebratory broadcast (deduped by ship instance).
+        static void MaybeAnnounceShipSink(Player killer, Unit ship)
+        {
+            try
+            {
+                if (killer == null || ship == null || ship.definition == null) return;
+                float now = Time.time;
+                int id = ship.GetInstanceID();
+                if (_sunkShips.TryGetValue(id, out var t) && now - t < 15f) return;        // already announced this sink
+                _sunkShips[id] = now;
+                if (_sunkShips.Count > 64)                                                  // bounded cleanup
+                {
+                    var old = new List<int>();
+                    foreach (var kv in _sunkShips) if (now - kv.Value > 30f) old.Add(kv.Key);
+                    foreach (var k in old) _sunkShips.Remove(k);
+                }
+                string nm = SafeText(ship.definition.unitName ?? "");
+                string low = nm.ToLowerInvariant();
+                string cls = low.Contains("carrier") ? "CARRIER" : low.Contains("destroyer") ? "DESTROYER" : null;
+                if (cls == null) return;                                                    // only carriers/destroyers
+                string colour = cls == "CARRIER" ? "#FF1493" : "#FF8C00";
+                // chat-feed style line: "[RANK] Name sunk <ship>"
+                Instance?.BroadcastAll($"{RankNameTag(killer)} <color=#FFFFFF>sunk</color> <color={colour}>{nm}</color>");
+                Log?.LogInfo($"[killfeed] {cls} sink: {nm} by {RawNameOf(killer)}");
+            }
+            catch (Exception e) { Log?.LogError("MaybeAnnounceShipSink: " + e); }
+        }
+
+        // -------- rich unit label for the kill feed --------
+        // On spawn we set a player aircraft's networked unitName to
+        // "<rank-colour>ABBR</rank-colour> Name [Plane]". The native kill feed renders
+        // unitName wrapped in the faction colour, so the ABBR shows in the rank colour and
+        // the name+plane inherit the faction colour. NOTE: unitName is ALSO used on radar /
+        // target labels / refuel-rearm text, so this shows there too (accepted trade-off).
+        // Rank is read from plugin_ranks.txt and only refreshes on the player's next spawn.
+        internal void LabelAircraft(Player p)
+        {
+            try
+            {
+                if (p == null) return;
+                var ac = p.Aircraft;
+                if (ac == null) return;
+                string id = Sid(p);
+                if (string.IsNullOrEmpty(id) || id == "0") return;
+                string plane = "";
+                try { var d = ac.definition; if (d != null) plane = SafeText(d.unitName); } catch { }
+                if (CustomKillFeed != null && CustomKillFeed.Value)
+                {
+                    // Custom kill feed on: the native feed (which read unitName) is suppressed, so the unit
+                    // label no longer needs the player's name. Show the PLANE only -> a pilot's name appears
+                    // once, via their chat name (PlayerName), not duplicated on radar / map / lock-on.
+                    ac.NetworkunitName = plane;
+                    return;
+                }
+                string name = SafeText(RawNameOf(p));    // RAW name (the rank tag is added below, not doubled)
+                LoadRankMap();
+                string label = name;
+                if (RankMap.TryGetValue(id, out var rc) && !string.IsNullOrEmpty(rc.label))
+                    label = $"<color={rc.color}>{rc.label}</color> {name}";
+                if (!string.IsNullOrEmpty(plane)) label += $" [{plane}]";
+                ac.NetworkunitName = label;
+            }
+            catch (Exception e) { Log?.LogError("LabelAircraft: " + e); }
+        }
+
+        // -------- RankInName: embed the player's rank into their chat NAME --------
+        // Strip any "[RANK] " prefix we previously added, to recover the real name.
+        static string StripPrefix(string n)
+        {
+            if (string.IsNullOrEmpty(n) || n.Length < 2 || n[0] != '[') return n;
+            int c = n.IndexOf(']');
+            if (c > 0 && c + 2 <= n.Length && n[c + 1] == ' ') return n.Substring(c + 2);
+            return n;
+        }
+
+        // The player's REAL name: from our cache if known, else strip a prefix off PlayerName.
+        static string RawNameOf(Player p)
+        {
+            try
+            {
+                if (p == null) return "";
+                string sid = Sid(p);
+                if (!string.IsNullOrEmpty(sid) && RawNames.TryGetValue(sid, out var r) && !string.IsNullOrEmpty(r))
+                    return r;
+                return StripPrefix(p.PlayerName);
+            }
+            catch { return p != null ? p.PlayerName : ""; }
+        }
+
+        // "[ABBR] raw" when the bot has pushed a rank for this player; plain "raw" otherwise (so
+        // we never show a guessed/wrong rank). The total is capped at 32 chars (the game runs
+        // SanitizeRichText(32) on the name) by trimming the raw tail, so the rank tag itself is
+        // never the part that gets clipped. The full raw name is still cached in RawNames for
+        // the bot, so this only affects the in-game display of very long names.
+        static string Prefixed(string sid, string raw)
+        {
+            LoadRankMap();
+            if (RankMap.TryGetValue(sid, out var rc) && !string.IsNullOrEmpty(rc.label))
+            {
+                string tag = "[" + rc.label + "] ";         // SHORTHAND rank in name: consistent with the kill feed,
+                                                            // and avoids the full-rank "[Flying Officer]" duplicate the
+                                                            // HUD lock / map marker show alongside the unitName label.
+                int room = 32 - tag.Length;
+                if (room < 1) return raw;                       // pathological: tag alone fills the cap
+                if (raw.Length > room) raw = raw.Substring(0, room);
+                return tag + raw;
+            }
+            return raw;
+        }
+
+        // Called from the CmdSetPlayerName prefix: rewrite the name the client is setting (its
+        // FIRST and only set -- the game rejects later sets) to include the rank tag, and remember
+        // the real name. The tag is applied ONCE here, at join: returning players (rank already in
+        // plugin_ranks.txt) show "[ABBR] Name" immediately; a brand-new player whose rank isn't
+        // known yet shows the plain name this session and picks up the tag next session. We do NOT
+        // re-tag mid-session: writing PlayerName later fires the NameChanged->JoinMessage hook on
+        // each CLIENT (the server process is headless, base.IsHost==false, so we can't intercept
+        // it), which would show a spurious duplicate "joined the game". The kill-feed/radar rank
+        // (aircraft unitName in LabelAircraft) still refreshes every spawn, so live rank is shown.
+        internal static void InjectRankIntoName(Player p, ref string name)
+        {
+            if (RankInName == null || !RankInName.Value || p == null) return;
+            if (!string.IsNullOrEmpty(p.PlayerName)) return;    // only the first set; later sets are rejected anyway
+            string sid = Sid(p);
+            if (string.IsNullOrEmpty(sid) || sid == "0") return;
+            string raw = name ?? "";
+            RawNames[sid] = raw;
+            name = Prefixed(sid, raw);
+        }
+
+        // -------- dismounted-pilot cleanup --------
+        internal static void MaybeCleanupPilots()
+        {
+            try
+            {
+                if (CleanupPilots == null || !CleanupPilots.Value) return;
+                float now = Time.time;
+                if (now < _nextPilotSweep) return;
+                _nextPilotSweep = now + 30f;                       // sweep at most every 30s
+                float maxAge = Mathf.Max(30, PilotLifetime != null ? PilotLifetime.Value : 300);
+
+                var live = UnityEngine.Object.FindObjectsOfType<PilotDismounted>();
+                var seen = new HashSet<PilotDismounted>();
+                int removed = 0;
+                foreach (var pilot in live)
+                {
+                    if (pilot == null) continue;
+                    seen.Add(pilot);
+                    if (!PilotSeen.TryGetValue(pilot, out var first)) { PilotSeen[pilot] = now; continue; }
+                    if (now - first < maxAge) continue;
+                    try
+                    {
+                        if (pilot.Networkplayer != null) pilot.Networkplayer.RemovePilotDismounted(pilot);
+                    }
+                    catch { }
+                    UnityEngine.Object.Destroy(pilot.gameObject);     // same despawn the game uses on capture/landing
+                    removed++;
+                }
+                // forget pilots that are gone (captured/destroyed) so the dict doesn't grow
+                foreach (var key in new List<PilotDismounted>(PilotSeen.Keys))
+                    if (key == null || !seen.Contains(key)) PilotSeen.Remove(key);
+                if (removed > 0) Log?.LogInfo($"[cleanup] despawned {removed} lingering pilot(s) (> {maxAge}s)");
+            }
+            catch (Exception e) { Log?.LogError("MaybeCleanupPilots: " + e); }
+        }
+
+        // -------- end of game: authoritative winner + awards --------
+        internal void OnDeclareEndGame(FactionHQ hq, string endType)
+        {
+            try
+            {
+                if (Time.time - _lastEnd < 20f) return;                 // debounce paired/dup calls
+                if (!string.Equals(endType, "Victory", StringComparison.OrdinalIgnoreCase)) return;
+                _lastEnd = Time.time;
+                // NOTE: do NOT advance the balance game-counter here - that happens once per mission START
+                // (AdvanceGame in StartingRankFloorPatch), so move-exemptions span whole games correctly.
+
+                var players = Humans();
+                string winFaction = hq != null && hq.faction != null ? hq.faction.factionName : "";
+                EmitAll("snap");                                        // final authoritative scores
+                Out("{\"t\":\"win\",\"f\":\"" + Esc(winFaction) + "\"}");
+
+                foreach (var p in players)                              // +WinPoints to the winning side
+                    if (p.HQ == hq) Award(p, WinPoints.Value, "win");
+
+                var ranked = players.OrderByDescending(ScoreOf).ToList();   // placement bonuses
+                int[] bonus = { FirstPlace.Value, SecondPlace.Value, ThirdPlace.Value };
+                string[] tag = { "1st", "2nd", "3rd" };
+                for (int i = 0; i < ranked.Count && i < 3; i++) Award(ranked[i], bonus[i], tag[i]);
+
+                Out("{\"t\":\"end\"}");
+                Log.LogInfo($"NukeStats: end-of-game, winner={winFaction}, {players.Count} players.");
+                // v0.8.7: NO match-end eject/bank - a skill life now PERSISTS across the match and ends
+                // only on death or mid-air eject (the bot keeps the running per-life score in curLife).
+            }
+            catch (Exception e) { Log?.LogError("OnDeclareEndGame: " + e); }
+        }
+
+        static double ScoreOf(Player p)
+        {
+            try { return Convert.ToDouble(p.PlayerScore, CultureInfo.InvariantCulture); }
+            catch { return 0; }
+        }
+
+        static void Award(Player p, int pts, string reason)
+        {
+            if (p == null || pts == 0) return;
+            string id = Sid(p);
+            if (string.IsNullOrEmpty(id) || id == "0") return;
+            Out("{\"t\":\"award\",\"id\":\"" + id + "\",\"n\":\"" + Esc(RawNameOf(p)) +
+                "\",\"pts\":" + pts + ",\"reason\":\"" + reason + "\"}");
+        }
+
+        // ======================= NuclearSkill: per-life skill tracking (v0.8.7) =======================
+        // PERSISTENT points-per-DEATH. The running per-life SCORE now lives in the BOT (rec["curLife"],
+        // fed by snap deltas) so it survives disconnects AND match-ends. This plugin is just the life
+        // EVENT detector: it emits a "life" event (reason "death" or "eject") ONLY when the pilot DIES or
+        // EJECTS mid-air. A ground dismount, a disconnect, a match-end, and a balance/admin move are all
+        // life-NEUTRAL (the life stays open; the bot keeps accumulating). Captures emit a "capbonus"
+        // event the bot folds into the current life. The bot derives the rating (points-per-life) + 0-10.
+        internal static ConfigEntry<int>  CaptureSkillBonus, WinSkillBonus, LossSkillBonus;
+        internal static ConfigEntry<bool> BalanceBySkill;
+
+        // alive = a life is open; airborne = the aircraft was in the air last scan (tells a real mid-air
+        // EJECT from a ground dismount). _balancing = SteamIDs ejected by an admin/balance move, so
+        // SkillTick treats their aircraft-loss as life-NEUTRAL (balancing never ruins a rank).
+        sealed class Life { public bool alive; public bool airborne; }
+        static readonly Dictionary<string, Life> _lives = new Dictionary<string, Life>(StringComparer.Ordinal);
+        static readonly HashSet<string> _balancing = new HashSet<string>(StringComparer.Ordinal);
+        // AdminEject also stamps this guard (sid -> expiry time). The ON-DEATH path (CheckTeamkill, via the
+        // ReportKilled patch) checks it and SKIPS the death + the "down"/"went down" killfeed for an admin- or
+        // team-swap-ejected pilot - so an AIRBORNE eject (a balance move of a flyer, or the !swapteam/!forceteamswap
+        // Cricket) is truly life- AND feed-neutral. (_balancing alone only neutralises the slower 1Hz SkillTick
+        // scan; the on-death patch fires first and would otherwise bank a phantom death + spam chat.)
+        static readonly Dictionary<string, float> _adminEjectGuard = new Dictionary<string, float>(StringComparer.Ordinal);
+        internal static bool IsAdminEjecting(string sid) => !string.IsNullOrEmpty(sid) && _adminEjectGuard.TryGetValue(sid, out var exp) && Time.time < exp;
+        internal static void GuardEject(string sid)
+        {
+            if (string.IsNullOrEmpty(sid) || sid == "0") return;
+            float now = Time.time;
+            _adminEjectGuard[sid] = now + 6f;                          // covers the async ReportKilled after StartEjectionSequence
+            if (_adminEjectGuard.Count > 16)                           // opportunistic prune of expired entries
+            {
+                List<string> stale = null;
+                foreach (var kv in _adminEjectGuard) if (kv.Value < now) (stale ?? (stale = new List<string>())).Add(kv.Key);
+                if (stale != null) foreach (var s in stale) _adminEjectGuard.Remove(s);
+            }
+        }
+        static Life LifeOf(string sid) { if (!_lives.TryGetValue(sid, out var l)) { l = new Life(); _lives[sid] = l; } return l; }
+        static float _nextLifeScan;
+
+        // Signal a completed life. The bot holds the running score (curLife) and banks it on receipt;
+        // we just emit the END. reason = "death" (shot down/crashed) or "eject" (bailed from an airborne
+        // plane). Ground dismounts, disconnects, match-end and balance/admin moves do NOT end a life.
+        static void EndLife(string sid, Life l, string reason)
+        {
+            if (l == null || !l.alive) return;
+            l.alive = false;
+            if (string.IsNullOrEmpty(sid) || sid == "0") return;
+            Out("{\"t\":\"life\",\"id\":\"" + sid + "\",\"r\":\"" + reason + "\"}");
+            Log?.LogInfo($"[skill] life ended {sid} ({reason})");
+        }
+
+        // A capture adds CaptureBonus to the capturing player's CURRENT life - emitted as a "capbonus"
+        // event the bot folds into curLife (banked at the next death/eject). Hooked from ReportCaptureLocationAction.
+        internal static void OnCapture(Player p)
+        {
+            try
+            {
+                if (p == null) return;
+                string sid = Sid(p); if (string.IsNullOrEmpty(sid) || sid == "0") return;
+                var l = LifeOf(sid);
+                if (!l.alive) l.alive = true;                                 // capture => active life
+                int b = CaptureSkillBonus != null ? CaptureSkillBonus.Value : 250;
+                Out("{\"t\":\"capbonus\",\"id\":\"" + sid + "\",\"pts\":" + b + "}");
+                Log?.LogInfo($"[skill] capture +{b} for {RawNameOf(p)}");
+            }
+            catch (Exception e) { Log?.LogError("OnCapture: " + e); }
+        }
+
+        // Eject a player by ADMIN/BALANCE action (move/spectate/probation/teamkill-warn). Marks them so
+        // SkillTick treats the resulting aircraft-loss as life-NEUTRAL - balancing never ruins a rank.
+        internal static void AdminEject(Player p)
+        {
+            try
+            {
+                if (p == null || p.Aircraft == null) return;
+                string sid = Sid(p);
+                if (!string.IsNullOrEmpty(sid) && sid != "0") { _balancing.Add(sid); GuardEject(sid); }
+                p.Aircraft.StartEjectionSequence();
+            }
+            catch (Exception e) { Log?.LogWarning("AdminEject: " + e); }
+        }
+
+        // Driven from HQTick (~1s): detect life START (got an aircraft) and real AIR-EJECT (lost an
+        // airborne plane with no admin move). The running per-life SCORE lives in the BOT (curLife), so
+        // we only emit the discrete life-END events here (death is emitted from the kill patch). Ground
+        // dismounts, disconnects, match-end and balance/admin moves are all life-NEUTRAL. No match eject.
+        internal static void SkillTick()
+        {
+            float now = Time.time;
+            if (now < _nextLifeScan) return;
+            _nextLifeScan = now + 1f;
+            try
+            {
+                foreach (var p in Humans())
+                {
+                    string sid = Sid(p);
+                    if (string.IsNullOrEmpty(sid) || sid == "0") continue;
+                    var l = LifeOf(sid);
+                    bool hasAc = false; try { hasAc = p.Aircraft != null; } catch { }
+                    if (hasAc)
+                    {
+                        _balancing.Remove(sid);                       // flying again -> clear any admin-move marker
+                        if (!l.alive) l.alive = true;                 // life start (the bot owns the running score)
+                        try { l.airborne = !p.Aircraft.IsLanded(); } catch { l.airborne = true; }
+                    }
+                    else if (l.alive && l.airborne)
+                    {
+                        if (_balancing.Contains(sid))
+                        {
+                            // a balance/admin move ejected them - NOT a real eject: keep the life OPEN and
+                            // count nothing (balancing never ruins a rank). Treat like a ground dismount.
+                            _balancing.Remove(sid);
+                            l.airborne = false;
+                        }
+                        else
+                        {
+                            // lost an airborne plane with no admin move -> a real AIR-EJECT -> end + count.
+                            // (A real death is closed earlier in the kill patch with reason "death".)
+                            EndLife(sid, l, "eject");
+                        }
+                    }
+                    // A GROUND dismount (l.airborne == false) does NOTHING: the life stays OPEN so the
+                    // bot's curLife keeps accumulating across sorties; it ends only on death or air-eject.
+                }
+                // Disconnects are deliberately NOT dropped - the life stays open so the bot keeps
+                // accumulating curLife across a reconnect. _lives is bounded by unique SteamIDs per
+                // session and is cleared on the daily server restart.
+            }
+            catch (Exception e) { Log?.LogError("SkillTick scan: " + e); }
+        }
+
+        // Skill rating per SteamID (points-per-life), pushed by the bot in plugin_skill.txt as "sid|rating".
+        static readonly Dictionary<string, float> _skillMap = new Dictionary<string, float>(StringComparer.Ordinal);
+        static float _skillAvg = 0f;
+        static long _skillFileTicks = -1;
+        static string SkillFilePath => Path.Combine(Paths.GameRootPath, "plugin_skill.txt");
+        static void LoadSkillMap()
+        {
+            try
+            {
+                var fi = new FileInfo(SkillFilePath);
+                if (!fi.Exists || fi.LastWriteTimeUtc.Ticks == _skillFileTicks) return;
+                _skillFileTicks = fi.LastWriteTimeUtc.Ticks;
+                _skillMap.Clear();
+                double sum = 0; int n = 0;
+                foreach (var line in File.ReadAllLines(SkillFilePath))
+                {
+                    var parts = line.Split('|');                            // sid|rating
+                    if (parts.Length >= 2 && float.TryParse(parts[1].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var r))
+                    { _skillMap[parts[0].Trim()] = r; sum += r; n++; }
+                }
+                _skillAvg = n > 0 ? (float)(sum / n) : 0f;
+            }
+            catch (Exception e) { Log?.LogError("LoadSkillMap: " + e); }
+        }
+
+        // ======================= teamkill enforcement (friendly fire) =======================
+        // Detection: Unit.ReportKilled runs for every death; the dead unit's top damager (from
+        // damageCredit) who is a PLAYER on the SAME faction as the dead unit = a teamkill (covers
+        // friendly buildings/vehicles/aircraft). Escalation PER MATCH: 1st = eject + private warning;
+        // 2nd = kick ("next is a ban") + set in-game rank 0 on rejoin; 3rd = ban. Bans persist
+        // (plugin_bans.txt) and are enforced by kicking on sight. Defensive: failures no-op (never
+        // a false kick). TK is rare/intentional in this game, so auto-enforcement is safe.
+        internal static ConfigEntry<bool> TeamkillEnforce;
+        static readonly List<string> _tkQueue = new List<string>();
+        static readonly Dictionary<string, int> _tkCount = new Dictionary<string, int>(StringComparer.Ordinal);   // per match
+        static readonly HashSet<string> _tkBanned = new HashSet<string>(StringComparer.Ordinal);                  // persistent
+        static readonly HashSet<string> _tkRankZero = new HashSet<string>(StringComparer.Ordinal);               // rank 0 on next sight
+        static readonly List<KeyValuePair<string, float>> _tkKicks = new List<KeyValuePair<string, float>>();    // delayed kicks
+        static System.Reflection.FieldInfo _dmgCreditFI;
+        static float _nextTkScan;
+
+        static string BanFilePath => Path.Combine(Paths.GameRootPath, "plugin_bans.txt");
+        internal static void LoadBans()
+        {
+            try { if (File.Exists(BanFilePath)) foreach (var l in File.ReadAllLines(BanFilePath)) { var s = l.Trim(); if (s.Length > 0) _tkBanned.Add(s); } }
+            catch (Exception e) { Log?.LogError("LoadBans: " + e); }
+        }
+        static void SaveBans()
+        {
+            try { File.WriteAllText(BanFilePath, string.Join("\n", _tkBanned) + "\n"); }
+            catch (Exception e) { Log?.LogError("SaveBans: " + e); }
+        }
+        internal static void ClearMatchTeamkills() { _tkCount.Clear(); _tkRankZero.Clear(); }   // per-match reset (bans persist)
+
+        static void Kick(Player p)
+        {
+            // KickPlayer(INetworkPlayer) is the void overload (KickPlayerAsync would pull in UniTask).
+            try { if (p != null && p.Owner != null && NetworkManagerNuclearOption.i != null) NetworkManagerNuclearOption.i.KickPlayer(p.Owner); }
+            catch (Exception e) { Log?.LogError("Kick: " + e); }
+        }
+
+        // From the ReportKilled hook (every unit death): announce a PLAYER being shot down (by whom -
+        // incl. AI / crash; enemy-PLAYER kills are left to the bot's "X splashed Y"), and run teamkill
+        // enforcement when the top damager is a friendly player. One damageCredit scan serves both.
+        internal static void CheckTeamkill(Unit dead)
+        {
+            try
+            {
+                if (dead == null) return;
+                bool tkOn = (TeamkillEnforce == null || TeamkillEnforce.Value);
+                bool announceOn = (CustomKillFeed == null || CustomKillFeed.Value);
+                Player victim = null; try { if (dead is Aircraft dv) victim = dv.Player; } catch { }
+                // SWAP/ADMIN EJECT: an admin- or team-swap-ejected pilot is NOT really dying (we ejected them for a
+                // balance/swap move). Suppress the death (keep their open skill-life + points) AND the phantom
+                // "down"/"went down" killfeed entry. Guard set by AdminEject/GuardEject; expires after a few seconds.
+                if (victim != null && IsAdminEjecting(Sid(victim))) return;
+                // SKILL: end this pilot's life NOW with reason "death" (regardless of feed/tk config).
+                // Ending on the death event (not the 1s scan) means fast death->respawn cycles are each
+                // counted, fixing the under-count, and gives an accurate "death" reason for the bot.
+                if (victim != null)
+                {
+                    try { string vs = Sid(victim); var vl = LifeOf(vs); if (vl.alive) EndLife(vs, vl, "death"); }
+                    catch (Exception e) { Log?.LogError("life-on-death: " + e); }
+                }
+                bool wantAnnounce = announceOn && victim != null;            // only real-player deaths
+                if (!tkOn && !wantAnnounce) return;
+                FactionHQ deadHQ = null; try { deadHQ = dead.NetworkHQ; } catch { }
+
+                // PERF: the damageCredit reflection scan below runs for EVERY unit death. When
+                // there's no player to announce, only run it if a human could have team-killed
+                // this unit (i.e. a human shares the dead unit's faction). Skips enemy-AI deaths
+                // - the bulk in PvE - entirely.
+                if (!wantAnnounce)
+                {
+                    bool deadHasHumans = false;
+                    if (tkOn && deadHQ != null)
+                        foreach (var hp in Humans()) { try { if (hp.HQ == deadHQ) { deadHasHumans = true; break; } } catch { } }
+                    if (!deadHasHumans) return;
+                }
+
+                // top damager from damageCredit
+                if (_dmgCreditFI == null)
+                    _dmgCreditFI = typeof(Unit).GetField("damageCredit", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                var dc = _dmgCreditFI?.GetValue(dead) as System.Collections.IDictionary;
+                object topKey = null; float top = 0f;
+                if (dc != null)
+                    foreach (System.Collections.DictionaryEntry e in dc)
+                    { float v; try { v = Convert.ToSingle(e.Value); } catch { continue; } if (v > top) { top = v; topKey = e.Key; } }
+
+                Player killer = null; FactionHQ killerHQ = null; string killerName = null;
+                if (topKey != null && UnitRegistry.TryGetPersistentUnit((PersistentID)topKey, out var pu))
+                {
+                    try { killer = pu.player; } catch { }
+                    try { killerHQ = pu.GetHQ(); } catch { }
+                    try { killerName = (killer != null) ? RawNameOf(killer) : (pu.definition != null ? SafeText(pu.definition.unitName) : null); } catch { }
+                }
+
+                // KILLFEED -> bot: every human death with who/what downed them (player name OR AI/unit name).
+                // kp=1 => killer is a player (ks=their sid for team colour); else k = the AI/SAM/unit name.
+                if (victim != null)
+                {
+                    bool kPlayer = killer != null && killer != victim;
+                    string kdisp = kPlayer ? RawNameOf(killer) : (killerName ?? "");
+                    bool ff = kPlayer && killerHQ != null && deadHQ != null && killerHQ == deadHQ;
+                    Out("{\"t\":\"down\",\"v\":\"" + Sid(victim) + "\",\"vn\":\"" + Esc(RawNameOf(victim))
+                        + "\",\"k\":\"" + Esc(kdisp) + "\",\"ks\":\"" + (kPlayer ? Sid(killer) : "")
+                        + "\",\"kp\":" + (kPlayer ? 1 : 0) + ",\"ff\":" + (ff ? 1 : 0) + "}");
+                }
+
+                // player shot-down message (skip enemy-player kills -> the bot says "X splashed Y")
+                if (wantAnnounce)
+                {
+                    bool enemyPlayerKill = killer != null && killer != victim && killerHQ != null && deadHQ != null && killerHQ != deadHQ;
+                    if (!enemyPlayerKill)
+                    {
+                        string vt = RankNameTag(victim);
+                        if (killer != null && killer != victim)             // friendly player (also a teamkill)
+                            Instance?.BroadcastAll($"{vt} <color=#FFFFFF>was shot down by</color> {RankNameTag(killer)}");
+                        else if (killer == null && !string.IsNullOrEmpty(killerName))   // AI / unit
+                        {
+                            if (IsStrategicLauncher(killerName))            // coalesce launcher spam -> one summary
+                            { _stratStrikes++; _stratLast = Time.time; }
+                            else
+                                Instance?.BroadcastAll($"{vt} <color=#FFFFFF>was shot down by</color> <color=#FF6A00>{killerName}</color>");
+                        }
+                        else                                                 // crash / self / unknown
+                            Instance?.BroadcastAll($"{vt} <color=#FFFFFF>went down.</color>");
+                    }
+                }
+
+                // teamkill enforcement: top damager is a friendly player (and not the victim's own aircraft)
+                if (tkOn && killer != null && killerHQ != null && deadHQ != null && killerHQ == deadHQ && killer != victim)
+                {
+                    string sid = Sid(killer);
+                    if (!string.IsNullOrEmpty(sid) && sid != "0") { _tkQueue.Add(sid); Log?.LogInfo($"[tk] friendly kill by {RawNameOf(killer)}"); }
+                }
+            }
+            catch (Exception e) { Log?.LogError("CheckTeamkill: " + e); }
+        }
+
+        // Off HQTick: escalate queued teamkills, fire delayed kicks, enforce bans + rank-0 on sight.
+        internal static void TkTick()
+        {
+            float now = Time.time;
+            if (_tkQueue.Count > 0)
+            {
+                var batch = new List<string>(_tkQueue); _tkQueue.Clear();
+                foreach (var sid in batch)
+                {
+                    int n = (_tkCount.TryGetValue(sid, out var c) ? c : 0) + 1;
+                    _tkCount[sid] = n;
+                    var p = FindPlayerBySid(sid);
+                    if (n == 1)
+                    {
+                        if (p != null)
+                        {
+                            AdminEject(p);   // life-neutral: a teamkill-warning eject must not end a skill-life
+                            Instance?.TellPlayer(p, "<color=#FF5555>FRIENDLY FIRE - first warning.</color> <color=#FFD200>Check your targets. Do it again this match and you'll be removed.</color>");
+                        }
+                        Log?.LogInfo($"[tk] warn+eject {sid} (1)");
+                    }
+                    else if (n == 2)
+                    {
+                        _tkRankZero.Add(sid);
+                        if (p != null) Instance?.TellPlayer(p, "<color=#FF5555>FRIENDLY FIRE - second warning. The next one is a BAN.</color>");
+                        _tkKicks.Add(new KeyValuePair<string, float>(sid, now + 2.5f));   // let the message land, then kick
+                        Log?.LogInfo($"[tk] kick {sid} (2)");
+                    }
+                    else
+                    {
+                        _tkBanned.Add(sid); SaveBans();
+                        if (p != null) Instance?.TellPlayer(p, "<color=#FF0000>BANNED for repeated team killing.</color>");
+                        _tkKicks.Add(new KeyValuePair<string, float>(sid, now + 2.5f));
+                        Log?.LogInfo($"[tk] BAN {sid} (3+)");
+                    }
+                }
+            }
+            if (_tkKicks.Count > 0)
+                for (int i = _tkKicks.Count - 1; i >= 0; i--)
+                    if (now >= _tkKicks[i].Value) { var k = _tkKicks[i]; _tkKicks.RemoveAt(i); Kick(FindPlayerBySid(k.Key)); }
+            if (now < _nextTkScan) return;
+            _nextTkScan = now + 2f;
+            try
+            {
+                foreach (var p in Humans())
+                {
+                    string sid = Sid(p);
+                    if (string.IsNullOrEmpty(sid) || sid == "0") continue;
+                    if (_tkBanned.Contains(sid)) { Kick(p); continue; }                  // enforce ban on rejoin
+                    if (_tkRankZero.Contains(sid)) { try { p.SetRank(0, true); } catch { } _tkRankZero.Remove(sid); Log?.LogInfo($"[tk] rank->0 {RawNameOf(p)}"); }
+                }
+            }
+            catch (Exception e) { Log?.LogError("TkTick: " + e); }
+        }
+
+        // ===== ANTI-GRIEF: detect a single connection mass-commanding units to brick the server (the
+        // reliable-send-buffer flood that mass-disconnects EVERYONE) and auto-kick THAT one offender (not the
+        // lobby) + emit a report the webcc Reports tab shows with a Ban button. Two-factor by default: a player
+        // must own > threshold GroundVehicles AND be SUSTAINED-flooding move-orders (a macro/held-key/loop) --
+        // so a legit base-builder who 'select-all + move once' is never kicked. Reuses the teamkill kick/ban
+        // path (Kick / _tkKicks / _tkBanned). Fail-open everywhere. =====
+        internal static ConfigEntry<bool> GriefAutoKick, GriefRequireFlooding, GriefHardBan, GriefReportOnly, GriefExemptAdmins;
+        internal static ConfigEntry<int>  GriefOwnedThreshold, GriefFloodPerSec;
+        static readonly Dictionary<string, int>   _orderAttempts = new Dictionary<string, int>();   // CmdSetDestination attempts since last GriefTick
+        static readonly Dictionary<string, int>   _griefStreak   = new Dictionary<string, int>();    // consecutive high-rate ticks per player
+        static readonly Dictionary<string, float> _griefActed    = new Dictionary<string, float>();  // last action time (throttle re-acting)
+        static float _nextGriefScan, _lastGriefScan;
+        const float GRIEF_INTERVAL = 2f;
+
+        // called from FleetOrderFloodPatch.Prefix on EVERY CmdSetDestination attempt (before the rate/policy gates)
+        internal static void NoteOrderAttempt(Player p)
+        {
+            try
+            {
+                if (p == null) return; string id = Sid(p);
+                if (string.IsNullOrEmpty(id) || id == "0") return;
+                _orderAttempts[id] = (_orderAttempts.TryGetValue(id, out var c) ? c : 0) + 1;
+            }
+            catch { }
+        }
+
+        internal static void GriefTick()
+        {
+            try
+            {
+                if (GriefAutoKick == null) return;                 // not yet bound
+                float now = Time.time;
+                if (now < _nextGriefScan) return;
+                _nextGriefScan = now + GRIEF_INTERVAL;
+                float elapsed = Mathf.Max(0.5f, now - _lastGriefScan);   // REAL window (a lag hitch can exceed GRIEF_INTERVAL)
+                _lastGriefScan = now;
+
+                bool enabled      = GriefAutoKick.Value;
+                int  ownThresh    = GriefOwnedThreshold != null ? Mathf.Max(1, GriefOwnedThreshold.Value) : 12;
+                bool requireFlood = GriefRequireFlooding == null || GriefRequireFlooding.Value;
+                int  floodPerSec  = GriefFloodPerSec != null ? Mathf.Max(1, GriefFloodPerSec.Value) : 3;
+                bool reportOnly   = GriefReportOnly != null && GriefReportOnly.Value;
+                bool hardBan      = GriefHardBan != null && GriefHardBan.Value;
+                bool exemptAdmins = GriefExemptAdmins == null || GriefExemptAdmins.Value;
+                bool diag         = CommandDiagLog != null && CommandDiagLog.Value;
+
+                // snapshot + reset the per-player order-attempt counters for this window
+                var attempts = new Dictionary<string, int>(_orderAttempts);
+                _orderAttempts.Clear();
+
+                // update sustained-flooding streaks (high order RATE held across consecutive ticks)
+                var streakKeys = new List<string>(_griefStreak.Keys);
+                foreach (var id in streakKeys) if (!attempts.ContainsKey(id)) _griefStreak[id] = 0;   // decay idle
+                foreach (var kv in attempts)
+                {
+                    float rate = kv.Value / elapsed;
+                    _griefStreak[kv.Key] = rate >= floodPerSec
+                        ? (_griefStreak.TryGetValue(kv.Key, out var st) ? st : 0) + 1
+                        : 0;
+                }
+
+                if (!enabled && !diag) return;   // disabled and not diagnosing -> nothing to do
+
+                // count owned GroundVehicles per player in ONE pass over allUnits (vs O(players x units))
+                var ownedCount = new Dictionary<Player, int>();
+                try
+                {
+                    foreach (var u in UnitRegistry.allUnits)
+                        if (u is GroundVehicle gv)
+                        {
+                            var ow = SafeOwner(gv);
+                            if (ow != null) ownedCount[ow] = (ownedCount.TryGetValue(ow, out var oc) ? oc : 0) + 1;
+                        }
+                }
+                catch { }
+
+                foreach (var p in Humans())
+                {
+                    string sid = Sid(p);
+                    if (string.IsNullOrEmpty(sid) || sid == "0") continue;
+                    if (_tkBanned.Contains(sid)) continue;        // already banned; TkTick enforces it
+
+                    int owned = ownedCount.TryGetValue(p, out var oc2) ? oc2 : 0;
+                    int streak  = _griefStreak.TryGetValue(sid, out var s2) ? s2 : 0;
+                    bool flooding = streak >= 2;                  // ~2 ticks (~4s) of sustained high order rate
+                    int rateNow = attempts.TryGetValue(sid, out var a2) ? (int)(a2 / GRIEF_INTERVAL) : 0;
+
+                    if (diag && (owned > 0 || rateNow > 0))
+                        Log?.LogInfo($"[grief] {RawNameOf(p)} ({sid}) owned={owned} rate={rateNow}/s streak={streak} thr={ownThresh} flooding={flooding}");
+
+                    if (!enabled) continue;
+                    // AGGRESSIVE: sustained command-spam ALONE trips it -- catch a single connection
+                    // re-commanding units >= floodPerSec/s (held ~4s), regardless of how many units they
+                    // own (the spam can be on units they don't even own). OwnedUnitThreshold is now an
+                    // OPTIONAL escalator: with RequireActiveFlooding=false, owning a huge fleet also trips.
+                    bool trip = requireFlood ? flooding : (flooding || owned > ownThresh);
+                    if (!trip) continue;
+                    if (exemptAdmins && IsAdmin(p)) continue;          // never auto-kick an admin (legit mass-command)
+                    if (_griefActed.TryGetValue(sid, out var t) && now - t < 15f) continue;   // throttle re-acting
+                    _griefActed[sid] = now;
+
+                    string action = reportOnly ? "report" : (hardBan ? "ban" : "kick");
+                    Log?.LogWarning($"[grief] {action} {RawNameOf(p)} ({sid}) owned={owned} rate={rateNow}/s streak={streak}");
+                    // emit the report ([NOSTATS] line the bot tails); ts=0 -> the bot stamps the real time on ingest
+                    Out("{\"t\":\"report\",\"id\":\"" + sid + "\",\"n\":\"" + Esc(RawNameOf(p))
+                        + "\",\"reason\":\"command-spam (sustained order rate)\",\"count\":" + owned + ",\"rate\":" + rateNow
+                        + ",\"action\":\"" + action + "\",\"ts\":0}");
+                    if (reportOnly) continue;
+                    Instance?.TellPlayer(p, "<color=#FF0000>Auto-removed: commanding too many units at once (server protection).</color>");
+                    if (hardBan) { _tkBanned.Add(sid); SaveBans(); }
+                    _tkKicks.Add(new KeyValuePair<string, float>(sid, now + 2.5f));   // delayed kick (let the msg land) -> drained by TkTick
+                }
+            }
+            catch (Exception e) { Log?.LogError("GriefTick: " + e); }
+        }
+
+        // ================= force-move / spectate + PvP auto-balance =================
+        internal static ConfigEntry<bool> AutoMove, MoveOnlyUnspawned;
+        internal static ConfigEntry<int>  RecheckSeconds, MoveDebounce, BalanceGraceSeconds, BalanceMoveExemptGames;
+        internal static ConfigEntry<int>  BalanceMinPlayers, BalanceWarnSeconds;   // never balance under MinPlayers; warn WarnSeconds before moving
+        internal static ConfigEntry<int>  BalanceNewJoinerSeconds, SquadMaxSize, SquadInviteSeconds;  // new-joiner protection window + !squadup tunables
+
+        // numeric server-rank weight per SteamID (1..11), from plugin_ranks.txt 4th field.
+        static readonly Dictionary<string, int> RankWeight = new Dictionary<string, int>();
+        static float Weight(Player p)
+        {
+            try
+            {
+                if (BalanceBySkill == null || BalanceBySkill.Value)        // skill-based balance (default)
+                {
+                    LoadSkillMap();
+                    if (_skillMap.Count > 0)
+                    {
+                        var sid = Sid(p);
+                        return _skillMap.TryGetValue(sid, out var r) ? r : _skillAvg;   // unranked -> server average
+                    }
+                }
+                LoadRankMap(); var id = Sid(p);                            // fallback: server-rank weight (no skill data yet)
+                if (RankWeight.TryGetValue(id, out var w)) return w;
+            }
+            catch { }
+            return 1f;   // last resort
+        }
+
+        static Player FindPlayerBySid(string sid)
+        {
+            if (string.IsNullOrEmpty(sid)) return null;
+            foreach (var p in Humans()) if (Sid(p) == sid) return p;
+            return null;
+        }
+
+        // ---- command channel (command centre -> bot -> here) ----
+        // The bot drops ONE file per command in the game root: "plugin_cmd_<id>.txt" holding
+        // "verb|steamId|faction". We process and DELETE each (so there's no dedup/replay to get
+        // wrong). Writing those files needs SFTP/console access, so they're implicitly trusted.
+        // A standalone persistent ticker so the command loop runs even when the server is EMPTY. The
+        // normal driver is FactionHQ.Update (HQTick), which does NOT fire with 0 players / no active HQ,
+        // so admin commands (setcfg/dumpcfg/swaps) would queue unprocessed on an idle server. This fresh
+        // DontDestroyOnLoad object keeps ticking; it calls PollCommands at ~2 Hz (PollCommands is itself
+        // 1 Hz-gated for the folder scan and idempotent, so being driven from here AND HQTick is safe).
+        internal class Ticker : MonoBehaviour
+        {
+            float _next;
+            void Update() { try { if (Time.time >= _next) { _next = Time.time + 0.5f; PollCommands(); } } catch { } }
+        }
+
+        static float _nextCmdPoll;
+        internal static void PollCommands()
+        {
+            try
+            {
+                float now = Time.time;
+                PumpPending(now);                                        // run any due delayed moves
+                PumpSwaps(now);                                          // advance any in-progress !swapteam/!forceteamswap
+                if (now < _nextCmdPoll) return;
+                _nextCmdPoll = now + 1f;                                 // glance at the drop folder ~1/sec
+                TrackPresence(now);                                      // ~1/sec: maintain each player's join clock (new-joiner protection)
+                MaybeWelcome(now);                                       // ~1/sec: fire the one-time private "plugin vX is active" notice
+                string[] files;
+                try { files = Directory.GetFiles(Paths.GameRootPath, "plugin_cmd_*.txt"); }
+                catch { return; }
+                if (files.Length == 0) return;
+                Array.Sort(files, StringComparer.Ordinal);              // id-prefixed name => chronological
+                foreach (var f in files)
+                {
+                    try { foreach (var raw in File.ReadAllLines(f)) { var l = raw.Trim(); if (l.Length > 0 && l[0] != '#') ExecCommand(l); } }
+                    catch (Exception e) { Log?.LogError("cmd read: " + e); }
+                    try { File.Delete(f); } catch (Exception e) { Log?.LogError("cmd delete: " + e); }
+                }
+            }
+            catch (Exception e) { Log?.LogError("PollCommands: " + e); }
+        }
+
+        // ===================== LIVE CONFIG (webcc settings menu) =====================
+        // The webcc settings menu reads/writes plugin tunables WITHOUT a redeploy. We drive this
+        // generically off BepInEx's own ConfigFile.Keys, so EVERY Config.Bind key (and any future
+        // one) is covered automatically — no hand-maintained registry to drift. DumpCfg emits the
+        // current values as one [NOSTATS] {"t":"cfg",...} line the bot tails; SetCfg type-parses +
+        // applies a value live (ConfigEntry.BoxedValue) and Config.Save()s it. Range validation is
+        // done UPSTREAM in cc_web against the shipped settings catalogue, so here we only type-parse.
+        // NOTE: Flood.Enforce / Flood.DropDeadNetIdRpcs apply LIVE — both flood-guard Harmony patches
+        // are installed unconditionally at load and read their .Value inside the prefix each call, so
+        // toggling them takes effect immediately. The ONE caveat: DropDeadNetIdRpcs fails open, so if
+        // RpcHandler.HandleRpc never bound at load, turning it on later cannot retro-install the patch.
+        static ConfigFile _cfgFile;   // cached in Awake; survives the plugin GameObject's destruction (Instance.Config would read Unity-null)
+        static string CfgKey(ConfigDefinition d) => d.Section + "." + d.Key;
+        static void AppendJsonVal(StringBuilder sb, object v)
+        {
+            if (v is bool b) sb.Append(b ? "true" : "false");
+            else if (v is int || v is long || v is short || v is byte) sb.Append(Convert.ToString(v, CultureInfo.InvariantCulture));
+            else if (v is float f) sb.Append((float.IsNaN(f) || float.IsInfinity(f)) ? "0" : f.ToString("R", CultureInfo.InvariantCulture));
+            else if (v is double d) sb.Append((double.IsNaN(d) || double.IsInfinity(d)) ? "0" : d.ToString("R", CultureInfo.InvariantCulture));
+            else { sb.Append('"').Append((v != null ? v.ToString() : "").Replace("\\", "\\\\").Replace("\"", "\\\"")).Append('"'); }
+        }
+        internal static void DumpCfg()
+        {
+            try
+            {
+                if (_cfgFile == null) return;
+                var sb = new StringBuilder("{\"t\":\"cfg\",\"v\":{");
+                bool first = true;
+                foreach (var def in _cfgFile.Keys)
+                {
+                    var e = _cfgFile[def]; if (e == null) continue;
+                    if (!first) sb.Append(','); first = false;
+                    sb.Append('"').Append(CfgKey(def)).Append("\":");
+                    AppendJsonVal(sb, e.BoxedValue);
+                }
+                sb.Append("}}");
+                Out(sb.ToString());
+            }
+            catch (Exception ex) { Log?.LogError("DumpCfg: " + ex); }
+        }
+        // returns null on success, else a short error code.
+        internal static string SetCfg(string key, string raw)
+        {
+            try
+            {
+                if (_cfgFile == null) return "no-config";
+                if (string.IsNullOrEmpty(key)) return "no-key";
+                foreach (var def in _cfgFile.Keys)
+                {
+                    if (!CfgKey(def).Equals(key, StringComparison.OrdinalIgnoreCase)) continue;
+                    var e = _cfgFile[def];
+                    var t = e.SettingType;
+                    object val;
+                    if (t == typeof(bool)) { string s = (raw ?? "").Trim().ToLowerInvariant(); val = (s == "1" || s == "true" || s == "on" || s == "yes"); }
+                    else if (t == typeof(int)) { if (!int.TryParse((raw ?? "").Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var i)) return "bad-int"; val = i; }
+                    else if (t == typeof(float)) { if (!float.TryParse((raw ?? "").Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var ff)) return "bad-float"; val = ff; }
+                    else val = raw ?? "";
+                    e.BoxedValue = val;
+                    _cfgFile.Save();
+                    Log?.LogInfo($"[cfg] set {CfgKey(def)} = {val}");
+                    DumpCfg();                                   // re-broadcast so the bot/webcc reflect the new value immediately
+                    return null;
+                }
+                return "unknown-key";
+            }
+            catch (Exception ex) { Log?.LogError("SetCfg: " + ex); return "error"; }
+        }
+
+        static void ExecCommand(string line)
+        {
+            try
+            {
+                var parts = line.Split('|');
+                string verb = parts.Length > 0 ? parts[0].Trim().ToLowerInvariant() : "";
+                Log?.LogInfo($"[cmd] recv: {(verb == "tell" ? "tell|…" : line)}");
+                if (verb == "balance") { int n = BalanceOnce(true); Log?.LogInfo($"[cmd] balance -> {n} move(s)"); return; }
+                if (verb == "dumpcfg") { DumpCfg(); return; }                  // webcc settings menu: re-emit current config
+                if (verb == "ban" || verb == "unban")                          // webcc Reports tab: ban/unban a SteamID (immediate)
+                {
+                    string bsid = parts.Length > 1 ? parts[1].Trim() : "";
+                    if (bsid.Length == 0) return;
+                    if (verb == "ban")
+                    {
+                        _tkBanned.Add(bsid); SaveBans();
+                        var bp = FindPlayerBySid(bsid);
+                        if (bp != null) { try { Instance?.TellPlayer(bp, "<color=#FF0000>You have been banned from this server.</color>"); } catch { } _tkKicks.Add(new KeyValuePair<string, float>(bsid, Time.time + 1.5f)); }
+                        Log?.LogInfo($"[cmd] BAN {bsid} (online={(bp != null)})");
+                    }
+                    else { _tkBanned.Remove(bsid); SaveBans(); Log?.LogInfo($"[cmd] UNBAN {bsid}"); }
+                    return;
+                }
+                if (verb == "kick")                                            // anti-grief auto-kick (recoverable; NOT a ban). Used by the bot's command-flood detector.
+                {
+                    string ksid = parts.Length > 1 ? parts[1].Trim() : "";
+                    if (ksid.Length == 0) return;
+                    var kp = FindPlayerBySid(ksid);
+                    if (kp != null) { try { Instance?.TellPlayer(kp, "<color=#FF0000>Removed: command flooding (server protection).</color>"); } catch { } _tkKicks.Add(new KeyValuePair<string, float>(ksid, Time.time + 1.0f)); }
+                    Log?.LogInfo($"[cmd] KICK {ksid} (online={(kp != null)})");
+                    return;
+                }
+                if (verb == "setcfg")                                          // webcc settings menu: setcfg|Section.Key|value
+                {
+                    string ck = parts.Length > 1 ? parts[1].Trim() : "";
+                    string cv = parts.Length > 2 ? parts[2].Trim() : "";
+                    var cerr = SetCfg(ck, cv);
+                    Log?.LogInfo($"[cmd] setcfg {ck}={cv} -> {(cerr ?? "ok")}");
+                    return;
+                }
+                if (verb == "tell")                                     // private message to one player (cuts chat spam)
+                {
+                    string tsid = parts.Length > 1 ? parts[1].Trim() : "";
+                    string body = parts.Length > 2 ? string.Join("|", parts, 2, parts.Length - 2) : "";
+                    var pl = FindPlayerBySid(tsid);
+                    if (pl == null) { Log?.LogInfo($"[cmd] tell: player {tsid} not found ({Humans().Count} humans online)"); return; }
+                    if (pl.Owner == null) { Log?.LogWarning($"[cmd] tell: {tsid} found but .Owner is null - cannot target"); return; }
+                    Log?.LogInfo($"[cmd] tell -> {tsid} (Owner ok), delivering");
+                    if (Instance != null)
+                        foreach (var ln in body.Split('\u001f'))
+                            if (!string.IsNullOrEmpty(ln)) Instance.TellPlayer(pl, ln);
+                    return;
+                }
+                string sid = parts.Length > 1 ? parts[1].Trim() : "";
+                var target = FindPlayerBySid(sid);
+                if (target == null) { Log?.LogInfo($"[cmd] {verb}: player {sid} not found/offline"); return; }
+                if (verb == "spec" || verb == "spectate" || verb == "unteam")
+                {
+                    Instance?.RequestMove(target, null, true);          // immediate (ejects if flying)
+                    return;
+                }
+                if (verb == "move" || verb == "join" || verb == "team")
+                {
+                    var hq = FindFaction(parts.Length > 2 ? parts[2].Trim() : "");
+                    if (hq == null) { Log?.LogInfo($"[cmd] {verb}: unknown faction '{(parts.Length > 2 ? parts[2] : "")}'"); return; }
+                    Instance?.RequestMove(target, hq, false);
+                    return;
+                }
+                if (verb == "setrank")                                  // setrank|sid|N  -> set in-game rank
+                {
+                    if (parts.Length > 2 && int.TryParse(parts[2].Trim(), out int rk)) Instance?.SetPlayerRank(target, rk);
+                    else Log?.LogInfo($"[cmd] setrank: bad rank '{(parts.Length > 2 ? parts[2] : "")}'");
+                    return;
+                }
+                if (verb == "setfunds" || verb == "addfunds")           // setfunds|sid|N (set) / addfunds|sid|N (delta)
+                {
+                    if (parts.Length > 2 && float.TryParse(parts[2].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out float amt))
+                        Instance?.SetPlayerFunds(target, amt, verb == "addfunds");
+                    else Log?.LogInfo($"[cmd] {verb}: bad amount '{(parts.Length > 2 ? parts[2] : "")}'");
+                    return;
+                }
+                Log?.LogInfo($"[cmd] unknown verb '{verb}'");
+            }
+            catch (Exception e) { Log?.LogError("ExecCommand: " + e); }
+        }
+
+        // ---- move orchestration: spectate is immediate; a team move of a FLYING player gets a
+        // 10s chat warning then ejects them out of the jet so the move actually takes effect. ----
+        sealed class Pending { public Player p; public FactionHQ to; public float due; }
+        static readonly List<Pending> _pendingMoves = new List<Pending>();
+
+        internal void RequestMove(Player target, FactionHQ to, bool isSpec)
+        {
+            if (target == null) return;
+            if (isSpec) { DoMoveNow(target, null); return; }            // spectate: now, no warning
+            if (IsFlying(target))
+            {
+                string fn = to != null && to.faction != null ? to.faction.factionName : "the other team";
+                BroadcastAll($"<color=#FFC857>{RawNameOf(target)} is being moved to {fn} in 10 seconds.</color>");
+                _pendingMoves.RemoveAll(x => x.p == target);           // collapse repeats
+                _pendingMoves.Add(new Pending { p = target, to = to, due = Time.time + 10f });
+                Log?.LogInfo($"[cmd] scheduled flying move: {RawNameOf(target)} -> {fn} in 10s");
+            }
+            else DoMoveNow(target, to);
+        }
+
+        internal void DoMoveNow(Player p, FactionHQ to)
+        {
+            if (p == null) return;
+            AdminEject(p);   // leave the jet so the change shows (life-neutral: balance/admin move never ends a skill-life)
+            if (MovePlayer(p, to))
+            {
+                if (to == null) TellPlayer(p, "<color=#36FFD0>You've been moved to spectate (no team).</color>");
+                else TellPlayer(p, $"<color=#36FFD0>You've been moved to {(to.faction != null ? to.faction.factionName : "the other team")}.</color>");
+            }
+        }
+
+        // Auto-balance spectate move: a FLYING player gets a 10s chat warning then is ejected to
+        // spectate; an unspawned player is moved immediately. The join guard funnels them to the
+        // smaller side on rejoin. (Debounce in BalanceOnce stops a 2nd schedule during the warning.)
+        internal void RequestBalanceSpectate(Player p, string smallerName)
+        {
+            if (p == null) return;
+            if (IsFlying(p))
+            {
+                BroadcastAll($"<color=#FFC857>{RawNameOf(p)} will be moved to spectate in 10s to balance teams - rejoin {smallerName} (fewer players), or type !spec now.</color>");
+                _pendingMoves.RemoveAll(x => x.p == p);
+                _pendingMoves.Add(new Pending { p = p, to = null, due = Time.time + 10f });
+                Log?.LogInfo($"[balance] scheduled spectate for {RawNameOf(p)} in 10s");
+            }
+            else
+            {
+                DoMoveNow(p, null);
+                TellPlayer(p, $"<color=#36FFD0>Teams were unbalanced - moved to spectate. Rejoin {smallerName}.</color>");
+            }
+        }
+
+        static void PumpPending(float now)
+        {
+            for (int i = _pendingMoves.Count - 1; i >= 0; i--)
+            {
+                var pm = _pendingMoves[i];
+                if (pm.p == null) { _pendingMoves.RemoveAt(i); continue; }
+                if (now >= pm.due) { _pendingMoves.RemoveAt(i); Instance?.DoMoveNow(pm.p, pm.to); }
+            }
+        }
+
+        // ---- join handling (the TEAM BLOCKER): returning false from the CmdSetFaction patch does NOT
+        // reliably stop the join, so we ALLOW it and, on the very next tick, IMMEDIATELY move anyone who
+        // joined the over-full side back to spectate - NO warning, NO grace period (a player can't have
+        // spawned within one frame of joining, so this lands before they're in a jet). They get a short
+        // note telling them to join the smaller side. This is the ONLY thing that fires on a join;
+        // autobalance (MaybeBalance) is reserved for LEAVES. Cheap when idle. _joinProbation is now
+        // vestigial (never populated) so OnPlayerSpawned is an inert safety net. ----
+        static readonly List<Player> _bounceQueue = new List<Player>();
+        static readonly HashSet<string> _joinProbation = new HashSet<string>(StringComparer.Ordinal);  // warned over-stackers
+        internal static void QueueBounceCheck(Player p)
+        {
+            if (p == null) return;
+            _bounceQueue.RemoveAll(x => x == p);
+            _bounceQueue.Add(p);
+        }
+
+        internal static void PumpBounces()
+        {
+            if (_bounceQueue.Count == 0) return;
+            for (int i = _bounceQueue.Count - 1; i >= 0; i--)
+            {
+                var p = _bounceQueue[i];
+                _bounceQueue.RemoveAt(i);
+                try
+                {
+                    if (p == null) continue;
+                    string sid = Sid(p);
+                    if (EnforceBalance == null || !EnforceBalance.Value) { _joinProbation.Remove(sid); continue; }
+                    FactionHQ hq = null; try { hq = p.HQ; } catch { }
+                    if (hq == null) { _joinProbation.Remove(sid); continue; }            // spectating / left
+                    var other = OtherHQ(hq);
+                    if (other == null || hq.preventJoin || other.preventJoin) { _joinProbation.Remove(sid); continue; }  // PvP only
+                    int max = BalanceMaxDiff != null ? BalanceMaxDiff.Value : 2;
+                    if (Side(hq).Count - Side(other).Count > max)                        // joined the over-full side -> INSTANT spectate (no warning)
+                    {
+                        _joinProbation.Remove(sid);                                      // not a probation case anymore - moved now
+                        string smaller  = (other.faction != null) ? other.faction.factionName : "the other team";
+                        string fullName = (hq.faction   != null) ? hq.faction.factionName    : "That team";
+                        Instance?.DoMoveNow(p, null);                                    // straight to spectate, immediately
+                        Instance?.TellPlayer(p, "<color=#FF5555>" + fullName + " has more players - moved to spectate.</color> " +
+                            "<color=#FFD200>Reopen the map, click a faction, and join " + smaller + " (the smaller team).</color>");
+                        Log?.LogInfo($"[balance] bounced {RawNameOf(p)} to spectate (joined the fuller side)");
+                    }
+                    else _joinProbation.Remove(sid);                                      // joined a fine side -> clear
+                }
+                catch (Exception e) { Log?.LogError("PumpBounces: " + e); }
+            }
+        }
+
+        // Called when a player spawns (Player.SetAircraft). If they were warned for over-stacking and
+        // the team is STILL too far ahead, eject them out of the jet and drop them to spectate.
+        internal void OnPlayerSpawned(Player p)
+        {
+            try
+            {
+                if (p == null) return;
+                string sid = Sid(p);
+                if (!_joinProbation.Contains(sid)) return;
+                FactionHQ hq = null; try { hq = p.HQ; } catch { }
+                if (hq == null) { _joinProbation.Remove(sid); return; }
+                var other = OtherHQ(hq);
+                if (other == null || hq.preventJoin || other.preventJoin) { _joinProbation.Remove(sid); return; }
+                int max = BalanceMaxDiff != null ? BalanceMaxDiff.Value : 2;
+                _joinProbation.Remove(sid);
+                if (Side(hq).Count - Side(other).Count > max)                            // still over-full -> eject to spectate
+                {
+                    string smaller = (other.faction != null) ? other.faction.factionName : "the smaller team";
+                    AdminEject(p);   // life-neutral: balance probation eject must not end a skill-life
+                    if (MovePlayer(p, null))
+                        TellPlayer(p, "<color=#36FFD0>That team was full - moved to spectate. Rejoin " + smaller +
+                            " (open the map, click a faction).</color>");
+                    Log?.LogInfo($"[balance] ejected {RawNameOf(p)} on spawn (still over-full)");
+                }
+            }
+            catch (Exception e) { Log?.LogError("OnPlayerSpawned: " + e); }
+        }
+
+        void BroadcastAll(string msg)
+        {
+            try { var cm = Cm ?? (Cm = UnityEngine.Object.FindObjectOfType<ChatManager>()); if (cm != null) cm.RpcServerMessage(msg, false); }
+            catch (Exception e) { Log?.LogError("BroadcastAll: " + e); }
+        }
+
+        // ---- admin auth for the IN-GAME commands (config; the user named this SteamID) ----
+        internal static ConfigEntry<string> AdminSteamIds;
+        static bool IsAdmin(Player p)
+        {
+            try
+            {
+                if (AdminSteamIds == null) return false;
+                string id = Sid(p);
+                foreach (var a in AdminSteamIds.Value.Split(',', ' ', ';'))
+                    if (a.Trim() == id && id.Length > 0) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        // resolve a player by name substring; messages the admin on no/ambiguous match.
+        Player Resolve(Player admin, string namePart)
+        {
+            namePart = (namePart ?? "").Trim().ToLowerInvariant();
+            if (namePart.Length == 0) { TellPlayer(admin, "name a player, e.g. !move bob primeva"); return null; }
+            var hits = new List<Player>();
+            foreach (var pl in Humans()) if (RawNameOf(pl).ToLowerInvariant().Contains(namePart)) hits.Add(pl);
+            if (hits.Count == 0) { TellPlayer(admin, $"<color=#FF5555>No player matches '{namePart}'.</color>"); return null; }
+            if (hits.Count > 1)
+            {
+                var names = new StringBuilder();
+                foreach (var h in hits) { if (names.Length > 0) names.Append(", "); names.Append(RawNameOf(h)); }
+                TellPlayer(admin, $"<color=#FFC857>Ambiguous '{namePart}': {names}. Be more specific.</color>");
+                return null;
+            }
+            return hits[0];
+        }
+
+        // The two JOINABLE human factions (preventJoin == false). Co-op's AI side (preventJoin==true)
+        // and any neutral/extra FactionHQ are skipped, so auto-balance picks the two real PvP teams
+        // even on the BUILT-IN missions, which can expose more than two FactionHQs (the old "grab the
+        // first two" version mis-detected those and silently disabled balancing). < 2 joinable sides =
+        // co-op / not-a-PvP-match -> not balanceable.
+        static bool TwoSides(out FactionHQ a, out FactionHQ b)
+        {
+            a = null; b = null;
+            var joinable = new List<FactionHQ>();
+            foreach (var hq in UnityEngine.Object.FindObjectsOfType<FactionHQ>())
+                if (hq != null && hq.faction != null && !hq.preventJoin) joinable.Add(hq);
+            if (joinable.Count < 2) return false;
+            if (joinable.Count > 2)                                   // rare: pick the two most-populated teams
+                joinable.Sort((x, y) => Side(y).Count.CompareTo(Side(x).Count));
+            a = joinable[0]; b = joinable[1];
+            return true;
+        }
+
+        // PvP mission = >= 2 JOINABLE factions (preventJoin == false). Co-op has one joinable side + a
+        // preventJoin AI side. We try the MISSION DEFINITION first (timing-independent, reliable for our
+        // custom JSON missions) and fall back to the live FactionHQs (covers BUILT-IN PvP maps whose
+        // Mission.factions list may be constructed differently). Either signal saying >=2 -> PvP; co-op
+        // yields 1 on both, so no false positive. Used by the rank floor.
+        internal static bool IsPvpMission(Mission m)
+        {
+            try
+            {
+                if (m != null && m.factions != null)
+                {
+                    int joinable = 0;
+                    foreach (var f in m.factions) if (f != null && !f.preventJoin) joinable++;
+                    if (joinable >= 2) return true;
+                }
+            }
+            catch { }
+            try { return TwoSides(out _, out _); }      // live-FactionHQ backstop (built-in missions)
+            catch { return false; }
+        }
+
+        static FactionHQ FindFaction(string key)
+        {
+            if (string.IsNullOrWhiteSpace(key)) return null;
+            key = key.Trim().ToLowerInvariant();
+            foreach (var hq in UnityEngine.Object.FindObjectsOfType<FactionHQ>())
+            {
+                if (hq == null || hq.faction == null) continue;
+                string fn = (hq.faction.factionName ?? "").ToLowerInvariant();
+                if (fn.Length == 0) continue;
+                if (fn == key || fn.StartsWith(key) || key.StartsWith(fn)) return hq;
+                if ((key == "bdf"  || key == "0") && fn.Contains("bosc")) return hq;   // Boscali = BDF
+                if ((key == "pala" || key == "1") && fn.Contains("prim")) return hq;   // Primeva = PALA
+            }
+            return null;
+        }
+
+        // live humans on a side (skips ghosts from mid-disconnect)
+        static List<Player> Side(FactionHQ hq)
+        {
+            var list = new List<Player>();
+            if (hq == null) return list;
+            try
+            {
+                foreach (var pr in hq.factionPlayers)
+                {
+                    var p = pr.Player; if (p == null) continue;
+                    var s = Sid(p); if (!string.IsNullOrEmpty(s) && s != "0") list.Add(p);
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        static bool IsFlying(Player p) { try { return p.Aircraft != null; } catch { return false; } }
+
+        // The HQ SyncVar's public setter is named with angle brackets; the clean "HQ" property's
+        // PRIVATE setter just forwards to it (and marks the SyncVar dirty -> syncs to clients).
+        static readonly System.Reflection.MethodInfo HqSetter =
+            typeof(Player).GetProperty("HQ", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetSetMethod(true);
+
+        // Move a player to `to` (null => spectate / no team). The game's SetFaction refuses a
+        // change once HQ is set, so we do the surgery ourselves: RemovePlayer (old) -> set HQ
+        // SyncVar -> AddPlayer (new), mirroring ServerApplyFaction.
+        internal bool MovePlayer(Player p, FactionHQ to)
+        {
+            if (p == null || HqSetter == null) { Log?.LogError("MovePlayer: no player / HQ setter missing"); return false; }
+            FactionHQ from = null; try { from = p.HQ; } catch { }
+            if (from == to) return false;
+            try
+            {
+                if (from != null) from.RemovePlayer(p);
+                HqSetter.Invoke(p, new object[] { to });
+                if (to != null) { to.AddPlayer(p); try { to.RequestTrackingStates(p); } catch { } }
+                Log?.LogInfo($"[move] {RawNameOf(p)} {(from != null && from.faction != null ? from.faction.factionName : "none")} -> {(to != null && to.faction != null ? to.faction.factionName : "spectate")}");
+                return true;
+            }
+            catch (Exception e) { Log?.LogError("MovePlayer: " + e); return false; }
+        }
+
+        // ---- admin: set a player's IN-GAME rank / IN-GAME funds (the spendable Allocation) ----
+        // Both call the game's own [Server] methods (we run server-side). SetRank(true) writes a
+        // scoreOffset so the rank STICKS (the game only auto-bumps rank UP from score, never down, so
+        // a set rank holds unless the player out-scores it). NOTE: separate from the bot's persistent
+        // SERVER rank in ranks.json - this changes what the GAME shows this match. A mission restart
+        // re-applies the mission's playerStartingRank floor (StartingRankFloorPatch).
+        internal void SetPlayerRank(Player target, int rank)
+        {
+            try { if (target != null) { target.SetRank(rank, true); Log?.LogInfo($"[admin] setrank {RawNameOf(target)} -> {target.PlayerRank}"); } }
+            catch (Exception e) { Log?.LogError("SetPlayerRank: " + e); }
+        }
+        // funds = Player.Allocation (the player's personal spendable budget). add=false -> SetAllocation;
+        // add=true -> AddAllocation (delta, may be negative).
+        internal void SetPlayerFunds(Player target, float amount, bool add)
+        {
+            try
+            {
+                if (target == null) return;
+                if (add) target.AddAllocation(amount); else target.SetAllocation(amount);
+                Log?.LogInfo($"[admin] {(add ? "addfunds" : "setfunds")} {RawNameOf(target)} {(add ? "+" : "=")}{amount:0} -> {target.Allocation:0}");
+            }
+            catch (Exception e) { Log?.LogError("SetPlayerFunds: " + e); }
+        }
+
+        // ---- mission-timeout resolution: end the match with a RESULT a bit BEFORE the game's MaxTime, so the
+        // bot's map vote can run before the mission auto-rotates. PvE (1 human side vs AI) -> declare the humans
+        // defeated (gated by TimeoutForceDefeat); PvP (2 joinable sides) -> the higher TOTAL in-game score wins,
+        // exact tie = draw (gated by PvpTimeoutResult). Lead = TimeoutLeadSeconds. Double-end guarded; 1 Hz from
+        // HQTickPatch. (Still named PvETimeoutTick for the existing call site.) ----
+        static float _lastTimeoutCheck = -999f;
+        internal static void PvETimeoutTick()
+        {
+            try
+            {
+                float now = Time.time;
+                if (now - _lastTimeoutCheck < 1f) return;            // 1 Hz, cheap
+                _lastTimeoutCheck = now;
+                if (GameManager.gameResolution != GameResolution.Ongoing) return;  // already ended -> guard
+                bool pveOn = TimeoutForceDefeat != null && TimeoutForceDefeat.Value;
+                bool pvpOn = PvpTimeoutResult != null && PvpTimeoutResult.Value;
+                if (!pveOn && !pvpOn) return;
+
+                float maxTime = CurrentMissionMaxTime();
+                if (maxTime <= 0f) return;
+                int lead = TimeoutLeadSeconds != null ? Mathf.Max(0, TimeoutLeadSeconds.Value) : 120;
+                if (Time.timeSinceLevelLoad <= maxTime - lead) return;   // not within the lead window yet
+
+                // Enumerate ALL HQs (the AI side has preventJoin==true, which TwoSides() hides).
+                FactionHQ aiHQ = null;
+                int human = 0, ai = 0;
+                foreach (var hq in UnityEngine.Object.FindObjectsOfType<FactionHQ>())
+                {
+                    if (hq == null || hq.faction == null) continue;
+                    if (hq.preventJoin) { ai++; aiHQ = hq; }         // AI-only side
+                    else human++;                                    // human-joinable side
+                }
+
+                if (human == 1 && ai >= 1 && aiHQ != null)
+                {
+                    if (!pveOn) return;                              // PvE, but the PvE defeat is off
+                    Log?.LogInfo($"[timeout] PvE timer ({Time.timeSinceLevelLoad:F0}s, {lead}s before {maxTime:F0}s) -> declaring AI victory (humans defeated).");
+                    ForceVictory(aiHQ);                             // humans see Mission Failed
+                    return;
+                }
+
+                if (pvpOn && TwoSides(out var A, out var B))
+                {
+                    double sa = TeamScore(A), sb = TeamScore(B);
+                    string na = A.faction != null ? A.faction.factionName : "Team A";
+                    string nb = B.faction != null ? B.faction.factionName : "Team B";
+                    if (Math.Abs(sa - sb) < 0.0001)
+                    {
+                        Log?.LogInfo($"[timeout] PvP timer ({Time.timeSinceLevelLoad:F0}s) -> DRAW ({na} {sa:F0} = {nb} {sb:F0}).");
+                        Instance?.BroadcastAll($"<color=#FFD200>** Time's up - it's a DRAW! {na} {sa:F0} : {sb:F0} {nb} **</color>");
+                        ForceDraw(A, B);
+                    }
+                    else
+                    {
+                        var winHQ = sa > sb ? A : B; string wn = sa > sb ? na : nb;
+                        Log?.LogInfo($"[timeout] PvP timer ({Time.timeSinceLevelLoad:F0}s) -> {wn} wins on score ({na} {sa:F0} vs {nb} {sb:F0}).");
+                        Instance?.BroadcastAll($"<color=#7CFFB0>** Time's up - {wn} wins on score! {na} {sa:F0} : {sb:F0} {nb} **</color>");
+                        ForceVictory(winHQ);
+                    }
+                }
+            }
+            catch (Exception e) { Log?.LogError("PvETimeoutTick: " + e); }
+        }
+
+        // total in-game score for a side (sum of live PlayerScore).
+        static double TeamScore(FactionHQ hq)
+        {
+            double t = 0;
+            try { foreach (var p in Side(hq)) { if (p == null) continue;
+                    try { t += System.Convert.ToDouble(p.PlayerScore, System.Globalization.CultureInfo.InvariantCulture); } catch { } } }
+            catch { }
+            return t;
+        }
+
+        // End a PvP match as a DRAW: prefer a real Draw-like EndType if the game has one, else declare BOTH human
+        // teams defeated (no winner). Best-effort - exact decimal-score ties are near-impossible.
+        static void ForceDraw(FactionHQ a, FactionHQ b)
+        {
+            try
+            {
+                if (GameManager.gameResolution != GameResolution.Ongoing) return;
+                var m = typeof(FactionHQ).GetMethod("DeclareEndGame");
+                if (m == null) return;
+                var et = m.GetParameters()[0].ParameterType;
+                object drawVal = null;
+                foreach (var name in new[] { "Draw", "Tie", "Stalemate" })
+                { try { drawVal = System.Enum.Parse(et, name); break; } catch { } }
+                if (drawVal != null) { m.Invoke(a, new object[] { drawVal }); return; }
+                object defeat; try { defeat = System.Enum.Parse(et, "Defeat"); } catch { return; }
+                m.Invoke(a, new object[] { defeat });
+                if (GameManager.gameResolution == GameResolution.Ongoing) m.Invoke(b, new object[] { defeat });
+            }
+            catch (Exception e) { Log?.LogError("ForceDraw: " + e); }
+        }
+
+        // Reflection helpers for game internals the plugin can't reference directly (EndType is internal;
+        // DedicatedServerManager sits in an un-imported namespace). All FAIL SAFE (null/-1) so a wrong
+        // name can never fire a false defeat - it just no-ops until the names are verified in testing.
+        static System.Type _dsmType; static bool _dsmResolved;
+        static System.Type FindGameType(string simpleName)
+        {
+            foreach (var a in System.AppDomain.CurrentDomain.GetAssemblies())
+            {
+                System.Type[] ts; try { ts = a.GetTypes(); } catch { continue; }
+                foreach (var t in ts) if (t.Name == simpleName) return t;
+            }
+            return null;
+        }
+        static object GetMember(object o, string name)
+        {
+            if (o == null) return null;
+            var t = o.GetType();
+            var p = t.GetProperty(name); if (p != null) return p.GetValue(o);
+            var f = t.GetField(name);    if (f != null) return f.GetValue(o);
+            return null;
+        }
+        static float CurrentMissionMaxTime()
+        {
+            try
+            {
+                if (!_dsmResolved) { _dsmType = FindGameType("DedicatedServerManager"); _dsmResolved = true; }
+                if (_dsmType == null) return -1f;
+                object inst = null;
+                var ip = _dsmType.GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                if (ip != null) inst = ip.GetValue(null);
+                else { var f = _dsmType.GetField("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static); if (f != null) inst = f.GetValue(null); }
+                object opt = GetMember(inst, "CurrentMissionOption");
+                object mt = GetMember(opt, "MaxTime");
+                return mt == null ? -1f : System.Convert.ToSingle(mt);
+            }
+            catch { return -1f; }
+        }
+
+        // ---- auto-balancer (PvP only), polled from HQTickPatch ----
+        // DESIGN (2026-06-26): autobalance fires ONLY in response to a player LEAVING (a side's
+        // human count drops) - NOT on joins, NOT continuously. Joining the fuller side is handled
+        // separately + instantly by the join blocker (PumpBounces -> immediate spectate). So the two
+        // mechanisms are cleanly split: LEAVE -> autobalance moves one to even up; JOIN over-full ->
+        // the joiner is bounced. We arm on a population decrease, then HOLD for GraceSeconds (a few
+        // minutes) so the gap can self-correct (a rejoin / someone filling the smaller side) before the
+        // first move, and keep trying (debounce-paced) until teams are within MaxDifference, then disarm.
+        static float _nextBalance, _lastMove = -999f;
+        static int   _lastSideTotal = -1;     // last observed (A+B) human count; a DECREASE = someone left
+        static bool  _balanceArmed;           // a leave armed autobalance; cleared once teams are even
+        static float _unevenSince = -1f;      // Time.time the still-standing imbalance first appeared (grace anchor)
+        internal static void MaybeBalance()
+        {
+            try
+            {
+                if (EnforceBalance == null || !EnforceBalance.Value) return;
+                if (AutoMove == null || !AutoMove.Value) return;
+                float now = Time.time;
+                if (now < _nextBalance) return;
+                _nextBalance = now + Mathf.Max(2, RecheckSeconds != null ? RecheckSeconds.Value : 6);
+                if (!TwoSides(out var A, out var B)) { _lastSideTotal = -1; _balanceArmed = false; _unevenSince = -1f; return; }
+                // MIN-PLAYERS GATE (user 2026-06-27): never auto-balance a small lobby. Counts ALL humans on the
+                // server (incl. spectators). Below the threshold -> disarm + reset so nothing is ever moved/warned.
+                int people = Humans().Count;
+                int minP = BalanceMinPlayers != null ? BalanceMinPlayers.Value : 6;
+                if (people < minP) { _lastSideTotal = Side(A).Count + Side(B).Count; _balanceArmed = false; _unevenSince = -1f; return; }
+                int total = Side(A).Count + Side(B).Count;
+                if (_lastSideTotal >= 0 && total < _lastSideTotal) _balanceArmed = true;   // a player left -> arm
+                _lastSideTotal = total;
+                if (!_balanceArmed) return;                                                // ONLY act after a leave
+                int max = BalanceMaxDiff != null ? BalanceMaxDiff.Value : 2;
+                if (Math.Abs(Side(A).Count - Side(B).Count) <= max)                        // teams even (self-corrected or fixed)
+                    { _balanceArmed = false; _unevenSince = -1f; return; }                 // -> disarm + reset the warn clock
+                // armed AND uneven: broadcast a one-time warning, then HOLD for WarnSeconds (a 5-minute warning by
+                // default) so the gap can self-correct (a rejoin / someone filling the smaller side) before any move.
+                float warn = BalanceWarnSeconds != null ? BalanceWarnSeconds.Value : 300;
+                if (_unevenSince < 0f)                                                      // first detection of THIS imbalance episode
+                {
+                    _unevenSince = now;
+                    int bigC = Math.Max(Side(A).Count, Side(B).Count), smallC = Math.Min(Side(A).Count, Side(B).Count);
+                    int mins = Mathf.Max(1, Mathf.RoundToInt(warn / 60f));
+                    Instance?.BroadcastAll($"<color=#FFC857>Teams are unbalanced ({bigC} v {smallC}). If it doesn't even out, a player will be moved to balance in {mins} minute{(mins == 1 ? "" : "s")}.</color>");
+                    Log?.LogInfo($"[balance] imbalance {bigC}v{smallC} with {people} on server; warned, will move in {warn:0}s if unresolved");
+                }
+                if (now - _unevenSince < warn) return;                                      // still inside the warning window -> wait
+                BalanceOnce(false);                                                        // move one; stay armed until even
+            }
+            catch (Exception e) { Log?.LogError("MaybeBalance: " + e); }
+        }
+
+        // A player auto-balanced in game G is EXEMPT from being moved again until MoveExemptGames games
+        // later (default 2 => "at most once per 2 games"), so the same person isn't repeatedly the one
+        // moved. _gameNum advances once per mission start (AdvanceGame); expired exemptions are pruned.
+        static readonly Dictionary<string, int> _movedAtGame = new Dictionary<string, int>(StringComparer.Ordinal);
+        static int _gameNum;
+        internal static void AdvanceGame()
+        {
+            _gameNum++;
+            int span = (BalanceMoveExemptGames != null ? BalanceMoveExemptGames.Value : 2);
+            List<string> stale = null;
+            foreach (var kv in _movedAtGame)
+                if (_gameNum - kv.Value >= span) (stale ?? (stale = new List<string>())).Add(kv.Key);
+            if (stale != null) foreach (var s in stale) _movedAtGame.Remove(s);   // exemption expired -> movable again
+        }
+        static bool MoveExempt(string sid)            // moved within the last MoveExemptGames games?
+        {
+            int span = (BalanceMoveExemptGames != null ? BalanceMoveExemptGames.Value : 2);
+            return _movedAtGame.TryGetValue(sid, out var g) && (_gameNum - g) < span;
+        }
+
+        // ===================== NEW-JOINER PROTECTION + SQUADS (2026-06-27) =====================
+        // Auto-balance protection layers, STRONGEST first (all sit INSIDE the MoveExempt filter, so a
+        // player moved within the last MoveExemptGames games is never the pick while anyone non-exempt
+        // remains; "everyone else moved within a couple of games" is what unlocks dipping into a
+        // protected player):
+        //   2) NEW JOINER - connected < NewJoinerSeconds (15 min) ago. Protected first and foremost;
+        //      moved only if EVERY other non-exempt big-side player is also a new joiner.
+        //   1) SQUAD      - in a !squadup group (up to MaxSize friends). WEAKER than new-joiner: a
+        //      squad member is moved only if no unprotected, non-exempt player is available.
+        //   0) unprotected.
+        // Within the least-protected non-empty tier we still pick whoever evens the teams' total SKILL
+        // best (the existing weight/target logic).
+
+        // ---- presence / first-seen clock (drives new-joiner protection) ----
+        static readonly Dictionary<string, float> _firstSeen = new Dictionary<string, float>(StringComparer.Ordinal);
+        // per-session "Nuke-Option Plugin Version X is active" PRIVATE welcome: scheduled ~6s after first
+        // sighting (so the joining client's chat UI is ready), shown ONCE per session, and reset on leave
+        // so a rejoin re-shows it. Parallels the _firstSeen presence clock above.
+        static readonly Dictionary<string, float> _welcomeDue = new Dictionary<string, float>(StringComparer.Ordinal);
+        static readonly HashSet<string> _welcomed = new HashSet<string>(StringComparer.Ordinal);
+        static void TrackPresence(float now)
+        {
+            try
+            {
+                var present = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var p in Humans()) { var s = Sid(p); if (!string.IsNullOrEmpty(s) && s != "0") present.Add(s); }
+                foreach (var s in present) if (!_firstSeen.ContainsKey(s)) { _firstSeen[s] = now; _welcomeDue[s] = now + 6f; }   // first sighting -> join clock + schedule welcome
+                if (_firstSeen.Count > present.Count)                                               // someone left -> forget them so a rejoin resets the clock + re-welcomes
+                {
+                    List<string> gone = null;
+                    foreach (var kv in _firstSeen) if (!present.Contains(kv.Key)) (gone ?? (gone = new List<string>())).Add(kv.Key);
+                    if (gone != null) foreach (var s in gone) { _firstSeen.Remove(s); _welcomeDue.Remove(s); _welcomed.Remove(s); }
+                }
+            }
+            catch (Exception e) { Log?.LogError("TrackPresence: " + e); }
+        }
+
+        // Fire the one-time per-session PRIVATE "plugin version is active" notice for any player whose
+        // scheduled welcome time has arrived. Called ~1/sec from PollCommands, right after TrackPresence.
+        static void MaybeWelcome(float now)
+        {
+            if (_welcomeDue.Count == 0) return;
+            try
+            {
+                foreach (var p in Humans())
+                {
+                    var s = Sid(p);
+                    if (string.IsNullOrEmpty(s) || _welcomed.Contains(s)) continue;
+                    if (!_welcomeDue.TryGetValue(s, out var due) || now < due) continue;
+                    Instance?.TellPlayer(p, $"<color=#6cc8ff>Nuke-Option Plugin Version {Version} is active on this server.</color>");
+                    _welcomed.Add(s);
+                    _welcomeDue.Remove(s);
+                }
+            }
+            catch (Exception e) { Log?.LogError("MaybeWelcome: " + e); }
+        }
+        static bool IsNewJoiner(string sid)
+        {
+            int win = BalanceNewJoinerSeconds != null ? BalanceNewJoinerSeconds.Value : 900;
+            if (win <= 0) return false;
+            if (string.IsNullOrEmpty(sid)) return false;
+            if (!_firstSeen.TryGetValue(sid, out var t)) return true;          // just appeared this frame -> treat as new (protected)
+            return (Time.time - t) < win;
+        }
+
+        // auto-balance protection tier (LOWER = moved sooner). See the region header above.
+        static int ProtTier(string sid)
+        {
+            if (IsNewJoiner(sid)) return 2;     // strongest
+            if (InSquad(sid))     return 1;     // weaker
+            return 0;                           // unprotected
+        }
+
+        // ---- squads (persist across matches AND restarts: plugin_squads.txt) ----
+        static readonly List<HashSet<string>> _squads = new List<HashSet<string>>();
+        static readonly Dictionary<string, string> _squadName = new Dictionary<string, string>(StringComparer.Ordinal);  // sid -> last-known display name
+        struct SquadInvite { public string Inviter; public string InviterName; public float Expiry; }
+        static readonly Dictionary<string, SquadInvite> _squadInvites = new Dictionary<string, SquadInvite>(StringComparer.Ordinal);  // invitee sid -> invite
+
+        static string SquadFilePath => Path.Combine(Paths.GameRootPath, "plugin_squads.txt");
+        static int SquadMax => SquadMaxSize != null ? Math.Max(2, SquadMaxSize.Value) : 4;
+        static HashSet<string> SquadOf(string sid)
+        {
+            if (string.IsNullOrEmpty(sid)) return null;
+            foreach (var sq in _squads) if (sq.Contains(sid)) return sq;
+            return null;
+        }
+        static bool InSquad(string sid) => SquadOf(sid) != null;
+        static string SafeName(string nm) => (nm ?? "").Replace('\t', ' ').Replace('~', '-').Replace('\n', ' ').Replace('\r', ' ');
+
+        internal static void LoadSquads()
+        {
+            try
+            {
+                _squads.Clear();
+                if (!File.Exists(SquadFilePath)) return;
+                foreach (var line in File.ReadAllLines(SquadFilePath))
+                {
+                    var l = line.Trim(); if (l.Length == 0) continue;
+                    var set = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (var tok in l.Split('\t'))
+                    {
+                        var t = tok.Trim(); if (t.Length == 0) continue;
+                        int bar = t.IndexOf('~');
+                        string sid = bar >= 0 ? t.Substring(0, bar) : t;
+                        string nm  = bar >= 0 ? t.Substring(bar + 1) : "";
+                        if (sid.Length == 0) continue;
+                        set.Add(sid);
+                        if (nm.Length > 0) _squadName[sid] = nm;
+                    }
+                    if (set.Count >= 2) _squads.Add(set);     // a 1-person "squad" is meaningless -> drop
+                }
+                Log?.LogInfo($"[squad] loaded {_squads.Count} squad(s)");
+            }
+            catch (Exception e) { Log?.LogError("LoadSquads: " + e); }
+        }
+        static void SaveSquads()
+        {
+            try
+            {
+                var sb = new StringBuilder();
+                foreach (var sq in _squads)
+                {
+                    if (sq.Count < 2) continue;
+                    bool first = true;
+                    foreach (var sid in sq)
+                    {
+                        if (!first) sb.Append('\t'); first = false;
+                        _squadName.TryGetValue(sid, out var nm);
+                        sb.Append(sid).Append('~').Append(SafeName(nm));
+                    }
+                    sb.Append('\n');
+                }
+                File.WriteAllText(SquadFilePath, sb.ToString());
+            }
+            catch (Exception e) { Log?.LogError("SaveSquads: " + e); }
+        }
+        static string SquadMateList(HashSet<string> sq, string exclude)
+        {
+            var others = new StringBuilder();
+            if (sq == null) return "";
+            foreach (var s in sq)
+            {
+                if (s == exclude) continue;
+                if (others.Length > 0) others.Append(", ");
+                _squadName.TryGetValue(s, out var nm);
+                others.Append(string.IsNullOrEmpty(nm) ? s : nm);
+            }
+            return others.ToString();
+        }
+
+        // ---- !squadup (PUBLIC): bare = status, <player> = invite, leave = exit ----
+        void HandleSquadup(Player p, string[] parts)
+        {
+            try
+            {
+                string me = Sid(p);
+                if (!string.IsNullOrEmpty(me)) _squadName[me] = RawNameOf(p);
+
+                if (parts.Length < 2)                                        // bare !squadup -> status (persists across matches)
+                {
+                    var sq = SquadOf(me);
+                    if (sq == null) { TellPlayer(p, $"<color=#36FFD0>You're not in a squad.</color> Use <color=#55FF55>!squadup <player></color> to team up with a friend (up to {SquadMax}) so PvP auto-balance won't split you up."); return; }
+                    TellPlayer(p, $"<color=#36FFD0>You're squadded with {SquadMateList(sq, me)}.</color> (<color=#55FF55>!squadup leave</color> to exit.)");
+                    return;
+                }
+                string arg = parts[1].ToLowerInvariant();
+                if (arg == "leave" || arg == "quit" || arg == "exit" || arg == "disband") { SquadLeave(p); return; }
+
+                var tgt = Resolve(p, Join(parts, 1, parts.Length));         // invite : !squadup <player>
+                if (tgt == null) return;                                     // Resolve already messaged the caller (no/ambiguous match)
+                string ts = Sid(tgt);
+                if (ts == me) { TellPlayer(p, "<color=#FFC857>You can't squad up with yourself.</color>"); return; }
+                _squadName[ts] = RawNameOf(tgt);
+
+                var mySquad = SquadOf(me);
+                if (mySquad != null && mySquad.Contains(ts)) { TellPlayer(p, $"<color=#FFC857>{RawNameOf(tgt)} is already in your squad.</color>"); return; }
+                if (mySquad != null && mySquad.Count >= SquadMax) { TellPlayer(p, $"<color=#FFC857>Your squad is full (max {SquadMax}).</color>"); return; }
+                if (InSquad(ts)) { TellPlayer(p, $"<color=#FFC857>{RawNameOf(tgt)} is already in another squad - they'd need to !squadup leave first.</color>"); return; }
+
+                int win = SquadInviteSeconds != null ? Math.Max(15, SquadInviteSeconds.Value) : 90;
+                _squadInvites[ts] = new SquadInvite { Inviter = me, InviterName = RawNameOf(p), Expiry = Time.time + win };
+                TellPlayer(tgt, $"<color=#FFD200>{RawNameOf(p)} wants to squad up with you.</color> Type <color=#55FF55>!y</color> to accept ({win}s). Squadmates stay together - PvP auto-balance won't split you.");
+                TellPlayer(p, $"<color=#36FFD0>Invite sent to {RawNameOf(tgt)} - they need to type !y.</color>");
+                Log?.LogInfo($"[squad] {RawNameOf(p)} invited {RawNameOf(tgt)}");
+            }
+            catch (Exception e) { Log?.LogError("HandleSquadup: " + e); }
+        }
+
+        // !y -> accept a pending squad invite. Returns TRUE if an invite was consumed (suppress the !y);
+        // FALSE if there's no live invite, so the !y flows through to the bot (map-vote approval also uses !y).
+        bool TryAcceptSquad(Player p)
+        {
+            try
+            {
+                string me = Sid(p);
+                if (string.IsNullOrEmpty(me) || !_squadInvites.TryGetValue(me, out var inv)) return false;   // no pending invite -> not ours
+                _squadInvites.Remove(me);
+                if (Time.time >= inv.Expiry) return false;                  // expired -> let !y flow to the bot
+                _squadName[me] = RawNameOf(p);
+
+                if (InSquad(me)) { TellPlayer(p, "<color=#FFC857>You're already in a squad - !squadup leave first.</color>"); return true; }
+                var host = SquadOf(inv.Inviter);
+                if (host != null && host.Count >= SquadMax) { TellPlayer(p, $"<color=#FFC857>Couldn't squad up - {inv.InviterName}'s squad is full.</color>"); return true; }
+
+                if (host == null)
+                {
+                    // Forming a BRAND-NEW squad: the inviter must still be on the server (they may have
+                    // dropped during the invite window). If they've left, this is a dead invite - don't
+                    // resurrect an absent, non-consenting player into a new squad.
+                    if (FindPlayerBySid(inv.Inviter) == null)
+                    { TellPlayer(p, $"<color=#FFC857>Couldn't squad up - {inv.InviterName} has left.</color>"); return true; }
+                    host = new HashSet<string>(StringComparer.Ordinal) { inv.Inviter }; _squads.Add(host);
+                }
+                host.Add(me);
+                SaveSquads();
+
+                TellPlayer(p, $"<color=#36FFD0>Squadded up! You're now with {SquadMateList(host, me)}.</color> PvP auto-balance won't split you. (<color=#55FF55>!squadup leave</color> to exit.)");
+                var hostP = FindPlayerBySid(inv.Inviter);
+                if (hostP != null) TellPlayer(hostP, $"<color=#36FFD0>{RawNameOf(p)} accepted - your squad is now {SquadMateList(host, inv.Inviter)} + you.</color>");
+                Log?.LogInfo($"[squad] {RawNameOf(p)} accepted {inv.InviterName} -> squad of {host.Count}");
+                return true;
+            }
+            catch (Exception e) { Log?.LogError("TryAcceptSquad: " + e); return true; }
+        }
+
+        void SquadLeave(Player p)
+        {
+            try
+            {
+                string me = Sid(p);
+                var sq = SquadOf(me);
+                if (sq == null) { TellPlayer(p, "<color=#FFC857>You're not in a squad.</color>"); return; }
+                sq.Remove(me);
+                TellPlayer(p, "<color=#36FFD0>You've left your squad.</color>");
+                if (sq.Count <= 1)                                           // a lone survivor isn't a squad -> dissolve it
+                {
+                    foreach (var s in sq) { var lp = FindPlayerBySid(s); if (lp != null) TellPlayer(lp, "<color=#FFC857>Your squad disbanded (everyone else left).</color>"); }
+                    _squads.Remove(sq);
+                }
+                else
+                    foreach (var s in sq) { var lp = FindPlayerBySid(s); if (lp != null) TellPlayer(lp, $"<color=#9fd6b0>{RawNameOf(p)} left the squad (still squadded: {SquadMateList(sq, s)} + you).</color>"); }
+                SaveSquads();
+                Log?.LogInfo($"[squad] {RawNameOf(p)} left; remaining {sq.Count}");
+            }
+            catch (Exception e) { Log?.LogError("SquadLeave: " + e); }
+        }
+
+        // Performs at most one move; returns moves done. force=true ignores the debounce
+        // (used by !balance). Picks the not-already-moved player whose rank/skill weight best evens
+        // the totals, then moves them to SPECTATE - the join guard funnels them to the smaller side on
+        // rejoin (clean client UI; a direct force-move to a team does NOT work reliably - stale spawn menu).
+        internal static int BalanceOnce(bool force)
+        {
+            if (!TwoSides(out var A, out var B)) return 0;
+            if (A.preventJoin || B.preventJoin) return 0;                 // PvP only (co-op AI side blocks)
+            var pa = Side(A); var pb = Side(B);
+            int max = BalanceMaxDiff != null ? BalanceMaxDiff.Value : 2;
+            if (Math.Abs(pa.Count - pb.Count) <= max) return 0;
+            float now = Time.time;
+            if (!force && now - _lastMove < Mathf.Max(2, MoveDebounce != null ? MoveDebounce.Value : 20)) return 0;
+
+            FactionHQ big   = pa.Count > pb.Count ? A : B;
+            FactionHQ small = big == A ? B : A;
+            var bigPlayers   = big == A ? pa : pb;
+            var smallPlayers = small == A ? pa : pb;
+
+            float sumBig = 0f, sumSmall = 0f;
+            foreach (var p in bigPlayers) sumBig += Weight(p);
+            foreach (var p in smallPlayers) sumSmall += Weight(p);
+            float target = (sumBig - sumSmall) / 2f;                      // ideal weight of the player to move
+
+            // Eligible = anyone on the big side NOT move-exempt (i.e. not auto-balanced within the last
+            // MoveExemptGames games). Flying players ARE eligible (they get a 10s warning + eject), so the
+            // balancer keeps working mid-match when everyone's airborne, and naturally falls through to the
+            // next-best pick when the ideal one is exempt. (MoveOnlyUnspawned unused - flying -> the warning.)
+            var movable = new List<Player>();
+            foreach (var p in bigPlayers)
+                if (!MoveExempt(Sid(p)))
+                    movable.Add(p);
+            if (movable.Count == 0) return 0;                             // everyone on the big side is move-exempt -> wait
+
+            // Protection tiers (move the LEAST-protected first): 0 = unprotected, 1 = squadded (weak),
+            // 2 = new joiner <NewJoinerSeconds (strongest). Pick the LOWEST non-empty tier, so a new
+            // joiner is only moved when every other non-exempt option is also a new joiner, and a squad
+            // member only when no unprotected non-exempt option exists. (See the NEW-JOINER + SQUADS
+            // region.) Then choose, within that tier, whoever evens the teams' total skill best.
+            int minTier = int.MaxValue;
+            foreach (var p in movable) { int t = ProtTier(Sid(p)); if (t < minTier) minTier = t; }
+            var pool = new List<Player>();
+            foreach (var p in movable) if (ProtTier(Sid(p)) == minTier) pool.Add(p);
+
+            Player pick = pool[0];
+            float best = Math.Abs(Weight(pick) - target);
+            foreach (var p in pool) { float d = Math.Abs(Weight(p) - target); if (d < best) { best = d; pick = p; } }
+
+            // Reserve the slot NOW (debounce + mark moved) so a 2nd player isn't scheduled during the
+            // 10s warning window, then move to SPECTATE: flying -> 10s warning + eject, unspawned ->
+            // immediate. The join guard funnels them to the smaller side on rejoin. (We deliberately do
+            // NOT force-move straight to a team - that leaves a stale spawn menu and doesn't work.)
+            _lastMove = now;
+            _movedAtGame[Sid(pick)] = _gameNum;        // exempt this player from another move for MoveExemptGames games
+            string tn = small.faction != null ? small.faction.factionName : "the smaller team";
+            // Move the picked player STRAIGHT to the smaller side via the forceteamswap mechanic (team swap +
+            // landed Cricket spawn + eject -> their UI resets to the new team), instead of sending them to
+            // spectate to rejoin. BeginSwap recomputes dest = the side that is NOT theirs = the smaller side
+            // here. admin=null (no admin-chat; BeginSwap notifies the moved player). Keeps points + skill-life.
+            Instance?.BeginSwap(pick, null, true);
+            Log?.LogInfo($"[balance] picked {RawNameOf(pick)} (tier {minTier} [0=open,1=squad,2=newjoiner], weight {Weight(pick):0.0}/target {target:0.0}) -> force-swap to {tn}; flying={IsFlying(pick)}");
+            return 1;
+        }
+
+        static string Join(string[] a, int start, int end)
+        {
+            var sb = new StringBuilder();
+            for (int i = start; i < end && i < a.Length; i++) { if (sb.Length > 0) sb.Append(' '); sb.Append(a[i]); }
+            return sb.ToString();
+        }
+
+        // ============ ADMIN TEST: !swapteam / !forceteamswap (move team, keep points+life) ============
+        // Two competing implementations of "move a player to the other team and reset their client spawn-menu
+        // UI to the new faction, WITHOUT them losing points or their open skill-life". The trick (verified):
+        // Spawner.SpawnAircraft(... spawningHangar=null, destHQ, explicit GlobalPosition ...) is a [Server]
+        // method we can call directly; Aircraft.OnStartServer auto-binds the player and the owning client's
+        // OnStartClient teleports its local plane there + attaches the HUD + DynamicMap.SetFaction (the UI
+        // reset), then we AdminEject so they drop back to the now-correct spawn menu. Every eject is
+        // GuardEject-protected so it's life- and killfeed-neutral.
+        //   !swapteam     : spectate -> wait despawn -> swap team -> spawn Cricket -> wait ~2s -> eject.
+        //   !forceteamswap: swap team -> wait ~1s -> spawn Cricket -> wait ~2s -> eject (no initial spectate).
+        // Cricket spawns HIGH over OPEN OCEAN in a quiet corner of the current map (far from every base and the
+        // fight), so the brief un-piloted moment + auto-eject can never crash into terrain, a base, or another
+        // plane. One ocean corner per map (verified open water via the terrain atlas).
+        struct SpawnXZ { public float x, z; public SpawnXZ(float x, float z) { this.x = x; this.z = z; } }
+        static readonly SpawnXZ HEART_OCEAN = new SpawnXZ(-33000f, -40000f);   // Heartland SW open ocean (nearest base ~27km)
+        static readonly SpawnXZ IGNUS_OCEAN = new SpawnXZ(  8000f, -33000f);   // Ignus deep-south open ocean (nearest base ~35km)
+
+        static AircraftDefinition _cricketDef;
+        static bool _cricketCatalogLogged;
+        static AircraftDefinition ResolveCricket()
+        {
+            if (_cricketDef != null) return _cricketDef;
+            try
+            {
+                var list = Encyclopedia.i != null ? Encyclopedia.i.aircraft : null;
+                if (list != null)
+                    foreach (var d in list)
+                    {
+                        if (d == null) continue;
+                        string un = d.unitName ?? "", co = d.code ?? "";
+                        if (un.IndexOf("Cricket", StringComparison.OrdinalIgnoreCase) >= 0
+                         || co.IndexOf("CI-22", StringComparison.OrdinalIgnoreCase) >= 0
+                         || co.Replace("-", "").IndexOf("CI22", StringComparison.OrdinalIgnoreCase) >= 0)
+                        { _cricketDef = d; break; }
+                    }
+                if (_cricketDef != null) Log?.LogInfo($"[swap] Cricket resolved: '{_cricketDef.unitName}' (code {_cricketDef.code})");
+                else if (!_cricketCatalogLogged && list != null)        // dump the catalog ONCE so we can find the real name
+                {
+                    _cricketCatalogLogged = true;
+                    var sb = new StringBuilder("[swap] CI-22 Cricket not found. aircraft catalog: ");
+                    foreach (var d in list) if (d != null) sb.Append(d.unitName).Append('|').Append(d.code).Append("  ");
+                    Log?.LogWarning(sb.ToString());
+                }
+            }
+            catch (Exception e) { Log?.LogError("ResolveCricket: " + e); }
+            return _cricketDef;
+        }
+
+        // Map = Heartland vs Ignus, from the mission name (mirrors the bot's cc_web mapping:
+        // Escalation => Heartland, Terminal Control => Ignus). Default Heartland when unknown.
+        static bool DetectIgnus()
+        {
+            try
+            {
+                string n = null;
+                try { n = MissionManager.CurrentMission != null ? MissionManager.CurrentMission.Name : null; } catch { }
+                if (string.IsNullOrEmpty(n)) return false;
+                n = n.ToLowerInvariant();
+                return n.Contains("terminal") || n.Contains("ignus");
+            }
+            catch { return false; }
+        }
+
+        static GlobalPosition SwapPos()
+        {
+            SpawnXZ c = DetectIgnus() ? IGNUS_OCEAN : HEART_OCEAN;       // one quiet open-ocean corner per map
+            float alt = SwapAltitude != null ? SwapAltitude.Value : 3000f;   // high up; over open water -> nothing to crash into
+            return new GlobalPosition(c.x, alt, c.z);
+        }
+
+        // Spawn player p into a CI-22 Cricket HIGH over open ocean in a quiet corner of the map. A couple seconds
+        // later AdminEject runs -> the client UI resets to the new team. The airborne eject is kept life-/points-
+        // neutral by the _adminEjectGuard (no death, no "went down", no lost streak), and being far out over the
+        // sea means the brief un-piloted plane can never hit terrain, a base, or another aircraft. Returns the
+        // Aircraft, or null on failure.
+        static Aircraft SpawnCricket(Player p, FactionHQ destHQ)
+        {
+            try
+            {
+                if (p == null) return null;
+                var def = ResolveCricket();
+                if (def == null || def.unitPrefab == null) { Log?.LogError("[swap] no Cricket prefab"); return null; }
+                var spawner = NetworkSceneSingleton<Spawner>.i;
+                if (spawner == null) { Log?.LogError("[swap] no Spawner singleton yet"); return null; }
+                GuardEject(Sid(p));                                          // airborne eject -> the guard keeps it life/points-neutral
+                var gpos = SwapPos();                                        // high over a quiet open-ocean corner of this map
+                var ac = spawner.SpawnAircraft(p, def.unitPrefab, default(Loadout), 1f, default(LiveryKey),
+                             gpos, Quaternion.identity, Vector3.zero, null /*spawningHangar -> airborne*/, destHQ,
+                             null /*uniqueName*/, 1f /*skill*/, 0.5f /*bravery*/);
+                Log?.LogInfo($"[swap] spawned Cricket for {RawNameOf(p)} @ ({gpos.x:0},{gpos.y:0},{gpos.z:0}) over-ocean on {(destHQ != null && destHQ.faction != null ? destHQ.faction.factionName : "?")}");
+                return ac;
+            }
+            catch (Exception e) { Log?.LogError("SpawnCricket: " + e); return null; }
+        }
+
+        // ---- step scheduler (parallel to _pendingMoves, pumped 1Hz from PollCommands) ----
+        enum SwapPhase { Eject0, WaitDespawn, MoveToDest, Spawn, WaitThenEject, Done }
+        sealed class SwapJob { public Player p, admin; public FactionHQ destHQ; public bool force; public SwapPhase phase; public float due, deadline; }
+        static readonly List<SwapJob> _swaps = new List<SwapJob>();
+
+        internal void BeginSwap(Player tgt, Player admin, bool force)
+        {
+            try
+            {
+                if (tgt == null) return;
+                if (!TwoSides(out var A, out var B)) { TellPlayer(admin, "<color=#FFC857>Swap needs a PvP match with two joinable teams.</color>"); return; }
+                FactionHQ orig = null; try { orig = tgt.HQ; } catch { }
+                FactionHQ dest = ReferenceEquals(orig, A) ? B : A;       // the side that is NOT theirs
+                if (dest == null || ReferenceEquals(dest, orig)) { TellPlayer(admin, "<color=#FFC857>Couldn't pick an other team to swap to.</color>"); return; }
+                if (ResolveCricket() == null) { TellPlayer(admin, "<color=#FF5555>Can't swap: CI-22 Cricket not found in the aircraft catalog (see log).</color>"); return; }
+                _swaps.RemoveAll(j => j.p == tgt);                       // collapse repeats / restart cleanly
+                float now = Time.time;
+                GuardEject(Sid(tgt));
+                var job = new SwapJob { p = tgt, admin = admin, destHQ = dest, force = force };
+                if (force)
+                {
+                    if (IsFlying(tgt)) AdminEject(tgt);                  // keep the spawn-replace auto-eject life-neutral
+                    job.phase = SwapPhase.MoveToDest; job.due = now + 1f;
+                }
+                else { job.phase = SwapPhase.Eject0; job.due = now; }
+                _swaps.Add(job);
+                string df = dest.faction != null ? dest.faction.factionName : "the other team";
+                if (admin != null) TellPlayer(admin, $"<color=#36FFD0>{(force ? "forceteamswap" : "swapteam")} {RawNameOf(tgt)} -> {df} started…</color>");
+                else TellPlayer(tgt, $"<color=#FFC857>You're being moved to {df} to balance the teams - you keep your points and progress.</color>");
+                Log?.LogInfo($"[swap] begin {(force ? "force " : "")}{RawNameOf(tgt)} -> {df}{(admin == null ? " [autobalance]" : "")}");
+            }
+            catch (Exception e) { Log?.LogError("BeginSwap: " + e); }
+        }
+
+        internal static void PumpSwaps(float now)
+        {
+            for (int i = _swaps.Count - 1; i >= 0; i--)
+            {
+                var j = _swaps[i];
+                if (j.p == null) { _swaps.RemoveAt(i); continue; }
+                if (now < j.due) continue;
+                try
+                {
+                    switch (j.phase)
+                    {
+                        case SwapPhase.Eject0:
+                            AdminEject(j.p); Instance?.MovePlayer(j.p, null);            // life-neutral eject -> spectate
+                            j.phase = SwapPhase.WaitDespawn; j.due = now + 1f; j.deadline = now + 5f; break;
+                        case SwapPhase.WaitDespawn:
+                            bool gone = false; try { gone = j.p.Aircraft == null; } catch { gone = true; }
+                            if (gone || now >= j.deadline) { j.phase = SwapPhase.MoveToDest; j.due = now; }
+                            else j.due = now + 1f; break;
+                        case SwapPhase.MoveToDest:
+                            Instance?.MovePlayer(j.p, j.destHQ);                          // server-side faction flip (UI not reset yet)
+                            j.phase = SwapPhase.Spawn; j.due = now + 0.2f; break;
+                        case SwapPhase.Spawn:
+                            var ac = SpawnCricket(j.p, j.destHQ);
+                            if (ac == null) { Instance?.TellPlayer(j.admin, "<color=#FF5555>Swap failed: couldn't spawn the Cricket (see log).</color>"); j.phase = SwapPhase.Done; }
+                            else { j.phase = SwapPhase.WaitThenEject; j.due = now + 2f; } break;
+                        case SwapPhase.WaitThenEject:
+                            AdminEject(j.p);                                              // eject -> client drops to the NEW team's spawn menu
+                            string df = j.destHQ != null && j.destHQ.faction != null ? j.destHQ.faction.factionName : "the new team";
+                            Instance?.TellPlayer(j.admin, $"<color=#36FFD0>Swap complete: {RawNameOf(j.p)} is now on {df}.</color>");
+                            j.phase = SwapPhase.Done; break;
+                    }
+                    if (j.phase == SwapPhase.Done) _swaps.RemoveAt(i);
+                }
+                catch (Exception e) { Log?.LogError("PumpSwaps: " + e); _swaps.RemoveAt(i); }
+            }
+        }
+
+        // ================= !forfeit : a team votes to SURRENDER (PvP only) =================
+        // A player types !forfeit to start (or add to) a vote among THEIR team to end the match as a
+        // loss for them / a win for the other team. Passes when a MAJORITY of the team's current players
+        // have agreed. The vote stays open for a short window; a fresh vote can't START until the cooldown
+        // (default 90s, measured from the previous vote's start) elapses. Keyed by faction name, reset on
+        // a new mission. Forfeit = the OTHER team's HQ declares Victory (same path as a normal win).
+        sealed class ForfeitVote { public readonly HashSet<string> voters = new HashSet<string>(StringComparer.Ordinal); public float startedAt; }
+        static readonly Dictionary<string, ForfeitVote> _forfeitVotes = new Dictionary<string, ForfeitVote>(StringComparer.Ordinal);
+        const float ForfeitWindow = 60f;            // seconds a started vote keeps collecting agreement
+        internal static void ClearForfeitVotes() { _forfeitVotes.Clear(); }
+
+        internal void HandleForfeit(Player p)
+        {
+            try
+            {
+                if (ForfeitEnabled != null && !ForfeitEnabled.Value) { TellPlayer(p, "<color=#FFC857>Forfeit is disabled.</color>"); return; }
+                FactionHQ callerHQ = null; try { callerHQ = p.HQ; } catch { }
+                if (callerHQ == null) { TellPlayer(p, "<color=#FFC857>Join a team first - spectators can't call a forfeit.</color>"); return; }
+                if (!TwoSides(out var A, out var B)) { TellPlayer(p, "<color=#FFC857>Forfeit votes are only for PvP matches.</color>"); return; }
+                FactionHQ otherHQ = (callerHQ == A) ? B : (callerHQ == B) ? A : null;
+                if (otherHQ == null) { TellPlayer(p, "<color=#FFC857>Couldn't find your opposing team.</color>"); return; }
+                string myFac  = callerHQ.faction != null ? callerHQ.faction.factionName : "your team";
+                string foeFac = otherHQ.faction  != null ? otherHQ.faction.factionName  : "the other team";
+
+                float now = Time.time;
+                float cd  = ForfeitCooldownSeconds != null ? ForfeitCooldownSeconds.Value : 90;
+                float window = Math.Min(ForfeitWindow, cd);
+                _forfeitVotes.TryGetValue(myFac, out var vote);
+                bool active = vote != null && (now - vote.startedAt) < window;
+                bool started = false;
+                if (!active)                                                 // need to START a new vote
+                {
+                    if (vote != null && (now - vote.startedAt) < cd)         // still cooling down
+                    {
+                        int left = (int)Math.Ceiling(cd - (now - vote.startedAt));
+                        TellPlayer(p, $"<color=#FFC857>Forfeit vote on cooldown - try again in {left}s.</color>");
+                        return;
+                    }
+                    vote = new ForfeitVote { startedAt = now };
+                    _forfeitVotes[myFac] = vote;
+                    started = true;
+                }
+                vote.voters.Add(Sid(p));
+
+                // tally against the CURRENT team (someone who left no longer counts; threshold tracks live size)
+                var team = Side(callerHQ);
+                var teamSids = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var tp in team) teamSids.Add(Sid(tp));
+                int yes = 0; foreach (var v in vote.voters) if (teamSids.Contains(v)) yes++;
+                int need = team.Count / 2 + 1;                               // majority of the current team
+
+                if (yes >= need)
+                {
+                    _forfeitVotes.Remove(myFac);
+                    BroadcastAll($"<color=#FF6A6A>** {myFac} has FORFEITED the match - {foeFac} wins! **</color>");
+                    Log?.LogInfo($"[forfeit] {myFac} forfeited ({yes}/{team.Count}) -> declaring {foeFac} victory");
+                    ForceVictory(otherHQ);
+                    return;
+                }
+                // not passed yet: tell the FORFEITING team only (don't tip off the enemy)
+                string lead = started ? $"{RawNameOf(p)} called a FORFEIT vote. " : "";
+                foreach (var tp in team)
+                    TellPlayer(tp, $"<color=#FFC857>{lead}Forfeit (surrender) vote: {yes}/{need} of {myFac}. Type <color=#55FF55>!forfeit</color> to agree.</color>");
+            }
+            catch (Exception e) { Log?.LogError("HandleForfeit: " + e); }
+        }
+
+        // Declare `winner`'s faction the victor -> ends the match (same call the PvE timeout uses).
+        static void ForceVictory(FactionHQ winner)
+        {
+            try
+            {
+                if (winner == null) return;
+                if (GameManager.gameResolution != GameResolution.Ongoing) return;   // already ended -> guard
+                var m = typeof(FactionHQ).GetMethod("DeclareEndGame");
+                if (m == null) { Log?.LogError("[forfeit] DeclareEndGame not found"); return; }
+                object victory;
+                try { victory = System.Enum.Parse(m.GetParameters()[0].ParameterType, "Victory"); }
+                catch (Exception e) { Log?.LogError("[forfeit] EndType parse: " + e); return; }
+                m.Invoke(winner, new object[] { victory });
+            }
+            catch (Exception e) { Log?.LogError("ForceVictory: " + e); }
+        }
+
+        // ---- in-game chat commands ----
+        // PUBLIC: !autobalance/!ab (explainer). ADMIN (SteamID in [Admin] SteamIds):
+        // !move <player> <faction>, !spec [player], !join <player> <faction>, !balance.
+        internal bool TryHandleChatCommand(ChatManager cm, Player p, string msg)
+        {
+            try
+            {
+                string t = (msg ?? "").TrimStart();
+                if (t.Length == 0 || t[0] != '!') return false;
+                var parts = t.Substring(1).Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length == 0) return false;
+                string cmd = parts[0].ToLowerInvariant();
+
+                if (cmd == "autobalance" || cmd == "ab") { Cm = cm; ExplainAutobalance(p); return true; }
+
+                // PUBLIC: any player may call/second a forfeit (surrender) vote for their own team.
+                if (cmd == "forfeit" || cmd == "ff" || cmd == "surrender") { Cm = cm; HandleForfeit(p); return true; }
+
+                // PUBLIC: anyone may send THEMSELVES to spectate with a bare !spec / !spectate.
+                if ((cmd == "spec" || cmd == "spectate") && parts.Length == 1)
+                {
+                    Cm = cm; RequestMove(p, null, true); return true;
+                }
+
+                // PUBLIC: !squadup - team up with friends (up to MaxSize) so PvP auto-balance won't split you.
+                if (cmd == "squadup" || cmd == "squad" || cmd == "su") { Cm = cm; HandleSquadup(p, parts); return true; }
+                // PUBLIC: !y accepts a PENDING squad invite only. With no live (unexpired) invite this
+                // returns false so the !y flows through to the bot untouched (the map-vote approval poll
+                // also tallies !y). NOTE: a player with a LIVE squad invite who types !y during a map-vote
+                // approval poll spends it on the squad-accept (rare race; everyone else's votes still tally).
+                if (cmd == "y" || cmd == "yes") { Cm = cm; return TryAcceptSquad(p); }
+
+                bool ours = cmd == "move" || cmd == "team" || cmd == "join"
+                         || cmd == "spec" || cmd == "spectate" || cmd == "unteam" || cmd == "balance"
+                         || cmd == "setrank" || cmd == "setfunds" || cmd == "addfunds"
+                         || cmd == "swapteam" || cmd == "forceteamswap";
+                if (!ours) return false;                                  // not ours -> normal chat
+                Cm = cm;
+                if (!IsAdmin(p)) { TellPlayer(p, "<color=#FF5555>You're not authorised to use that command.</color>"); return true; }
+
+                if (cmd == "balance")
+                {
+                    int n = BalanceOnce(true);
+                    TellPlayer(p, n > 0 ? "<color=#36FFD0>Balance pass: moved 1 player.</color>"
+                                        : "<color=#FFC857>Balance pass: nothing to do (need a lopsided PvP match with someone movable).</color>");
+                    return true;
+                }
+                if (cmd == "setrank")                                     // !setrank <player> <n> : set in-game rank
+                {
+                    if (parts.Length < 3) { TellPlayer(p, "<color=#FFC857>usage: !setrank <player> <number></color>"); return true; }
+                    if (!int.TryParse(parts[parts.Length - 1], out int rk)) { TellPlayer(p, "<color=#FF5555>Rank must be a whole number.</color>"); return true; }
+                    var tgt = Resolve(p, Join(parts, 1, parts.Length - 1));
+                    if (tgt != null) { SetPlayerRank(tgt, rk); TellPlayer(p, $"<color=#36FFD0>Set {RawNameOf(tgt)}'s in-game rank to {tgt.PlayerRank}.</color>"); }
+                    return true;
+                }
+                if (cmd == "setfunds" || cmd == "addfunds")              // !setfunds/!addfunds <player> <amount> : in-game funds
+                {
+                    bool add = cmd == "addfunds";
+                    if (parts.Length < 3) { TellPlayer(p, $"<color=#FFC857>usage: !{cmd} <player> <amount></color>"); return true; }
+                    if (!float.TryParse(parts[parts.Length - 1], NumberStyles.Float, CultureInfo.InvariantCulture, out float amt))
+                    { TellPlayer(p, "<color=#FF5555>Amount must be a number.</color>"); return true; }
+                    var tgt = Resolve(p, Join(parts, 1, parts.Length - 1));
+                    if (tgt != null) { SetPlayerFunds(tgt, amt, add); TellPlayer(p, $"<color=#36FFD0>{(add ? "Added" : "Set")} {RawNameOf(tgt)}'s funds {(add ? "by " : "to ")}{amt:0} (now {tgt.Allocation:0}).</color>"); }
+                    return true;
+                }
+                if (cmd == "spec" || cmd == "spectate" || cmd == "unteam")
+                {
+                    Player tgt = parts.Length >= 2 ? Resolve(p, Join(parts, 1, parts.Length)) : p;
+                    if (tgt != null) { RequestMove(tgt, null, true); if (tgt != p) TellPlayer(p, $"<color=#36FFD0>Moved {RawNameOf(tgt)} to spectate.</color>"); }
+                    return true;
+                }
+                if (cmd == "swapteam" || cmd == "forceteamswap")          // ADMIN TEST: move team + brief Cricket spawn + eject (resets the client UI)
+                {
+                    if (parts.Length < 2) { TellPlayer(p, $"<color=#FFC857>usage: !{cmd} <player></color>"); return true; }
+                    var tgt = Resolve(p, Join(parts, 1, parts.Length));
+                    if (tgt != null) BeginSwap(tgt, p, cmd == "forceteamswap");
+                    return true;
+                }
+                // move / team / join :  <player> <faction>   (faction is the last token)
+                if (parts.Length < 3) { TellPlayer(p, $"<color=#FFC857>usage: !{cmd} <player> <boscali|primeva></color>"); return true; }
+                string facKey = parts[parts.Length - 1];
+                var hq = FindFaction(facKey);
+                if (hq == null) { TellPlayer(p, $"<color=#FF5555>Unknown faction '{facKey}' (use boscali / primeva).</color>"); return true; }
+                var target = Resolve(p, Join(parts, 1, parts.Length - 1));
+                if (target != null)
+                {
+                    RequestMove(target, hq, false);
+                    string fn = hq.faction != null ? hq.faction.factionName : "the team";
+                    TellPlayer(p, IsFlying(target)
+                        ? $"<color=#36FFD0>{RawNameOf(target)} -> {fn} (airborne: 10s warning sent).</color>"
+                        : $"<color=#36FFD0>Moved {RawNameOf(target)} to {fn}.</color>");
+                }
+                return true;
+            }
+            catch (Exception e) { Log?.LogError("TryHandleChatCommand: " + e); return false; }
+        }
+
+        void ExplainAutobalance(Player p)
+        {
+            bool on = EnforceBalance != null && EnforceBalance.Value;
+            bool mv = AutoMove != null && AutoMove.Value;
+            int max = BalanceMaxDiff != null ? BalanceMaxDiff.Value : 2;
+            TellPlayer(p, "<color=#36FFD0>== Auto-balance (PvP only) ==</color>");
+            TellPlayer(p, $"Teams are kept within {max} of each other. If you join the side that already has more players you're moved straight to spectate (no warning) - just reopen the map and join the smaller side.");
+            if (mv) { int gmin = (BalanceGraceSeconds != null ? BalanceGraceSeconds.Value : 180) / 60;
+                TellPlayer(p, $"When someone LEAVES and a side ends up more than {max} ahead, the server waits ~{Mathf.Max(1, gmin)} min (in case the gap fills back in), then moves ONE player from the bigger side to spectate (rejoin the smaller side) - picking whoever keeps both teams' total skill as even as possible. Airborne picks get a 10s warning first."); }
+            else    TellPlayer(p, "Auto-move is currently OFF (join-blocking only).");
+            TellPlayer(p, "New pilots (first ~15 min) are never moved; friends who <color=#55FF55>!squadup</color> are kept together and only moved as a last resort.");
+            TellPlayer(p, $"<color=#FFC857>Co-op (PvE) is never balanced.</color>  Status: {(on ? "ON" : "OFF")}.");
+        }
+        // ================= end force-move / auto-balance =================
+
+        // -------- chat reformat --------
+        static void LoadRankMap()
+        {
+            try
+            {
+                var fi = new FileInfo(RankFilePath);
+                if (!fi.Exists || fi.LastWriteTimeUtc.Ticks == _rankFileTicks) return;
+                _rankFileTicks = fi.LastWriteTimeUtc.Ticks;
+                RankMap.Clear();
+                RankWeight.Clear();
+                foreach (var line in File.ReadAllLines(RankFilePath))
+                {
+                    var parts = line.Split('|');                        // sid|ABBR|#hex[|rankIndex][|FullName]
+                    if (parts.Length >= 3)
+                    {
+                        string sid = parts[0].Trim();
+                        int w = 1;                                       // 4th field = numeric rank 1..11 (for balancing)
+                        if (parts.Length >= 4) int.TryParse(parts[3].Trim(), out w);
+                        string full = (parts.Length >= 5 && parts[4].Trim().Length > 0) ? parts[4].Trim() : parts[1];
+                        RankMap[sid] = (parts[1], parts[2].Trim(), full);
+                        RankWeight[sid] = w < 1 ? 1 : w;
+                    }
+                }
+            }
+            catch (Exception e) { Log?.LogError("LoadRankMap: " + e); }
+        }
+
+        // returns true if we rebroadcast a custom line (suppress native chat); false -> native
+        internal bool FormatAndBroadcast(ChatManager cm, Player player, string message, bool allChat)
+        {
+            Cm = cm;                          // cache for TellPlayer (team-balance block messages)
+            // RankInName mode: the rank is in the player's NAME, so let chat flow natively
+            // (the game then renders "[RANK] Name: msg" AND runs its text-to-speech). The bot
+            // still sees chat via the native CmdSendChatMessage log line (CHAT_RE), so we emit
+            // nothing here -- emitting {"t":"chat"} too would double-log it.
+            if (RankInName != null && RankInName.Value) return false;
+            if (!ReformatChat.Value) return false;
+            try
+            {
+                // Let '!'-prefixed messages pass through UNMODIFIED - that's both commands (!rank)
+                // and the map votes (!1 .. !6) - so the external bot still sees them in the log and
+                // can respond / tally votes. Everything else (incl. bare numbers) is ordinary chat
+                // and gets reformatted. (Rerouting suppresses the original line, so we must not
+                // reroute anything the bot needs to read.)
+                string t = message.TrimStart();
+                if (t.Length > 0 && t[0] == '!') return false;
+
+                string id = Sid(player);
+                if (_chatThrottle.TryGetValue(id, out var last) && Time.time - last < 0.4f)
+                    return true;                                        // light anti-spam (we bypass server rate-limit)
+                _chatThrottle[id] = Time.time;
+
+                // Report the message to the bot so it shows in the activity feed. The
+                // normal CmdSendChatMessage log line is skipped when we reroute (our
+                // Prefix returns false), so without this the bot can't see reformatted
+                // chat. Commands/votes (!.. / digit) aren't rerouted -> they still come
+                // through the normal path, so there's no double-logging. Esc() = JSON-safe.
+                Out("{\"t\":\"chat\",\"id\":\"" + id + "\",\"n\":\"" + Esc(player.PlayerName) +
+                    "\",\"msg\":\"" + Esc(message) + "\",\"all\":" + (allChat ? "true" : "false") + "}");
+
+                LoadRankMap();
+                string label = "", color = "#FFFFFF";
+                if (RankMap.TryGetValue(id, out var rc)) { label = rc.label; color = rc.color; }  // shorthand rank tag
+                string name = SafeText(player.PlayerName);
+                string msg = SafeText(message);
+                string ally = allChat ? "" : "(ally) ";
+                string who = string.IsNullOrEmpty(label) ? $"[{name}]" : $"[{name} - {label}]";
+                // name+rank tag in the rank colour; the message itself in white.
+                string outLine = $"{ally}<color={color}>{who}</color> <color=#FFFFFF>{msg}</color>";
+
+                if (allChat) cm.RpcServerMessage(outLine, false);
+                else foreach (var v in Humans())
+                        if (v.HQ == player.HQ && v.Owner != null) cm.RpcTargetServerMessage(v.Owner, outLine, false);
+                return true;
+            }
+            catch (Exception e) { Log?.LogError("FormatAndBroadcast threw: " + e); return false; }   // -> native chat
+        }
+
+        // -------- string helpers --------
+        static string SafeText(string s)   // for raw-rendered server messages: strip markup + control chars
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            var sb = new StringBuilder(s.Length);
+            foreach (char c in s) sb.Append(c == '<' || c == '>' || c < 0x20 ? ' ' : c);
+            return sb.ToString();
+        }
+        static string Num(object o) { try { return Convert.ToString(o, CultureInfo.InvariantCulture) ?? "0"; } catch { return "0"; } }
+        static string Esc(string s)        // JSON string escaping
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            var sb = new StringBuilder(s.Length + 8);
+            foreach (char c in s)
+            {
+                if (c == '"' || c == '\\') sb.Append('\\').Append(c);
+                else if (c < 0x20) sb.Append(' ');
+                else sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        // ---------------- profanity (racist-slur) gate ----------------
+        // The in-game filter doesn't work, so we screen chat here. If ANY single token of
+        // a message resolves to a racist slur, the WHOLE message is swapped for the canned
+        // line below, BEFORE it broadcasts. We deliberately DO NOT touch ordinary swearing
+        // (fuck/cunt/shit/crap and Aussie banter) - only racial/ethnic slurs. The list is
+        // curated to be liberal on slur SPELLINGS (leetspeak, spacing, repeats, a few
+        // Cyrillic/accented look-alikes are all normalised away) while avoiding collisions
+        // with innocent words via two passes:
+        //   * STRONG (substring, whole de-spaced message): only distinctive roots that
+        //     cannot form inside innocent text - catches "fucknigger" and "n i g g e r".
+        //   * FULL  (anchored, per whitespace token): the complete list - anchoring lets
+        //     short roots match safely, so "coon"/"spic"/"paki"/"abo" hit but raccoon,
+        //     spicy, Pakistan, about, Japan, squawk, minigame, niqab, Nigeria do NOT.
+        // Deliberate exclusions (innocent bare tokens / Aussie usage): fag (=cigarette),
+        // nip, mick, paddy, dink (dinky-di), cracker, slope (skiing), spook, honky, negro.
+        internal const string ProfanityReplacement = "I am an idiot and need help!";
+
+        static readonly string[] FullSlurs =
+        {
+            // n-word family (liberal: single-g, q-substitution, -uh/-let endings)
+            "nigger","nigga","niga","niqqa","niqqer","niqa","nikka","nicca","nigguh","niglet",
+            // anti-black
+            "jigaboo","jiggaboo","porchmonkey","pickaninny","picaninny","golliwog","gollywog",
+            "spearchucker","mooncricket","darkie","darky","coon",
+            // anti-asian
+            "chink","gook","zipperhead","slopehead","chingchong","jap",
+            // anti-hispanic
+            "wetback","beaner","spic",
+            // anti-arab / south-asian / muslim
+            "raghead","towelhead","cameljockey","dothead","muzzie","currymuncher","paki",
+            // anti-indigenous (AU-relevant)
+            "boong","abo","injun","squaw",
+            // anti-jewish
+            "kike","kyke",
+            // roma
+            "gyppo","gippo",
+            // organised hate
+            "kkk","siegheil","seigheil","heilhitler","gasthejews",
+        };
+
+        // Distinctive roots that are safe to match as a substring anywhere (no innocent
+        // word/place-name forms them, even across word boundaries once spaces are stripped).
+        static readonly string[] StrongSlurs =
+        {
+            "nigger","nigga","niqqa","niqqer","nigguh","niglet",
+            "jigaboo","jiggaboo","porchmonkey","pickaninny","picaninny","golliwog","gollywog",
+            "spearchucker","mooncricket","chingchong","cameljockey","currymuncher",
+            "siegheil","seigheil","heilhitler","gasthejews",
+        };
+
+        // Innocent words that embed a strong root as a substring -> never flag these tokens.
+        // (Only the n-word collides with a real English word: "snigger" = laugh slyly.)
+        static readonly HashSet<string> SlurAllowlist = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "snigger","sniggers","sniggered","sniggering","sniggeringly","sniggerer","sniggerers",
+        };
+
+        // Each root char -> "c+" so repeats (niiigger) and leet-doubled forms still match.
+        static string ExpandSlur(string root)
+        {
+            var sb = new StringBuilder(root.Length * 2);
+            foreach (char c in root) sb.Append(c).Append('+');
+            return sb.ToString();
+        }
+
+        static Regex _tokenRx, _strongRx;
+        static Regex TokenRx => _tokenRx ?? (_tokenRx =
+            new Regex("^(?:" + string.Join("|", FullSlurs.Select(ExpandSlur)) + ")$", RegexOptions.CultureInvariant));
+        static Regex StrongRx => _strongRx ?? (_strongRx =
+            new Regex(string.Join("|", StrongSlurs.Select(ExpandSlur)), RegexOptions.CultureInvariant));
+
+        // Collapse to bare lowercase a-z, mapping common leetspeak and a few Cyrillic/
+        // accented look-alikes to their latin base and dropping everything else.
+        static string NormalizeForSlur(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            var sb = new StringBuilder(s.Length);
+            foreach (char ch in s)
+            {
+                char c = char.ToLowerInvariant(ch);
+                switch (c)
+                {
+                    case '0': c = 'o'; break;
+                    case '1': case '|': case '!': c = 'i'; break;
+                    case '3': c = 'e'; break;
+                    case '4': case '@': c = 'a'; break;
+                    case '5': case '$': c = 's'; break;
+                    case '6': case '9': c = 'g'; break;   // ni66er / ni99er
+                    case '7': c = 't'; break;
+                    // Cyrillic homoglyphs
+                    case 'а': c = 'a'; break; case 'е': case 'ё': c = 'e'; break;
+                    case 'о': c = 'o'; break; case 'с': c = 'c'; break;
+                    case 'р': c = 'p'; break; case 'у': c = 'y'; break;
+                    case 'х': c = 'x'; break; case 'і': c = 'i'; break;
+                    // accented latin
+                    case 'à': case 'á': case 'â': case 'ä': case 'ã': case 'å': c = 'a'; break;
+                    case 'è': case 'é': case 'ê': case 'ë': c = 'e'; break;
+                    case 'ì': case 'í': case 'î': case 'ï': c = 'i'; break;
+                    case 'ò': case 'ó': case 'ô': case 'ö': case 'õ': c = 'o'; break;
+                    case 'ù': case 'ú': case 'û': case 'ü': c = 'u'; break;
+                    case 'ñ': c = 'n'; break; case 'ç': c = 'c'; break;
+                }
+                if (c >= 'a' && c <= 'z') sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        // Strip leading/trailing punctuation from a token so "spic!" / "(coon)" still anchor,
+        // while interior leet ("sp!c") survives into NormalizeForSlur.
+        static string TrimEdges(string s)
+        {
+            int i = 0, j = s.Length - 1;
+            while (i <= j && !char.IsLetterOrDigit(s[i])) i++;
+            while (j >= i && !char.IsLetterOrDigit(s[j])) j--;
+            return (i > j) ? "" : s.Substring(i, j - i + 1);
+        }
+
+        internal static bool IsRacist(string raw)
+        {
+            try
+            {
+                if (ProfanityFilter != null && !ProfanityFilter.Value) return false;
+                if (string.IsNullOrWhiteSpace(raw)) return false;
+                var sbWhole = new StringBuilder(raw.Length);
+                foreach (var tok in raw.Split((char[])null, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    string n = NormalizeForSlur(TrimEdges(tok));
+                    if (n.Length == 0) continue;
+                    if (SlurAllowlist.Contains(n)) continue;            // innocent word that embeds a slur ("snigger")
+                    if (n.Length >= 3 && TokenRx.IsMatch(n)) return true; // standalone slur token (anchored, full list)
+                    sbWhole.Append(n);                                   // de-spaced stream (allowlisted words excluded)
+                }
+                string whole = sbWhole.ToString();
+                return whole.Length >= 5 && StrongRx.IsMatch(whole);    // concatenated / spaced-out distinctive slurs
+            }
+            catch (Exception e) { Log?.LogError("IsRacist: " + e); return false; }
+        }
+    }
+
+    // Authoritative winner: the winning faction's HQ declares the end. Read the result
+    // by name ("Victory"/"Defeat") so we don't need the internal EndType enum.
+    // Authoritative winner: the winning faction's HQ declares the end.
+    [HarmonyPatch(typeof(FactionHQ), "DeclareEndGame")]
+    internal static class DeclareEndGamePatch
+    {
+        static bool _fired;
+        static void Postfix(FactionHQ __instance, object[] __args)
+        {
+            string end = (__args != null && __args.Length > 0 && __args[0] != null) ? __args[0].ToString() : "";
+            if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] DeclareEndGame fired: " + end); }
+            NukeStatsPlugin.Instance?.OnDeclareEndGame(__instance, end);
+        }
+    }
+
+    // PvP team-balance: block a player from joining a side that's already too far ahead.
+    // Hook the server-side faction-set handler (build-specific hash - re-derive after updates).
+    // Only enforced in PvP (both sides joinable); co-op has a preventJoin AI side -> skipped.
+    [HarmonyPatch(typeof(Player), "UserCode_CmdSetFaction_-1594139491")]
+    internal static class BlockJoinPatch
+    {
+        static bool _fired;
+        // Returning false here does NOT reliably stop the faction assignment (the join still takes,
+        // so the old "please join the other team" message did nothing). Instead we ALLOW the join
+        // and queue the player; PumpBounces (next HQTick) moves them to spectate if it left the
+        // teams too lopsided, and tells them how to join the smaller side.
+        static void Postfix(Player __instance)
+        {
+            if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] CmdSetFaction hooked (team balance)"); }
+            if (__instance != null) NukeStatsPlugin.QueueBounceCheck(__instance);
+        }
+    }
+
+    // Periodic snapshot driver. Our own MonoBehaviour.Update() does not tick on the
+    // dedicated server, so we piggy-back the snapshot on FactionHQ.Update -- a method
+    // the server calls every frame for each faction during a live mission. The shared
+    // Time.time gate in MaybeSnapshot throttles all callers to one snap per interval.
+    [HarmonyPatch(typeof(FactionHQ), "Update")]
+    internal static class HQTickPatch
+    {
+        static bool _fired;
+        static int _lastFrame = -1;
+        static void Postfix()
+        {
+            if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] FactionHQ.Update tick hooked"); }
+            // PERF: FactionHQ.Update fires once PER HQ per frame (2x). Run our batch once per frame.
+            if (UnityEngine.Time.frameCount == _lastFrame) return;
+            _lastFrame = UnityEngine.Time.frameCount;
+            NukeStatsPlugin.PvETimeoutTick();     // PvE: force human defeat when the mission timer expires
+            NukeStatsPlugin.MaybeSnapshot();
+            NukeStatsPlugin.MaybeCleanupPilots();
+            NukeStatsPlugin.MaybeBalance();
+            NukeStatsPlugin.PumpBounces();        // bounce wrong-team joiners to spectate (cheap when idle)
+            NukeStatsPlugin.PumpKillStreaks();    // announce settled kill streaks (cheap when idle)
+            NukeStatsPlugin.PumpStrategic();      // coalesce strategic-launcher shot-downs into one line
+            NukeStatsPlugin.SkillTick();          // NuclearSkill: per-life tracking + end-match eject
+            NukeStatsPlugin.PosTick();            // live map: ~2s plane position broadcast
+            NukeStatsPlugin.TkTick();             // teamkill enforcement (warn/eject/kick/ban)
+            NukeStatsPlugin.GriefTick();          // anti-grief: detect + auto-kick a single connection mass-commanding units
+            NukeStatsPlugin.AiLimitTick();        // AI aircraft limiter (cap + stuck-runway clear)
+            NukeStatsPlugin.PollCommands();
+        }
+    }
+
+    // On spawn, stamp the player's aircraft with a rich networked unitName
+    // ("<rank>ABBR</rank> Name [Plane]") so the native kill feed shows rank + name + plane.
+    [HarmonyPatch(typeof(Player), "SetAircraft")]
+    internal static class AircraftLabelPatch
+    {
+        static bool _fired;
+        static void Postfix(Player __instance)
+        {
+            if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] SetAircraft hooked (kill-feed labelling)"); }
+            NukeStatsPlugin.Instance?.LabelAircraft(__instance);
+            NukeStatsPlugin.Instance?.OnPlayerSpawned(__instance);   // eject over-stackers who spawn anyway
+        }
+    }
+
+    // Player-vs-player kills: FactionHQ.ReportKillAction(killer, target, factor). We read
+    // killer + target here and emit a "kill" event only for human-vs-human enemy kills.
+    [HarmonyPatch(typeof(FactionHQ), "ReportKillAction")]
+    internal static class KillPatch
+    {
+        static bool _fired;
+        static void Postfix(object[] __args)
+        {
+            if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] ReportKillAction hooked"); }
+            if (__args != null && __args.Length >= 2 && __args[0] is Player killer)
+                NukeStatsPlugin.OnKill(killer, __args[1]);
+        }
+    }
+
+    // Suppress the native GLOBAL kill feed (it floods with AI units). Returning false skips the
+    // ClientRpc send. The personal "you killed X" display (TargetCreditMessage -> KillDisplay) is a
+    // SEPARATE RPC and is unaffected. Custom streak / ship-sink callouts replace the global feed.
+    [HarmonyPatch(typeof(MessageManager), "RpcKillMessage")]
+    internal static class KillFeedSuppressPatch
+    {
+        static bool _fired;
+        static bool Prefix()
+        {
+            if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] RpcKillMessage hooked (kill-feed suppression)"); }
+            return !(NukeStatsPlugin.CustomKillFeed != null && NukeStatsPlugin.CustomKillFeed.Value);   // false = suppress
+        }
+    }
+
+    // Hide the "pilot rescued/captured" feed line (spammy; user request) while the custom feed is on.
+    [HarmonyPatch(typeof(MessageManager), "RpcPilotCaptureMessage")]
+    internal static class PilotMsgSuppressPatch
+    {
+        static bool _fired;
+        static bool Prefix()
+        {
+            if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] RpcPilotCaptureMessage hooked (rescue hidden)"); }
+            return !(NukeStatsPlugin.CustomKillFeed != null && NukeStatsPlugin.CustomKillFeed.Value);   // false = suppress
+        }
+    }
+
+    // NuclearSkill: a base capture gives the capturing player +CaptureBonus to their current life's score.
+    [HarmonyPatch(typeof(FactionHQ), "ReportCaptureLocationAction")]
+    internal static class CapturePatch
+    {
+        static bool _fired;
+        static void Postfix(object[] __args)
+        {
+            if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] ReportCaptureLocationAction hooked (skill captures)"); }
+            if (__args != null && __args.Length > 0 && __args[0] is Player p) NukeStatsPlugin.OnCapture(p);
+        }
+    }
+
+    // Teamkill detection: every unit death runs ReportKilled; CheckTeamkill flags a friendly kill by a player.
+    [HarmonyPatch(typeof(Unit), "ReportKilled")]
+    internal static class TeamkillPatch
+    {
+        static bool _fired;
+        static void Prefix(Unit __instance)
+        {
+            if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] ReportKilled hooked (teamkill enforcement)"); }
+            NukeStatsPlugin.CheckTeamkill(__instance);
+        }
+    }
+
+    // ANTI-EXPLOIT: suppress radar/spotting + radar-jamming score entirely.
+    // FactionHQ.RewardPlayer is the sole score funnel; its 5th param RewardType distinguishes
+    // the reason. RewardType (verified via ilspycmd on Assembly-CSharp.dll):
+    //   None=0, Kill=1, Recon=2, Jamming=3, Supply=4, Refuel=5, Repair=6,
+    //   RescuePilots=7, CapturePilots=8, CaptureLocation=9
+    // Recon (radar/sensor DETECTION) is the score-explosion vector: it fires from
+    // RadarLocator_OnRadarWarning / Sensor.DetectTarget on every fresh detection and
+    // accumulates fast with many AI aircraft. Jamming is the analogous passive radar reward.
+    // Returning false from this Prefix skips the original method body entirely, so NO
+    // AddScore / AddAllocation / sortieScore / credit popup happens for these reasons.
+    // Kills (1), captures (9), supply/refuel/repair/rescue (4-8) are untouched.
+    // NOTE: self-destruct-weapon kills route through RewardType.Kill and are intentionally
+    // NOT affected here (separate exploit, monitored only).
+    [HarmonyPatch(typeof(FactionHQ), "RewardPlayer")]
+    internal static class SuppressSpottingScorePatch
+    {
+        // consumed by RewardPlayerPatch.Postfix so suppressed rewards don't emit a score event
+        [ThreadStatic] internal static bool Suppressed;
+        static bool _fired;
+        // bind missionType by name (Harmony matches the original's 5th parameter)
+        static bool Prefix(object missionType)
+        {
+            int mt;
+            try { mt = System.Convert.ToInt32(missionType); } catch { return true; }
+            if (mt == 2 /*Recon*/ || mt == 3 /*Jamming*/)
+            {
+                if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] spotting/jamming score SUPPRESSED (anti-exploit)"); }
+                Suppressed = true;
+                return false; // skip original RewardPlayer body -> no score, no funds, no popup
+            }
+            return true;
+        }
+    }
+
+    // Score gains: the central path appears to be FactionHQ.RewardPlayer(player, ...).
+    [HarmonyPatch(typeof(FactionHQ), "RewardPlayer")]
+    internal static class RewardPlayerPatch
+    {
+        static bool _fired;
+        static void Postfix(object[] __args)
+        {
+            // a Prefix returning false still runs Postfixes; skip telemetry for suppressed spotting/jamming
+            if (SuppressSpottingScorePatch.Suppressed) { SuppressSpottingScorePatch.Suppressed = false; return; }
+            if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] RewardPlayer fired"); }
+            if (__args != null && __args.Length > 0 && __args[0] is Player p) NukeStatsPlugin.EmitOne(p, "score");
+        }
+    }
+
+    // NOTE: there is deliberately NO Player.AddScore patch. FactionHQ.RewardPlayer is the sole
+    // funnel for in-mission score (kills, recon, supply, refuel, captures, repair, rescue all
+    // call it, and it calls AddScore), so RewardPlayerPatch already covers every gain. Patching
+    // AddScore as well doubled every score event in console.log -- pure noise/CPU, removed in 0.4.0.
+
+    // Reroute player chat to a server message so we control format + colour. EXPLICIT
+    // method target (build-specific hash) matching the proven Nuclei style — the earlier
+    // reflection TargetMethod() patched a handle that didn't actually intercept calls.
+    // Re-derive the hash after a game update. No HarmonyWrapSafe: surface any failure.
+    [HarmonyPatch(typeof(ChatManager), "UserCode_CmdSendChatMessage_-456754112")]
+    internal static class ChatReformatPatch
+    {
+        static bool Prefix(ChatManager __instance, ref string __0, bool __1, INetworkPlayer __2)
+        {
+            try
+            {
+                // Profanity gate FIRST, before any mode branching, so it applies whether we
+                // reroute chat (Reformat) or let it flow natively (RankInName). Replacing __0
+                // (passed by ref) means the cleaned text is what broadcasts AND what the bot
+                // reads from the native CmdSendChatMessage log line -> everything stays in sync.
+                if (NukeStatsPlugin.IsRacist(__0))
+                    __0 = NukeStatsPlugin.ProfanityReplacement;
+
+                string message = __0; bool allChat = __1; INetworkPlayer sender = __2;
+                Player player = null;
+                bool got = sender != null && sender.TryGetPlayer<Player>(out player) && player != null;
+                if (!got || string.IsNullOrWhiteSpace(message)) return true;
+                // Admin team commands (!move/!spec/!join/!balance) + the public !autobalance
+                // explainer are handled here and suppressed (so they don't broadcast as chat).
+                if (NukeStatsPlugin.Instance.TryHandleChatCommand(__instance, player, message)) return false;
+                return !NukeStatsPlugin.Instance.FormatAndBroadcast(__instance, player, message, allChat);
+            }
+            catch (Exception e) { try { NukeStatsPlugin.Log?.LogError("chat Prefix threw: " + e); } catch { } return true; }
+        }
+    }
+
+    // RANK FLOOR FIX. The game seeds a player's mission starting rank only when
+    // !saveData.Rejoined; a reconnecting player (Rejoined=true) keeps their SAVED rank, which
+    // is 0 if their old connection was saved before they ever ranked (e.g. dropped in faction
+    // select). That stranded rejoiners at rank 0 on missions whose playerStartingRank is 2/3.
+    // Fix: after ServerMissionStartPlayer runs, ensure the player is at LEAST the mission's
+    // starting rank. No-op for everyone already at/above it (so legit higher ranks are kept).
+    [HarmonyPatch(typeof(NetworkManagerNuclearOption), "ServerMissionStartPlayer")]
+    internal static class StartingRankFloorPatch
+    {
+        static bool _fired;
+        static object _lastMission;
+        static void Postfix(Mission __0, Player __1)
+        {
+            if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] ServerMissionStartPlayer hooked (rank floor)"); }
+            try
+            {
+                if (!ReferenceEquals(_lastMission, __0)) { _lastMission = __0; NukeStatsPlugin.AdvanceGame(); NukeStatsPlugin.ClearMatchTeamkills(); NukeStatsPlugin.ClearForfeitVotes(); }  // new game -> advance balance move-exemption + reset teamkill + forfeit
+                if (__0 == null || __1 == null || __0.missionSettings == null) return;
+                int want = __0.missionSettings.playerStartingRank;
+                // PvP matches (Escalation/Terminal): floor EVERY player to PvpStartingRank, on top of the
+                // mission's own value (covers the built-in PvP maps we can't edit). Co-op is unaffected.
+                int pvp = NukeStatsPlugin.PvpStartingRank != null ? NukeStatsPlugin.PvpStartingRank.Value : 0;
+                if (pvp > want && NukeStatsPlugin.IsPvpMission(__0)) want = pvp;
+                if (__1.PlayerRank < want)
+                {
+                    int was = __1.PlayerRank;
+                    __1.SetRank(want, setScoreOffset: true);
+                    NukeStatsPlugin.Log?.LogInfo($"[rankfloor] {__1.PlayerName} {was} -> {want} (mission/PvP starting-rank floor)");
+                }
+            }
+            catch (Exception e) { NukeStatsPlugin.Log?.LogError("StartingRankFloor: " + e); }
+        }
+    }
+
+    // RankInName: rewrite the player's name to "[RANK] Name" as the client first sets it, so
+    // native chat (and the game's text-to-speech) shows the rank without us rerouting chat.
+    [HarmonyPatch(typeof(Player), "UserCode_CmdSetPlayerName_-1114485719")]
+    internal static class NameInjectPatch
+    {
+        static bool _fired;
+        static void Prefix(Player __instance, ref string __0)
+        {
+            if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] CmdSetPlayerName hooked (rank-in-name)"); }
+            try { NukeStatsPlugin.InjectRankIntoName(__instance, ref __0); }
+            catch (Exception e) { NukeStatsPlugin.Log?.LogError("NameInject: " + e); }
+        }
+    }
+
+    // FLOOD GUARD A: per-player rate limit on fleet move-orders. A runaway CmdSetDestination stream
+    // (held key / macro / a client re-firing at a destroyed unit) overflows every client's reliable
+    // send buffer and mass-disconnects the lobby at match start. We drop the offender's EXCESS orders
+    // server-side (no kick; other players untouched). The game's own limiter is per-UNIT, so commanding
+    // many ships multiplies its cap and dead-unit orders bypass it entirely -- this per-SENDER cap closes
+    // that gap. sender is the 2nd param of UserCode_CmdSetDestination_1791143641 => Harmony __1.
+    [HarmonyPatch(typeof(UnitCommand), "UserCode_CmdSetDestination_1791143641")]
+    internal static class FleetOrderFloodPatch
+    {
+        static bool _fired;
+        static bool Prefix(UnitCommand __instance, INetworkPlayer __1)
+        {
+            if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] CmdSetDestination hooked (flood guard A + command policy)"); }
+            try
+            {
+                if (__1 == null || !__1.TryGetPlayer<Player>(out Player player) || player == null) return true;
+                NukeStatsPlugin.NoteOrderAttempt(player);   // anti-grief: track per-player order rate for GriefTick
+                if (!NukeStatsPlugin.AllowCommandTarget(__instance, player)) return false;   // gameplay rule: target not allowed
+                return NukeStatsPlugin.AllowFleetOrder(player);   // anti-flood: per-sender rate limit (false => drop this order)
+            }
+            catch (Exception e) { NukeStatsPlugin.Log?.LogError("FleetOrderFlood: " + e); return true; }
+        }
+    }
+
+    // FLOOD GUARD B: silently drop a ServerRpc whose target netId has no live object. The game already
+    // drops these (return false) but first LOGS + pushes a client error + builds a network reader; under
+    // a flood (a client re-firing at a just-destroyed unit) that storm exhausts the ByteBuffer pool and
+    // overflows send buffers. We short-circuit with the SAME result, minus the amplifier. RPCs to a dead
+    // netId NEVER reach the per-unit handler (they exit HandleRpc before dispatch), so Layer A cannot see
+    // them -- this is the only place to catch that path. Applied MANUALLY from Awake (RpcHandler is
+    // internal / HandleRpc private). HandleRpc(player, netId, ...) => netId is Harmony __1; returns bool.
+    internal static class DeadNetIdDropPatch
+    {
+        delegate bool TryGetIdDel(uint netId, out NetworkIdentity identity);
+        static object _boundHandler;
+        static TryGetIdDel _tryGetId;
+        static bool _fired;
+
+        static bool Prefix(object __instance, uint __1, ref bool __result)
+        {
+            try
+            {
+                var cfg = NukeStatsPlugin.FloodDropDeadNet;
+                if (cfg == null || !cfg.Value || __instance == null) return true;
+                if (!ReferenceEquals(__instance, _boundHandler))     // (re)bind once per RpcHandler instance
+                {
+                    _boundHandler = __instance; _tryGetId = null;
+                    var loc = AccessTools.Field(__instance.GetType(), "_objectLocator")?.GetValue(__instance);
+                    if (loc != null)
+                    {
+                        var mi = AccessTools.Method(typeof(IObjectLocator), "TryGetIdentity");
+                        if (mi != null) _tryGetId = (TryGetIdDel)Delegate.CreateDelegate(typeof(TryGetIdDel), loc, mi);
+                    }
+                }
+                var del = _tryGetId;
+                if (del == null) return true;                        // couldn't bind -> let the game handle it
+                if (!del(__1, out _))                                 // no live object for this netId
+                {
+                    if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] HandleRpc dead-netId drop ACTIVE (flood guard B)"); }
+                    NukeStatsPlugin.NoteDeadNetIdDrop();
+                    __result = false;                                // match the game's own drop result
+                    return false;                                    // skip body: no log, no SetError, no reader/pool churn
+                }
+            }
+            catch (Exception e) { NukeStatsPlugin.Log?.LogError("DeadNetIdDrop: " + e); }
+            return true;
+        }
+    }
+
+    // FLOOD GUARD C: raise the per-connection reliable-send-buffer cap on the Mirage.SocketLayer.Config that
+    // NetworkManagerNuclearOption.ConfigureNetwork just built + assigned to Server.PeerConfig (a reference type,
+    // so the mutation sticks for the Peer/AckSystem built right after). The game caps it at 3000; a busy server's
+    // transient fleet-order/RPC burst overflows that -> BufferFullException -> the whole lobby drops. We raise it
+    // (default 12000 = 4x) so the burst drains instead of overflowing, and read the field back to PROVE the new
+    // value. Field-or-property + reflection-only (no hard SocketLayer ref). Never LOWERS it. Fail-open everywhere.
+    // Applied MANUALLY from Awake (private target method; reflective field set).
+    internal static class MirageBufferRaisePatch
+    {
+        const string Member = "MaxReliablePacketsInSendBufferPerConnection";
+        static bool _fired;
+
+        static object GetMember(object o, string name)
+        {
+            if (o == null) return null;
+            var p = AccessTools.Property(o.GetType(), name);
+            if (p != null) return p.GetValue(o);
+            var f = AccessTools.Field(o.GetType(), name);
+            return f != null ? f.GetValue(o) : null;
+        }
+
+        static void Postfix(object __instance)   // __instance = NetworkManagerNuclearOption
+        {
+            try
+            {
+                var flag = NukeStatsPlugin.MirageRaiseSendBuffer;
+                if (flag == null || !flag.Value || __instance == null) return;
+
+                var server = GetMember(__instance, "Server");          // Mirage.NetworkServer (libs Mirage.dll)
+                if (server == null) { NukeStatsPlugin.Log?.LogWarning("[flood] Layer C: Server null, skipped"); return; }
+                var peerCfg = GetMember(server, "PeerConfig");          // Mirage.SocketLayer.Config (reference type)
+                if (peerCfg == null) { NukeStatsPlugin.Log?.LogWarning("[flood] Layer C: PeerConfig null, skipped"); return; }
+
+                var t = peerCfg.GetType();
+                var fld = AccessTools.Field(t, Member);
+                var prop = fld == null ? AccessTools.Property(t, Member) : null;
+                if (fld == null && prop == null) { NukeStatsPlugin.Log?.LogWarning("[flood] Layer C: " + Member + " not found, skipped"); return; }
+
+                int target = NukeStatsPlugin.MirageSendBufferLimit != null ? NukeStatsPlugin.MirageSendBufferLimit.Value : 12000;
+                if (target < 3000) target = 3000;   // never go BELOW the game default
+
+                int before = 0;
+                try { before = System.Convert.ToInt32(fld != null ? fld.GetValue(peerCfg) : prop.GetValue(peerCfg)); } catch { }
+                if (target <= before)
+                {
+                    if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo($"[diag] Layer C: {Member} already {before} >= target {target}, left as-is"); }
+                    return;
+                }
+                if (fld != null) fld.SetValue(peerCfg, target); else prop.SetValue(peerCfg, target);
+                int after = 0;
+                try { after = System.Convert.ToInt32(fld != null ? fld.GetValue(peerCfg) : prop.GetValue(peerCfg)); } catch { }
+
+                if (!_fired || after != target)
+                {
+                    _fired = true;
+                    NukeStatsPlugin.Log?.LogInfo($"[diag] Layer C ACTIVE: {Member} {before} -> {after} (target {target}, {(double)target / 3000.0:0.#}x default)");
+                }
+            }
+            catch (Exception e) { NukeStatsPlugin.Log?.LogError("MirageBufferRaise: " + e); }
+        }
+    }
+
+}

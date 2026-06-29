@@ -1,0 +1,226 @@
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nuke Option Server — Setup</title>
+<style>
+:root{--bg:#0a0e14;--pan:#111824;--bd:#23303f;--txt:#d6e2f0;--dim:#8aa0b8;--ac:#36d0ff;--ok:#5df2a0;--bad:#ff7a7a;--warn:#ffce7a}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:820px;margin:0 auto;padding:24px 18px 64px}
+h1{font-size:20px;margin:0 0 2px}.sub{color:var(--dim);margin-bottom:18px}
+.steps{display:flex;gap:6px;margin-bottom:18px;flex-wrap:wrap}
+.steps div{flex:1;min-width:90px;text-align:center;font-size:11px;color:var(--dim);border-bottom:2px solid var(--bd);padding-bottom:6px}
+.steps div.on{color:var(--ac);border-color:var(--ac)}.steps div.done{color:var(--ok);border-color:var(--ok)}
+.card{background:var(--pan);border:1px solid var(--bd);border-radius:12px;padding:18px;margin-bottom:14px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0}
+label.fl{display:block;font-weight:600;margin:10px 0 3px}.hint{color:var(--dim);font-size:12px}
+input[type=text],input[type=password],input[type=number],select{background:#0a0f17;border:1px solid var(--bd);border-radius:8px;color:var(--txt);padding:8px 11px;width:100%}
+button{background:#16202e;border:1px solid var(--bd);border-radius:8px;color:var(--txt);padding:9px 14px;cursor:pointer;font-weight:600}
+button:hover{border-color:var(--ac)}button.go{background:#0c3a24;color:var(--ok);border-color:#1c5a3a}button.pri{background:var(--ac);color:#04222b;border-color:var(--ac)}
+button:disabled{opacity:.5;cursor:default}
+.nav{display:flex;justify-content:space-between;margin-top:16px}
+.opt{border:1px solid var(--bd);border-radius:10px;padding:12px;cursor:pointer;flex:1;min-width:210px}
+.opt:hover{border-color:var(--ac)}.opt.sel{border-color:var(--ac);background:#0c2230}
+.opt b{display:block}.opt .hint{margin-top:3px}
+.chk{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:7px}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.dim{color:var(--dim)}
+.feat{display:flex;align-items:flex-start;gap:10px;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.05)}
+.feat .meta{flex:1}.tg{min-width:52px;border-radius:6px;border:1px solid var(--bd);padding:4px 8px;font-weight:700;cursor:pointer}
+.tg.on{background:#0c3a24;color:var(--ok)}.tg.off{background:#3a1414;color:#ff9a9a}
+.grp{font-weight:700;color:var(--ac);margin:14px 0 4px}
+.pre{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}.pre button{font-size:12px;padding:6px 10px}
+.msg{min-height:18px;font-size:12px;margin-top:6px}
+code{background:#0a0f17;border:1px solid var(--bd);border-radius:5px;padding:1px 5px;color:var(--warn)}
+.hide{display:none}
+</style></head><body><div class="wrap">
+<h1>🚀 Nuke Option Server Toolkit — Setup</h1>
+<div class="sub">A guided, offline setup. Your credentials stay on this machine and are never committed.</div>
+<div class="steps" id="steps"></div>
+<div id="panel"></div>
+<div class="nav"><button id="back" onclick="go(-1)">‹ Back</button><button id="next" class="pri" onclick="go(1)">Next ›</button></div>
+</div>
+<script>
+const TOKEN="__TOKEN__";
+const S=["Welcome","Hosting","Connection","Features","Files","Review"];
+let step=0;
+const state={scenario:"external_linux",connection:{},features:{},web_port:8770,power:"pterodactyl",
+  github_repo:"",channel:"stable",auto_check:false,catalogue:[],
+  mode:"online",platformTarget:"",detected:null,offlineDir:""};
+async function api(path,body){const u=path+(path.indexOf('?')<0?'?':'&')+'t='+TOKEN;
+  const o=body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{};
+  const r=await fetch(u,o);return r.json();}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+const $=s=>document.querySelector(s);
+
+function renderSteps(){$('#steps').innerHTML=S.map((s,i)=>`<div class="${i===step?'on':i<step?'done':''}">${i+1}. ${s}</div>`).join('');}
+
+async function render(){
+  renderSteps();
+  $('#back').style.visibility=step?'visible':'hidden';
+  $('#next').textContent=step===S.length-1?'Finish ✓':'Next ›';
+  const p=$('#panel');
+  if(step===0){
+    p.innerHTML='<div class="card"><b>Welcome.</b> This sets up the toolkit for your Nuclear Option server. We\'ll check prerequisites, ask where your server runs, take your connection details, let you pick which plugin features you want, and write a clean config. <div class="hint" style="margin-top:8px">Everything runs locally — no internet needed. The only network calls are the “Test connection” buttons you click.</div><div id="pf" style="margin-top:12px" class="dim">checking…</div></div>';
+    const r=await api('/api/preflight');
+    $('#pf').innerHTML=r.checks.map(c=>`<div><span class="chk" style="background:${c.ok?'var(--ok)':'var(--warn)'}"></span><b>${esc(c.name)}</b> — <span class="${c.ok?'ok':'warn'}">${esc(c.detail)}</span></div>`).join('');
+    try{const dt=await api('/api/detect');state.detected=dt;state.platformTarget=dt.platform_target||'';
+      if(dt.suggested_option){state.scenario=({external_linux_ptero:'external_linux',own_pc_windows:'own_pc',own_pc_linux:'own_pc',external_windows:'external_windows'})[dt.suggested_option]||state.scenario;}
+      if(dt.local_game_dir&&!state.connection.local_game_dir)state.connection.local_game_dir=dt.local_game_dir;
+      state.mode=(dt.connectivity&&dt.connectivity.online_ok)?'online':'offline';
+      $('#pf').innerHTML+=`<div style="margin-top:10px;border-top:1px solid var(--bd);padding-top:8px"><b>Autodetected:</b> ${esc(dt.reason||'')} <span class="hint">(${(dt.connectivity&&dt.connectivity.online_ok)?'internet available — online install':'no connectivity — offline install'})</span></div>`;
+    }catch(e){}
+  }
+  else if(step===1){
+    const opt=(id,t,h)=>`<div class="opt ${state.scenario===id?'sel':''}" onclick="state.scenario='${id}';render()"><b>${t}</b><div class="hint">${h}</div></div>`;
+    p.innerHTML='<div class="card"><label class="fl">Where does your game server run?</label><div class="row">'
+      +opt('external_linux','External Linux (Pterodactyl)','A hosted server behind a Pterodactyl panel. We tail logs + transfer files over SFTP and control power via the panel API. (The current, most-tested path.)')
+      +opt('own_pc','My own PC','The dedicated server runs on this same machine. We read the local log + control the local process directly — usually no SFTP needed.')
+      +opt('external_windows','External Windows','A hosted Windows server. Files over SFTP/SCP; power via SSH or manual.')
+      +'</div>'
+      +'<label class="fl" style="margin-top:14px">Install mode</label><div class="row">'
+      +'<label style="cursor:pointer"><input type="radio" name="mode" value="online" '+(state.mode==='online'?'checked':'')+' onchange="state.mode=\'online\'"> Online — download the right files automatically</label>'
+      +'<label style="cursor:pointer;margin-left:14px"><input type="radio" name="mode" value="offline" '+(state.mode==='offline'?'checked':'')+' onchange="state.mode=\'offline\'"> Offline — I\'ll provide pre-downloaded files (from the official GitHubs)</label></div>'
+      +'<div class="hint" style="margin-top:10px">You can change this later by re-running setup.</div></div>';
+  }
+  else if(step===2){ renderConnection(p); }
+  else if(step===3){ await renderFeatures(p); }
+  else if(step===4){ await renderFiles(p); }
+  else if(step===5){ renderReview(p); }
+}
+
+function renderConnection(p){
+  const c=state.connection, v=(k)=>esc(c[k]||'');
+  const f=(k,label,ph,type='text')=>`<label class="fl">${label}</label><input type="${type}" value="${v(k)}" placeholder="${ph||''}" oninput="state.connection['${k}']=this.value">`;
+  let html='<div class="card">';
+  if(state.scenario==='own_pc'){
+    html+='<div class="hint" style="margin-bottom:6px">Own-PC hosting: point us at your local server folder + log. (Power = start/stop the local process.)</div>'
+      +f('local_game_dir','Game server folder','C:\\\\path\\\\to\\\\NuclearOptionServer')
+      +f('log_path','Server log file','console.log')
+      +f('rcmd_port','RemoteCommand port','5504','number');
+    state.power='local';
+  } else {
+    html+='<div class="hint" style="margin-bottom:6px">SFTP is used to tail the log + deploy the plugin. Power control is optional (Pterodactyl / manual).</div>'
+      +f('sftp_host','SFTP host','your-host.example.net')
+      +'<div class="row"><div style="flex:1">'+f('sftp_port','SFTP port','22','number')+'</div><div style="flex:2">'+f('sftp_user','SFTP user','user.xxxxxx')+'</div></div>'
+      +f('sftp_pass','SFTP password','••••••••','password')
+      +f('log_path','Remote log path','console.log')
+      +'<div class="row"><div style="flex:1">'+f('rcmd_host','Relay host (for game commands)','same as SFTP host')+'</div><div style="flex:1">'+f('rcmd_port','Relay port','5550','number')+'</div></div>'
+      +'<button class="go" onclick="testSftp(this)">Test SFTP</button> <span id="sftpmsg" class="msg"></span>'
+      +'<hr style="border-color:var(--bd);margin:14px 0">'
+      +'<label class="fl">Power control (optional)</label>'
+      +'<div class="hint">For a Pterodactyl-hosted server, paste your <b>client</b> API key to let the toolkit start/stop the server. Leave blank to control power manually.</div>'
+      +f('panel_url','Panel URL','https://panel.yourhost.net')
+      +f('api_key','Pterodactyl client API key','ptlc_…','password')
+      +f('server_id','Server ID (short)','abcd1234')
+      +'<button class="go" onclick="testPanel(this)">Test panel</button> <span id="panelmsg" class="msg"></span>';
+  }
+  html+='<hr style="border-color:var(--bd);margin:14px 0"><label class="fl">Web command centre port</label><input type="number" value="'+(state.web_port)+'" oninput="state.web_port=this.value">';
+  html+='</div>';
+  p.innerHTML=html;
+}
+async function testSftp(btn){btn.disabled=true;$('#sftpmsg').textContent='testing…';const r=await api('/api/test-sftp',state.connection);
+  $('#sftpmsg').innerHTML=r.ok?'<span class="ok">✓ '+esc(r.info)+'</span>':'<span class="bad">✗ '+esc(r.error)+'</span>';btn.disabled=false;}
+async function testPanel(btn){btn.disabled=true;$('#panelmsg').textContent='testing…';const r=await api('/api/test-panel',state.connection);
+  if(r.ok&&r.servers&&r.servers.length&&!state.connection.server_id){state.connection.server_id=r.servers[0].id;render();}
+  $('#panelmsg').innerHTML=r.ok?'<span class="ok">✓ '+esc(r.info)+'</span>':'<span class="bad">✗ '+esc(r.error)+'</span>';btn.disabled=false;}
+
+const PRESETS={
+  full:{name:'Full community',set:{}},   // all defaults (everything on)
+  pvp:{name:'PvP-competitive',set:{'PvE.TimeoutForceDefeat':false}},
+  pve:{name:'PvE co-op',set:{'Balance.Enforce':false,'Forfeit.Enabled':false,'PvE.TimeoutForceDefeat':true}},
+  minimal:{name:'Minimal (stats only)',set:{'Balance.Enforce':false,'AILimit.Enforce':true,'Forfeit.Enabled':false,'KillFeed.Custom':false,'PvE.TimeoutForceDefeat':false}},
+};
+async function renderFeatures(p){
+  if(!state.catalogue.length){const r=await api('/api/catalogue');state.catalogue=r.settings||[];
+    // init feature toggles from defaults (toggle-type settings only)
+    for(const s of state.catalogue){if(s.type==='toggle' && state.features[s.key]===undefined){state.features[s.key]=(String(s.default).toLowerCase()==='true');}}
+  }
+  const toggles=state.catalogue.filter(s=>s.type==='toggle');
+  const byGroup={};for(const s of toggles){(byGroup[s.group]=byGroup[s.group]||[]).push(s);}
+  let html='<div class="card"><div class="hint">Pick which plugin features to turn on. Safety features (teamkill, flood guard, AI limiter) are on by default — leave them on unless you have a reason. You can fine-tune all the numbers later in the web command centre.</div>';
+  html+='<div class="pre" style="margin-top:10px">Presets: '+Object.keys(PRESETS).map(k=>`<button onclick="applyPreset('${k}')">${PRESETS[k].name}</button>`).join('')+'</div>';
+  for(const g of Object.keys(byGroup)){
+    html+='<div class="grp">'+esc(g)+'</div>';
+    for(const s of byGroup[g]){
+      const on=!!state.features[s.key];
+      html+=`<div class="feat"><div class="meta"><b>${esc(s.friendlyName)}</b><div class="hint">${esc(s.adminDescription||'')}</div></div>`
+        +`<button class="tg ${on?'on':'off'}" onclick="state.features['${s.key}']=${!on};renderFeatures(document.getElementById('panel'))">${on?'ON':'OFF'}</button></div>`;
+    }
+  }
+  html+='</div>';p.innerHTML=html;
+}
+function applyPreset(k){
+  for(const s of state.catalogue){if(s.type==='toggle')state.features[s.key]=(String(s.default).toLowerCase()==='true');}
+  Object.assign(state.features,PRESETS[k].set);
+  renderFeatures(document.getElementById('panel'));
+}
+
+function manifestOption(){
+  if(state.scenario==='own_pc') return (state.platformTarget==='linux_x64')?'own_pc_linux':'own_pc_windows';
+  if(state.scenario==='external_linux') return 'external_linux_ptero';
+  return 'external_windows';
+}
+async function renderFiles(p){
+  const opt=manifestOption();
+  p.innerHTML='<div class="card"><label class="fl">Server files for <code>'+esc(opt)+'</code> · mode: <b>'+esc(state.mode)+'</b></label>'
+    +'<div class="hint">'+(state.mode==='online'?'These will be fetched at the latest version from their official sources and verified.':'Download each item from its official GitHub/source into one folder, then point us at it.')+'</div>'
+    +'<div id="fileList" style="margin-top:8px" class="dim">loading…</div>'
+    +(state.mode==='offline'?'<label class="fl">Folder with your downloaded files</label><input id="offDir" placeholder="C:\\\\path\\\\to\\\\downloads" value="'+esc(state.offlineDir||'')+'" oninput="state.offlineDir=this.value">':'')
+    +'<div class="row" style="margin-top:12px"><button class="go" onclick="fetchFiles(this)">'+(state.mode==='offline'?'Validate & stage files':'Download & stage files')+'</button> <span id="fetchMsg" class="msg"></span></div>'
+    +'<div id="fetchOut" style="margin-top:8px"></div>'
+    +'<div class="hint" style="margin-top:8px">Note: the game server binaries come from Steam (SteamCMD app 3930080); on a Pterodactyl host the panel installs them. This step handles the loader + plugin + egg.</div></div>';
+  if(state.mode==='online'){
+    const pl=await api('/api/plan?option='+opt);
+    $('#fileList').innerHTML=(pl.deps||[]).map(d=>`<div><b>${esc(d.name||d.id)}</b> — <span class="ok">${esc(d.version||'?')}</span> <span class="hint">${esc(d.note||d.url||'')}</span></div>`).join('');
+  }else{
+    const ol=await api('/api/offline-list?option='+opt);
+    $('#fileList').innerHTML=(ol.items||[]).map(i=>i.manual
+      ? `<div><b>${esc(i.name)}</b>: <code>${esc(i.filename||'')}</code> — <a href="${esc(i.url||'#')}" target="_blank" style="color:var(--ac)">${esc(i.url||'')}</a>${i.instructions?'<div class="hint">'+esc(i.instructions)+'</div>':''}</div>`
+      : `<div class="hint">${esc(i.name)} — provided by the host / bundled (no download)</div>`).join('');
+  }
+}
+async function fetchFiles(btn){btn.disabled=true;$('#fetchMsg').textContent='working…';
+  const opt=manifestOption();
+  let r;try{ r=await api('/api/fetch',{option:opt,offline_dir:state.mode==='offline'?(state.offlineDir||''):null}); }catch(e){ r={error:String(e)}; }
+  if(r.error){$('#fetchMsg').innerHTML='<span class="bad">✗ '+esc(r.error)+'</span>';btn.disabled=false;return;}
+  $('#fetchMsg').innerHTML='<span class="ok">staged → '+esc(r.dest||'')+'</span>';
+  $('#fetchOut').innerHTML=(r.results||[]).map(x=>'<div>'+(x.ok===true?'<span class="ok">✓</span>':x.ok===null?'<span class="info">—</span>':'<span class="bad">✗</span>')+' '+esc(x.id)+' <span class="hint">'+esc(x.placed||x.note||'')+'</span></div>').join('');
+  btn.disabled=false;
+}
+function renderReview(p){
+  const c=state.connection;const on=Object.keys(state.features).filter(k=>state.features[k]);
+  p.innerHTML='<div class="card"><b>Review</b>'
+    +'<div class="row"><div style="flex:1"><label class="fl">Hosting</label>'+esc(state.scenario)+'</div>'
+    +'<div style="flex:1"><label class="fl">Server</label>'+esc(state.scenario==='own_pc'?(c.local_game_dir||'(local)'):(c.sftp_host||'(not set)'))+'</div></div>'
+    +'<label class="fl">Features ON ('+on.length+')</label><div class="hint">'+on.map(esc).join(', ')+'</div>'
+    +'<hr style="border-color:var(--bd);margin:14px 0">'
+    +'<label class="fl">Updates (opt-in)</label><div class="hint">Connect a GitHub repo to pull plugin fixes by choice later. Leave blank to skip — you can add it anytime.</div>'
+    +'<input type="text" value="'+esc(state.github_repo)+'" placeholder="owner/repo (e.g. tomo/nuke-option-toolkit)" oninput="state.github_repo=this.value">'
+    +'<div class="row" style="margin-top:6px"><label><input type="checkbox" '+(state.auto_check?'checked':'')+' onchange="state.auto_check=this.checked"> check for updates on launch (still asks before applying)</label></div>'
+    +'<hr style="border-color:var(--bd);margin:14px 0">'
+    +'<button class="go" onclick="saveAll(this)">💾 Save configuration</button> <span id="savemsg" class="msg"></span>'
+    +'<div id="done" class="hide" style="margin-top:12px"></div></div>';
+}
+async function saveAll(btn){btn.disabled=true;$('#savemsg').textContent='writing config + secrets…';
+  const r=await api('/api/save',state);
+  if(r.ok){
+    $('#savemsg').innerHTML='<span class="ok">✓ saved</span>';
+    const d=$('#done');d.classList.remove('hide');
+    d.innerHTML='<b class="ok">Setup complete.</b><div class="hint" style="margin-top:6px">Written:</div>'
+      +'<div>• config: <code>'+esc(r.config_path)+'</code></div>'
+      +'<div>• secrets (0600, never commit): <code>'+esc(r.secrets_path)+'</code></div>'
+      +(r.cfg_path?'<div>• generated plugin cfg: <code>'+esc(r.cfg_path)+'</code></div>':'')
+      +'<div class="hint" style="margin-top:10px">Next: launch the bot + web command centre (the launcher will read this config), then open the web CC to fine-tune any setting live. '
+      +(state.github_repo?'Use the GitHub updater to pull plugin fixes when you choose.':'Add a GitHub repo later to enable opt-in plugin updates.')+'</div>';
+  } else {$('#savemsg').innerHTML='<span class="bad">✗ '+esc(r.error||'failed')+'</span>';}
+  btn.disabled=false;
+}
+
+function go(d){
+  if(d>0 && step===S.length-1){ // finish -> just scroll to save
+    if($('#done')&&!$('#done').classList.contains('hide'))window.scrollTo(0,document.body.scrollHeight);
+    else { const sm=$('#savemsg'); if(sm) sm.innerHTML='<span class="warn">click “Save configuration” above to finish</span>'; }
+    return;
+  }
+  step=Math.max(0,Math.min(S.length-1,step+d));render();
+}
+render();
+</script></body></html>
