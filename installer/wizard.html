@@ -16,6 +16,8 @@ input[type=text],input[type=password],input[type=number],select{background:#0a0f
 button{background:#16202e;border:1px solid var(--bd);border-radius:8px;color:var(--txt);padding:9px 14px;cursor:pointer;font-weight:600}
 button:hover{border-color:var(--ac)}button.go{background:#0c3a24;color:var(--ok);border-color:#1c5a3a}button.pri{background:var(--ac);color:#04222b;border-color:var(--ac)}
 button:disabled{opacity:.5;cursor:default}
+button:active{transform:translateY(1px);background:var(--ac);color:#04222b;border-color:var(--ac)}
+.opt:active{transform:translateY(1px)}
 .nav{display:flex;justify-content:space-between;margin-top:16px}
 .opt{border:1px solid var(--bd);border-radius:10px;padding:12px;cursor:pointer;flex:1;min-width:210px}
 .opt:hover{border-color:var(--ac)}.opt.sel{border-color:var(--ac);background:#0c2230}
@@ -285,8 +287,8 @@ function renderReview(p){
     +'<label class="fl">Server setup</label><div class="hint">'+esc(state.server.server_name||'(unnamed)')+' · ports game '+esc(state.server.game_port)+' / query '+esc(state.server.query_port)+' · '+esc(state.server.mode==='existing'?'existing install':(state.scenario==='external_linux'?'host-installed binaries':'SteamCMD install'))+(state.server.dir?(' · '+esc(state.server.dir)):'')+'</div>'
     +'<label class="fl">Features ON ('+on.length+')</label><div class="hint">'+on.map(esc).join(', ')+'</div>'
     +'<hr style="border-color:var(--bd);margin:14px 0">'
-    +'<label class="fl">Updates (opt-in)</label><div class="hint">Connect a GitHub repo to pull plugin fixes by choice later. Leave blank to skip — you can add it anytime.</div>'
-    +'<input type="text" value="'+esc(state.github_repo)+'" placeholder="owner/repo (e.g. tomo/nuke-option-toolkit)" oninput="state.github_repo=this.value">'
+    +'<label class="fl">Updates</label><div class="hint">Where the plugin + bot updates come from. <b>Leave this as the official repo</b> to receive official updates; only change it if you maintain your own fork.</div>'
+    +'<input type="text" value="'+esc(state.github_repo)+'" placeholder="TomosBombos/nuclear-option-toolkit" oninput="state.github_repo=this.value">'
     +'<div class="row" style="margin-top:6px"><label><input type="checkbox" '+(state.auto_check?'checked':'')+' onchange="state.auto_check=this.checked"> check for updates on launch (still asks before applying)</label></div>'
     +'<hr style="border-color:var(--bd);margin:14px 0">'
     +'<button class="go" onclick="saveAll(this)">💾 Save configuration</button> <span id="savemsg" class="msg"></span>'
@@ -297,22 +299,40 @@ async function saveAll(btn){btn.disabled=true;$('#savemsg').textContent='writing
   if(r.ok){
     $('#savemsg').innerHTML='<span class="ok">✓ saved</span>';
     const d=$('#done');d.classList.remove('hide');
-    d.innerHTML='<b class="ok">Setup complete.</b><div class="hint" style="margin-top:6px">Written:</div>'
-      +'<div>• config: <code>'+esc(r.config_path)+'</code></div>'
-      +'<div>• secrets (0600, never commit): <code>'+esc(r.secrets_path)+'</code></div>'
-      +(r.cfg_path?'<div>• generated plugin cfg: <code>'+esc(r.cfg_path)+'</code></div>':'')
-      +((r.dedicated_config&&r.dedicated_config.length)?'<div>• server config (ports/name): <code>'+esc(r.dedicated_config[r.dedicated_config.length-1])+'</code></div>':'')
-      +(r.launch?'<div>• launcher: <code>'+esc(r.launch.script)+'</code></div><div>• server log: <code>'+esc(r.launch.log)+'</code></div>':'')
-      +'<div class="hint" style="margin-top:10px">Next: '+(r.launch?'run the <b>StartServer</b> launcher above in your server folder to start the modded server (it creates the log), then ':'')+'launch the bot + web command centre (they read this config), then open the web CC to fine-tune any setting live. '
-      +(state.github_repo?'Use the GitHub updater to pull plugin fixes when you choose.':'Add a GitHub repo later to enable opt-in plugin updates.')+'</div>';
+    const launcherName = r.launch ? r.launch.script.split('\\').pop().split('/').pop() : '';
+    d.innerHTML='<b class="ok" style="font-size:16px">✅ Setup complete!</b>'
+      +'<div class="hint" style="margin-top:4px">Wrote your config + secrets'+(r.cfg_path?', plugin cfg':'')+((r.dedicated_config&&r.dedicated_config.length)?', server config':'')+(r.launch?', and a launcher':'')+'.</div>'
+      +(r.launch?(
+        '<div style="margin-top:14px;font-weight:700;color:var(--ac)">▶ How to start your server</div>'
+        +'<ol style="margin:6px 0 4px 20px;padding:0;line-height:1.7">'
+        +'<li>Click <b>Launch now</b> below — it opens your server folder.</li>'
+        +'<li>Double-click <b>'+esc(launcherName)+'</b>. A console window opens and the modded server boots (BepInEx loads the NukeStats plugin). <b>Leave that window open.</b></li>'
+        +'<li>Check the mod loaded: that window (or <code>BepInEx\\LogOutput.log</code> in your server folder) should print <code>NukeStats ... loaded</code>.</li>'
+        +'<li>Join from the game\'s in-game server browser, or connect to <code>localhost</code>.</li>'
+        +'</ol>'
+        +'<div class="hint" style="margin-top:6px">The ranks bot + web dashboard are set up for the remote/Pterodactyl flow today (full own-PC bot support is coming) — the modded <b>server</b> itself runs now.</div>'
+        +'<div class="row" style="margin-top:12px"><button class="pri" onclick="launchNow(this)">🚀 Launch now (open server folder)</button> <button class="go" onclick="finishClose(this)">✓ Finish &amp; close</button></div>'
+        +'<div id="launchMsg" class="msg"></div>'
+      ):(
+        '<div class="hint" style="margin-top:10px">Config written to <code>'+esc(r.config_path)+'</code>. For an external server, push the generated files to your host over SFTP per the docs, then start the bot + web command centre.</div>'
+        +'<div class="row" style="margin-top:12px"><button class="go" onclick="finishClose(this)">✓ Finish &amp; close</button></div>'
+      ));
   } else {$('#savemsg').innerHTML='<span class="bad">✗ '+esc(r.error||'failed')+'</span>';}
   btn.disabled=false;
 }
+async function launchNow(btn){btn.disabled=true;const m=document.getElementById('launchMsg');if(m)m.textContent='opening folder…';
+  let r;try{r=await api('/api/open-folder',{path:state.server.dir});}catch(e){r={ok:false,error:String(e)};}
+  btn.disabled=false;
+  if(m)m.innerHTML=r.ok?'<span class="ok">✓ opened — now double-click the launcher in that window.</span>':'<span class="bad">✗ '+esc(r.error||'could not open the folder')+'</span>';}
+async function finishClose(btn){if(btn)btn.disabled=true;
+  try{await api('/api/shutdown',{});}catch(e){}
+  document.body.innerHTML='<div style="max-width:560px;margin:60px auto;font:15px/1.6 system-ui,Segoe UI,sans-serif;color:#d6e2f0;background:#111824;border:1px solid #23303f;border-radius:12px;padding:24px"><b style="color:#5df2a0;font-size:17px">✅ Setup finished.</b><div style="margin-top:8px;color:#8aa0b8">The setup server has stopped — you can safely close this tab.<br>Start your server by double-clicking the <b>StartServer</b> launcher in your server folder.</div></div>';
+  try{window.close();}catch(e){}}
 
 function go(d){
-  if(d>0 && step===S.length-1){ // finish -> just scroll to save
-    if($('#done')&&!$('#done').classList.contains('hide'))window.scrollTo(0,document.body.scrollHeight);
-    else { const sm=$('#savemsg'); if(sm) sm.innerHTML='<span class="warn">click “Save configuration” above to finish</span>'; }
+  if(d>0 && step===S.length-1){ // Finish
+    if($('#done')&&!$('#done').classList.contains('hide')){ finishClose(null); }
+    else { const sm=$('#savemsg'); if(sm) sm.innerHTML='<span class="warn">click “Save configuration” above first</span>'; else window.scrollTo(0,document.body.scrollHeight); }
     return;
   }
   step=Math.max(0,Math.min(S.length-1,step+d));render();

@@ -42,6 +42,7 @@ USER_DIR = os.environ.get("NOST_DATA_DIR") or os.path.join(
 CONFIG = os.path.join(USER_DIR, "config.json")
 SECRETS = os.path.join(USER_DIR, "secrets.json")
 TOKEN = _secrets.token_urlsafe(16)                # guards the setup API for this run
+_SERVER = None                                    # set in main(); used by /api/shutdown
 
 sys.path.insert(0, HERE)
 try:
@@ -473,6 +474,22 @@ def _api_install_steamcmd(payload):
         return {"ok": False, "error": "SteamCMD install failed: %s" % e}
 
 
+def _api_open_folder(payload):
+    """Open a folder in the OS file explorer (the wizard runs locally)."""
+    path = (payload.get("path") or "").strip()
+    if not path or not os.path.isdir(path):
+        return {"ok": False, "error": "folder not found: %s" % (path or "(empty)")}
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)                           # noqa
+        else:
+            import subprocess
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", path])
+        return {"ok": True}
+    except Exception as e:                               # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+
+
 # ----------------------------- HTTP server -----------------------------
 class Handler(http.server.BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json"):
@@ -566,6 +583,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps(_api_install_server(payload)))
         if path == "/api/install-steamcmd":
             return self._send(200, json.dumps(_api_install_steamcmd(payload)))
+        if path == "/api/open-folder":
+            return self._send(200, json.dumps(_api_open_folder(payload)))
+        if path == "/api/shutdown":
+            self._send(200, json.dumps({"ok": True}))
+            if _SERVER is not None:
+                threading.Thread(target=_SERVER.shutdown, daemon=True).start()
+            return
         return self._send(404, json.dumps({"error": "not found"}))
 
 
@@ -573,6 +597,8 @@ def main():
     port = _free_port()
     url = "http://127.0.0.1:%d/?t=%s" % (port, TOKEN)
     httpd = http.server.HTTPServer(("127.0.0.1", port), Handler)
+    global _SERVER
+    _SERVER = httpd
     print("Nuke Option setup wizard — open this in your browser if it doesn't pop up:")
     print("   " + url)
     print("(Ctrl+C to stop.)  User data dir: " + USER_DIR)
