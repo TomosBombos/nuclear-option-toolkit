@@ -198,8 +198,8 @@ def _generate_launch(game_dir, platform, rcmd_port):
                 "cd /d \"%~dp0\"\r\n"
                 "if not exist logs mkdir logs\r\n"
                 "echo Starting Nuclear Option (modded) - logs\\console.log\r\n"
-                "NuclearOptionServer.exe -batchmode -nographics -logFile logs\\console.log -ServerRemoteCommands %s\r\n"
-                "pause\r\n" % rcmd_port)
+                "NuclearOptionServer.exe -batchmode -nographics -logFile logs\\console.log -ServerRemoteCommands " + str(rcmd_port) + "\r\n"
+                "pause\r\n")
     else:
         script = os.path.join(game_dir, "start_server.sh")
         body = ("#!/usr/bin/env bash\n"
@@ -210,8 +210,7 @@ def _generate_launch(game_dir, platform, rcmd_port):
                 "export DOORSTOP_ENABLED=1\n"
                 "export DOORSTOP_TARGET_ASSEMBLY=\"$(pwd)/BepInEx/core/BepInEx.Preloader.dll\"\n"
                 "export LD_PRELOAD=\"$(pwd)/libdoorstop.so:$LD_PRELOAD\"\n"
-                "./NuclearOptionServer.x86_64 -batchmode -nographics -logFile logs/console.log -ServerRemoteCommands %s\n"
-                % rcmd_port)
+                "./NuclearOptionServer.x86_64 -batchmode -nographics -logFile logs/console.log -ServerRemoteCommands " + str(rcmd_port) + "\n")
     with open(script, "w", encoding="utf-8", newline="") as f:
         f.write(body)
     if platform != "windows":
