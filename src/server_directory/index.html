@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nuclear Option — Community Servers</title>
+<style>
+  :root{
+    --bg:#0a0e14; --pan:#111824; --bd:#23303f; --txt:#d6e2f0; --dim:#8aa0b8;
+    --ac:#36d0ff; --ok:#5df2a0; --chip:#16202e;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:15px/1.55 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:980px;margin:0 auto;padding:28px 18px 72px}
+  header{margin-bottom:18px}
+  h1{font-size:24px;margin:0 0 4px;letter-spacing:.2px}
+  h1 .em{color:var(--ac)}
+  .sub{color:var(--dim);max-width:680px}
+  .bar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:16px 0 6px;
+    color:var(--dim);font-size:13px}
+  .bar .count{color:var(--txt);font-weight:700}
+  .reg{margin-top:26px}
+  .reg h2{font-size:13px;letter-spacing:1.4px;text-transform:uppercase;color:var(--ac);
+    margin:0 0 10px;border-bottom:1px solid var(--bd);padding-bottom:7px}
+  .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(260px,1fr))}
+  .card{background:var(--pan);border:1px solid var(--bd);border-radius:12px;padding:14px 15px}
+  .card .nm{font-weight:700;font-size:16px;word-break:break-word}
+  .card .meta{margin-top:8px;display:flex;gap:7px;flex-wrap:wrap}
+  .chip{background:var(--chip);border:1px solid var(--bd);border-radius:999px;
+    padding:2px 9px;font-size:12px;color:var(--dim)}
+  .chip.ok{color:var(--ok);border-color:#1c5a3a}
+  .note{margin-top:22px;color:var(--dim);font-size:13px;
+    background:var(--pan);border:1px solid var(--bd);border-radius:12px;padding:13px 15px}
+  .state{margin-top:40px;text-align:center;color:var(--dim)}
+  .state .big{font-size:18px;color:var(--txt);margin-bottom:6px}
+  a{color:var(--ac)}
+  .foot{margin-top:34px;color:var(--dim);font-size:12px;border-top:1px solid var(--bd);padding-top:12px}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--bd);
+    border-top-color:var(--ac);border-radius:50%;animation:s .8s linear infinite;vertical-align:-2px}
+  @keyframes s{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Nuclear&nbsp;Option — <span class="em">Community Servers</span></h1>
+    <div class="sub">Servers running the community toolkit that have opted into the public
+      directory. <b>There's no direct-connect in Nuclear Option</b> — find a server by its
+      <b>name</b> (and region) in the in-game server browser.</div>
+  </header>
+
+  <div class="bar">
+    <span class="count" id="count">—</span>
+    <span id="status"><span class="spin"></span> loading…</span>
+  </div>
+
+  <div id="list"></div>
+
+  <div class="note" id="howto" style="display:none">
+    <b>Run a server?</b> Turn on <i>List Server Publicly</i> in your web command centre
+    (Game&nbsp;Settings → Public&nbsp;Listing) and set your region. Only your server's
+    <b>name, region and plugin version</b> are published here — never IPs, SteamIDs, or player data.
+  </div>
+
+  <div class="foot">
+    Read-only public data · auto-refreshes every 90&nbsp;seconds ·
+    <span id="updated"></span>
+  </div>
+</div>
+
+<script>
+"use strict";
+// For a custom domain (where the GitHub owner/repo can't be read from the URL), set this to
+// "owner/repo", e.g. "YourUser/nuclear-option-servers". Leave "" for normal *.github.io hosting.
+const REPO_OVERRIDE = "";
+
+const REGION_NAMES = {
+  OCE:"Oceania", NA:"North America", EU:"Europe", SA:"South America",
+  AS:"Asia", AF:"Africa", ME:"Middle East", Other:"Other"
+};
+const REGION_ORDER = ["OCE","NA","EU","SA","AS","AF","ME","Other"];
+const REFRESH_MS = 90000;   // unauthenticated GitHub API allows ~60 req/hr per IP; 1 call/refresh
+
+function detectRepo(){
+  if (REPO_OVERRIDE) return REPO_OVERRIDE;
+  const host = location.hostname;                       // <owner>.github.io
+  if (!host.endsWith(".github.io")) return "";
+  const owner = host.slice(0, -".github.io".length);
+  const seg = location.pathname.split("/").filter(Boolean);
+  const repo = seg.length ? seg[0] : (owner + ".github.io");   // project page vs user/org root
+  return owner && repo ? owner + "/" + repo : "";
+}
+
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,
+  c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+const $=id=>document.getElementById(id);
+
+function setStatus(html){ $("status").innerHTML = html; }
+function stamp(){ const d=new Date(); $("updated").textContent =
+  "updated " + d.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}); }
+
+function showState(big, small){
+  $("list").innerHTML = '<div class="state"><div class="big">'+esc(big)+'</div>'
+    + (small?('<div>'+small+'</div>'):'') + '</div>';
+}
+
+async function load(){
+  const repo = detectRepo();
+  if (!repo){
+    setStatus("");
+    showState("Couldn't work out which repo to read.",
+      "Set <code>REPO_OVERRIDE</code> at the top of this file to <code>owner/repo</code>.");
+    return;
+  }
+  setStatus('<span class="spin"></span> checking…');
+  const api = "https://api.github.com/repos/" + repo + "/contents/servers";
+  let list;
+  try {
+    const r = await fetch(api, {headers:{Accept:"application/vnd.github+json"}, cache:"no-store"});
+    if (r.status === 404){ done(0); $("count").textContent="0 servers"; $("howto").style.display="";
+      showState("No servers listed yet.", "Be the first — see below."); return; }
+    if (r.status === 403){ setStatus("GitHub rate limit reached — retrying shortly.");
+      stamp(); return; }     // keep whatever's on screen; next refresh retries
+    if (!r.ok){ setStatus("GitHub API error " + r.status + " — retrying."); stamp(); return; }
+    list = await r.json();
+  } catch (e){
+    setStatus("Network error — retrying."); stamp(); return;
+  }
+  const files = (Array.isArray(list) ? list : [])
+    .filter(f => f && f.type === "file" && /\.json$/i.test(f.name||""));
+  if (!files.length){ done(0); $("count").textContent="0 servers"; $("howto").style.display="";
+    showState("No servers listed yet.", "Be the first — see below."); return; }
+
+  const servers = (await Promise.all(files.map(async f => {
+    try {
+      const d = await fetch(f.download_url, {cache:"no-store"});
+      if (!d.ok) return null;
+      const j = await d.json();
+      return (j && (j.name || j.server_name)) ? j : null;
+    } catch (e){ return null; }
+  }))).filter(Boolean);
+
+  render(servers);
+  done(servers.length);
+}
+
+function regionOf(s){
+  const r = String(s.region || "").trim().toUpperCase();
+  for (const k of REGION_ORDER){ if (k.toUpperCase() === r) return k; }
+  return "Other";
+}
+
+function render(servers){
+  if (!servers.length){ $("count").textContent="0 servers"; $("howto").style.display="";
+    showState("No servers listed yet.", "Be the first — see below."); return; }
+  $("howto").style.display = "";
+  const groups = {};
+  for (const s of servers){ (groups[regionOf(s)] = groups[regionOf(s)] || []).push(s); }
+  let html = "";
+  for (const reg of REGION_ORDER){
+    const items = groups[reg];
+    if (!items || !items.length) continue;
+    items.sort((a,b)=> String(a.name||a.server_name).localeCompare(String(b.name||b.server_name)));
+    html += '<div class="reg"><h2>' + esc(REGION_NAMES[reg] || reg)
+      + ' <span style="color:var(--dim);font-weight:400">· ' + items.length + '</span></h2><div class="grid">';
+    for (const s of items){
+      const name = esc(s.name || s.server_name || "Unnamed server");
+      const ver = s.plugin_version ? ('<span class="chip">plugin v' + esc(s.plugin_version) + '</span>') : '';
+      html += '<div class="card"><div class="nm">' + name + '</div><div class="meta">'
+        + '<span class="chip ok">NukeOption toolkit</span>' + ver + '</div></div>';
+    }
+    html += '</div></div>';
+  }
+  $("list").innerHTML = html;
+}
+
+function done(n){
+  $("count").textContent = n + (n === 1 ? " server" : " servers");
+  setStatus("");
+  stamp();
+}
+
+load();
+setInterval(load, REFRESH_MS);
+</script>
+</body>
+</html>
