@@ -1,6 +1,7 @@
 {
   "schema_version": 2,
   "manifest_version": "2026.06.29",
+  "default_repo": "TomosBombos/nuclear-option-toolkit",
   "_note": "Verified upstream sources + in-repo toolkit files for each Nuclear Option install option. Binaries come from Steam (SteamCMD app 3930080), NOT GitHub. The Pterodactyl egg is community-authored in pterodactyl/game-eggs. BepInEx must be 5.4.x (Unity Mono), never 6.x/IL2CPP. Toolkit pieces (bot/web-CC/relay/launchers/config) ship INSIDE this repo: own-PC installs copy them locally; external installs push them over SFTP. 'target' = game (server dir) or admin (the always-on PC running bot+web-CC).",
 
   "options": {

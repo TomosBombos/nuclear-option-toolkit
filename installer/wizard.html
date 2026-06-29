@@ -42,8 +42,8 @@ const TOKEN="__TOKEN__";
 const S=["Welcome","Hosting","Server","Connection","Features","Files","Review"];
 let step=0;
 const state={scenario:"external_linux",connection:{},features:{},web_port:8770,power:"pterodactyl",
-  server:{mode:"install",dir:"",installed:false,exe:"",game_port:7777,query_port:7778,server_name:"",max_players:16,password:""},
-  github_repo:"",channel:"stable",auto_check:false,catalogue:[],
+  server:{mode:"install",dir:"",installed:false,exe:"",steamcmd_ready:false,game_port:7777,query_port:7778,server_name:"",max_players:16,password:""},
+  github_repo:"TomosBombos/nuclear-option-toolkit",channel:"stable",auto_check:false,catalogue:[],
   mode:"online",platformTarget:"",detected:null,offlineDir:""};
 async function api(path,body){const u=path+(path.indexOf('?')<0?'?':'&')+'t='+TOKEN;
   const o=body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{};
@@ -94,8 +94,11 @@ function renderConnection(p){
   let html='<div class="card">';
   if(state.scenario==='own_pc'){
     html+='<div class="hint" style="margin-bottom:6px">Own-PC hosting: the bot reads the local server log and controls the local process. (Your server folder + ports were set in the previous step.)</div>'
-      +f('log_path','Server log file (inside the server folder)','console.log')
-      +f('rcmd_port','RemoteCommand port','5504','number');
+      +'<label class="fl">Server log file</label>'
+      +'<div class="row"><div style="flex:1"><input type="text" value="'+v('log_path')+'" placeholder="console.log" oninput="state.connection.log_path=this.value"></div><button onclick="pickLogFile(this)">Browse…</button></div>'
+      +'<div class="hint">The console log the server writes (it carries chat + the plugin\'s data). With our launch settings it lands at <code>logs/console.log</code> inside your server folder — click <b>Browse…</b> to pick it (the picker opens in your server folder).</div>'
+      +'<label class="fl">RemoteCommand port</label><input type="number" value="'+v('rcmd_port')+'" placeholder="5504" oninput="state.connection.rcmd_port=this.value">'
+      +'<div class="hint">The port the game server opens for admin commands — you launch the server with <code>-ServerRemoteCommands &lt;port&gt;</code> (default 5504). On your own PC the bot reaches it over <b>127.0.0.1</b>, so you do <b>not</b> need to open or forward this port.</div>';
     state.power='local';
   } else {
     html+='<div class="hint" style="margin-bottom:6px">SFTP is used to tail the log + deploy the plugin. Power control is optional (Pterodactyl / manual).</div>'
@@ -113,7 +116,8 @@ function renderConnection(p){
       +f('server_id','Server ID (short)','abcd1234')
       +'<button class="go" onclick="testPanel(this)">Test panel</button> <span id="panelmsg" class="msg"></span>';
   }
-  html+='<hr style="border-color:var(--bd);margin:14px 0"><label class="fl">Web command centre port</label><input type="number" value="'+(state.web_port)+'" oninput="state.web_port=this.value">';
+  html+='<hr style="border-color:var(--bd);margin:14px 0"><label class="fl">Web command centre port</label><input type="number" value="'+(state.web_port)+'" oninput="state.web_port=this.value">'
+    +'<div class="hint">The browser admin dashboard runs locally at <code>http://localhost:'+esc(state.web_port)+'</code> on this PC — open that address after launching. No port-forwarding needed; to reach it from another device on your home network, open this port in your firewall and browse to this PC\'s LAN IP.</div>';
   html+='</div>';
   p.innerHTML=html;
 }
@@ -136,11 +140,20 @@ function renderServer(p){
       +'<div class="opt '+(sv.mode==='existing'?'sel':'')+'" onclick="state.server.mode=\'existing\';render()"><b>Yes — I already have it</b><div class="hint">Point me at the existing dedicated-server folder.</div></div>'
       +'</div>';
     if(sv.mode==='install'){
-      html+='<label class="fl">Where to install it <span class="hint">— a new/empty folder; SteamCMD will create it</span></label>'
-        +'<div class="row"><div style="flex:1"><input type="text" value="'+v('dir')+'" placeholder="C:\\\\NuclearOptionServer" oninput="state.server.dir=this.value"></div>'
-        +'<button onclick="pickServerDir(this)">Browse…</button> <button class="go" onclick="installServer(this)">Install now</button> <button onclick="checkServer(this)">Check install</button></div>'
-        +'<div id="instMsg" class="msg"></div>'
-        +'<div class="hint">SteamCMD opens in its own window and downloads several GB — leave it running, then click <b>Check install</b>.</div>';
+      html+='<label class="fl">Step 1 — Install SteamCMD <span class="hint">(the small Valve tool that downloads the server)</span></label>'
+        +'<div class="row"><button class="go" onclick="installSteamcmd(this)">Install SteamCMD</button> <button onclick="checkSteamcmd(this)">Check SteamCMD</button> <span id="scMsg" class="msg"></span></div>'
+        +'<div class="hint">A console window opens and SteamCMD downloads/updates itself first — <b>it can sit for up to a minute before showing anything, then the window closes on its own</b>. When it\'s done, click <b>Check SteamCMD</b>.</div>';
+      if(sv.steamcmd_ready){
+        html+='<hr style="border-color:var(--bd);margin:14px 0"><div class="ok" style="margin-bottom:6px">✓ SteamCMD ready.</div>'
+          +'<label class="fl">Step 2 — Download the server files <span class="hint">(several GB)</span></label>'
+          +'<label class="fl" style="font-weight:400">Install location <span class="hint">— a new/empty folder; SteamCMD will create it</span></label>'
+          +'<div class="row"><div style="flex:1"><input type="text" value="'+v('dir')+'" placeholder="C:\\\\NuclearOptionServer" oninput="state.server.dir=this.value"></div>'
+          +'<button onclick="pickServerDir(this)">Browse…</button> <button class="go" onclick="installServer(this)">Download server files</button> <button onclick="checkServer(this)">Check install</button></div>'
+          +'<div id="instMsg" class="msg"></div>'
+          +'<div class="hint">The server downloads in its own window — it can take a while and <b>may sit before showing progress</b>. When it finishes, click <b>Check install</b>.</div>';
+      }else{
+        html+='<hr style="border-color:var(--bd);margin:14px 0"><div class="hint">Finish Step 1 first — once SteamCMD is ready, Step 2 (downloading the server) appears here.</div>';
+      }
     }else{
       html+='<label class="fl">Existing server folder</label>'
         +'<div class="row"><div style="flex:1"><input type="text" value="'+v('dir')+'" placeholder="C:\\\\path\\\\to\\\\NuclearOptionServer" oninput="state.server.dir=this.value"></div>'
@@ -186,6 +199,18 @@ async function pickServerDir(btn){btn.disabled=true;
   btn.disabled=false;
   if(r&&r.ok&&r.path){state.server.dir=r.path;render();}
   else if(r&&r.error){const m=document.getElementById('svMsg')||document.getElementById('instMsg');if(m)m.innerHTML='<span class="warn">'+esc(r.error)+'</span>';}}
+async function installSteamcmd(btn){btn.disabled=true;const m=document.getElementById('scMsg');if(m)m.textContent='starting…';
+  let r;try{r=await api('/api/install-steamcmd',{platform:state.platformTarget});}catch(e){r={ok:false,error:String(e)};}
+  if(m)m.innerHTML=r.ok?'<span class="ok">'+esc(r.note)+'</span>':'<span class="bad">✗ '+esc(r.error)+'</span>';btn.disabled=false;}
+async function checkSteamcmd(btn){btn.disabled=true;const m=document.getElementById('scMsg');if(m)m.textContent='checking…';
+  let r;try{r=await api('/api/steamcmd-status?platform='+encodeURIComponent(state.platformTarget||''));}catch(e){r={};}
+  if(r&&r.present){state.server.steamcmd_ready=true;render();}
+  else{state.server.steamcmd_ready=false;if(m)m.innerHTML='<span class="warn">not ready yet — wait for the SteamCMD window to finish, then click Check SteamCMD again</span>';btn.disabled=false;}}
+async function pickLogFile(btn){btn.disabled=true;
+  const init=state.server.dir||state.connection.log_path||'';
+  let r;try{r=await api('/api/pick-file?initial='+encodeURIComponent(init));}catch(e){r={};}
+  btn.disabled=false;
+  if(r&&r.ok&&r.path){state.connection.log_path=r.path;render();}}
 
 const PRESETS={
   full:{name:'Full community',set:{}},   // all defaults (everything on)

@@ -74,3 +74,16 @@ def launch_install(steamcmd_exe, install_dir, appid=APPID):
     logf = os.path.join(install_dir, "steamcmd_install.log")
     subprocess.Popen(cmd, stdout=open(logf, "ab"), stderr=subprocess.STDOUT)
     return cmd, logf
+
+
+def launch_selfupdate(steamcmd_exe):
+    """Run steamcmd once (`+quit`) so it bootstraps/self-updates BEFORE the real install.
+    SteamCMD's first run downloads itself and then exits, which is why a single combined
+    run looks like it 'closes and does nothing'. Returns (cmd, where)."""
+    cmd = [steamcmd_exe, "+quit"]
+    if sys.platform.startswith("win"):
+        subprocess.Popen(cmd, creationflags=_CREATE_NEW_CONSOLE)
+        return cmd, "console"
+    logf = os.path.join(os.path.dirname(steamcmd_exe) or ".", "steamcmd_selfupdate.log")
+    subprocess.Popen(cmd, stdout=open(logf, "ab"), stderr=subprocess.STDOUT)
+    return cmd, logf

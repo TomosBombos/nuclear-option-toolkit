@@ -149,6 +149,11 @@ def resolve(dep, cfg=None):
     # template the plugin repo from user config
     if "${UPDATE_REPO}" in json.dumps(fetch):
         repo = (cfg.get("update", {}) or {}).get("github_repo", "")
+        if not repo:                                       # fall back to the manifest default
+            try:
+                repo = (load_manifest() or {}).get("default_repo", "")
+            except Exception:                              # noqa: BLE001
+                repo = ""
         if not repo:
             return {"method": method, "url": "", "version": "?", "asset": "",
                     "note": "plugin repo not configured (set update.github_repo) — skipped"}
@@ -195,6 +200,10 @@ def resolve(dep, cfg=None):
                 return r
             except Exception as e2:                        # noqa: BLE001
                 return {"method": method, "url": "", "version": "?", "asset": "", "note": "FAILED + fallback failed: %s" % e2}
+        if isinstance(e, LookupError) or getattr(e, "code", None) in (403, 404):
+            return {"method": method, "url": "", "version": "none", "asset": "",
+                    "note": "no published release for %s yet (or the repo is private) — the plugin DLL ships via GitHub Releases and resolves automatically once a release exists"
+                            % fetch.get("repo", "?")}
         return {"method": method, "url": "", "version": "?", "asset": "", "note": "FAILED: %s" % e}
 
 

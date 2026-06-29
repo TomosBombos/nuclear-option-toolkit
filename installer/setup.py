@@ -349,18 +349,71 @@ def _api_install_server(payload):
     platform = "windows" if plat.startswith("win") else "linux"
     sc_base = os.path.join(USER_DIR, "steamcmd")
     try:
-        had = bool(_steamcmd.find_steamcmd(sc_base, platform))
-        sc = _steamcmd.ensure_steamcmd(sc_base, platform, _fetcher)   # downloads it if missing
+        import shutil
+        sc = (_steamcmd.find_steamcmd(sc_base, platform)
+              or shutil.which("steamcmd") or shutil.which("steamcmd.exe") or "")
+        had = bool(sc)
         if not sc:
-            return {"ok": False, "error": "could not download SteamCMD (check your internet connection)"}
+            sc = _steamcmd.ensure_steamcmd(sc_base, platform, _fetcher)   # safety net: auto-download
+        if not sc:
+            return {"ok": False, "error": "SteamCMD isn't installed yet - click 'Install SteamCMD' first"}
         cmd, where = _steamcmd.launch_install(sc, install_dir)
-        steam_note = ("Downloaded SteamCMD. " if not had else "Using the SteamCMD already on this PC. ")
+        steam_note = ("Using SteamCMD. " if had else "Downloaded SteamCMD. ")
         launch_note = ("The game server is now downloading in a new console window. " if where == "console"
                        else "The game server is downloading (log: %s). " % where)
         return {"ok": True, "cmd": " ".join(cmd), "where": where, "downloaded_steamcmd": not had,
                 "note": steam_note + launch_note + "It's several GB — when it finishes, click 'Check install'."}
     except Exception as e:                               # noqa: BLE001
         return {"ok": False, "error": "install failed: %s" % e}
+
+
+def _pick_file(initial=""):
+    """Native FILE chooser on the user's machine (the wizard runs locally). Returns {ok, path}."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:                                    # noqa: BLE001
+        return {"ok": False, "error": "no native file picker on this machine — type the path"}
+    try:
+        if initial and os.path.isdir(initial):
+            initdir = initial
+        elif initial:
+            initdir = os.path.dirname(initial) or os.path.expanduser("~")
+        else:
+            initdir = os.path.expanduser("~")
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.askopenfilename(initialdir=initdir, title="Choose a file")
+        try:
+            root.destroy()
+        except Exception:                                # noqa: BLE001
+            pass
+        return {"ok": True, "path": path or ""}
+    except Exception as e:                               # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+
+
+def _api_install_steamcmd(payload):
+    """Step 1 of the own-PC install: download SteamCMD if missing and run it once so it
+    self-updates BEFORE the (separate) server download. Detached, so it never blocks."""
+    if not (_steamcmd and _fetcher):
+        return {"ok": False, "error": "installer modules unavailable"}
+    plat = str(payload.get("platform") or _platform())
+    platform = "windows" if plat.startswith("win") else "linux"
+    sc_base = os.path.join(USER_DIR, "steamcmd")
+    try:
+        had = bool(_steamcmd.find_steamcmd(sc_base, platform))
+        sc = _steamcmd.ensure_steamcmd(sc_base, platform, _fetcher)
+        if not sc:
+            return {"ok": False, "error": "could not download SteamCMD (check your internet connection)"}
+        cmd, where = _steamcmd.launch_selfupdate(sc)
+        note = ("Downloaded SteamCMD; " if not had else "SteamCMD already present; ")
+        note += ("it's self-updating in a new window — give it up to a minute, then click 'Check SteamCMD'."
+                 if where == "console" else "self-updating (log: %s)." % where)
+        return {"ok": True, "note": note}
+    except Exception as e:                               # noqa: BLE001
+        return {"ok": False, "error": "SteamCMD install failed: %s" % e}
 
 
 # ----------------------------- HTTP server -----------------------------
@@ -422,6 +475,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             from urllib.parse import urlparse, parse_qs
             ini = (parse_qs(urlparse(self.path).query).get("initial") or [""])[0]
             return self._send(200, json.dumps(_pick_folder(ini)))
+        if path == "/api/pick-file":
+            from urllib.parse import urlparse, parse_qs
+            ini = (parse_qs(urlparse(self.path).query).get("initial") or [""])[0]
+            return self._send(200, json.dumps(_pick_file(ini)))
+        if path == "/api/steamcmd-status":
+            from urllib.parse import urlparse, parse_qs
+            plat = (parse_qs(urlparse(self.path).query).get("platform") or [""])[0] or _platform()
+            platform = "windows" if str(plat).startswith("win") else "linux"
+            present = bool(_steamcmd.find_steamcmd(os.path.join(USER_DIR, "steamcmd"), platform)) if _steamcmd else False
+            return self._send(200, json.dumps({"present": present}))
         return self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):
@@ -444,6 +507,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps(_api_fetch(payload)))
         if path == "/api/install-server":
             return self._send(200, json.dumps(_api_install_server(payload)))
+        if path == "/api/install-steamcmd":
+            return self._send(200, json.dumps(_api_install_steamcmd(payload)))
         return self._send(404, json.dumps({"error": "not found"}))
 
 
