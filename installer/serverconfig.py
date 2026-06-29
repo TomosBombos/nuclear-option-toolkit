@@ -12,6 +12,22 @@ import time
 
 CONFIG_NAME = "DedicatedServerConfig.json"
 
+# The custom co-op rotation the toolkit ships (matches the missions in missions/ + the live
+# server). Mission files install into MissionDirectory; this rotation references them by name.
+_MISSION_NAMES = [
+    "Escalation Co-op as BDF - Afternoon", "Escalation Co-op as BDF - Clear Skies",
+    "Escalation Co-op as BDF - Dawn", "Escalation Co-op as BDF - Dusk",
+    "Escalation Co-op as BDF - Night", "Escalation Co-op as BDF - Overcast",
+    "Escalation Co-op as PALA - Afternoon", "Escalation Co-op as PALA - Clear Skies",
+    "Escalation Co-op as PALA - Dawn", "Escalation Co-op as PALA - Dusk",
+    "Escalation Co-op as PALA - Overcast", "Escalation Co-op as PALA - Thunderstorm",
+    "Terminal Control Co-op as BDF - Dawn", "Terminal Control Co-op as BDF - Day",
+    "Terminal Control Co-op as BDF - Dusk", "Terminal Control Co-op as PALA - Dawn",
+    "Terminal Control Co-op as PALA - Day", "Terminal Control Co-op as PALA - Dusk",
+    "Escalation",
+]
+_ROTATION = [{"Key": {"Group": "User", "Name": n}, "MaxTime": 7200.0} for n in _MISSION_NAMES]
+
 # Defaults used only when creating a fresh config (no existing file to merge into).
 DEFAULTS = {
     "MissionDirectory": "NuclearOption-Missions",
@@ -21,7 +37,7 @@ DEFAULTS = {
     "Password": "",
     "MaxPlayers": 16,
     "RotationType": 2,
-    "MissionRotation": [{"Key": {"Group": "User", "Name": "Escalation"}, "MaxTime": 7200.0}],
+    "MissionRotation": _ROTATION,
 }
 
 

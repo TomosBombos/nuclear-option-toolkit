@@ -64,6 +64,7 @@ TREE_INCLUDES = {
     "NukeStats":  ["libs/*", "bin/*", "obj/*", "bepinex_pack/*"],  # proprietary/build
     "map-build":  ["__pycache__/*"],
     "relay":      [],                                            # localhost->WAN remote-command relay
+    "missions":   [],                                            # the 18 custom co-op missions
     "START HERE": ["*.lnk"],                                      # machine-specific shortcut
 }
 

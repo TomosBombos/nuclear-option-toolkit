@@ -295,7 +295,12 @@ def _fetch_repo(dep_id, dep, dest, deployer=None):
         items, flat = [fetch["src"]], True
     else:
         base = fetch.get("src", ".")
-        items, flat = [(base + "/" + f) if base not in (".", "") else f for f in fetch["files"]], False
+        files = fetch.get("files")
+        if not files:                                   # no explicit list -> every file in the dir
+            import glob as _glob
+            srcdir = os.path.join(ROOT, *base.split("/")) if base not in (".", "") else ROOT
+            files = sorted(os.path.basename(p) for p in _glob.glob(os.path.join(srcdir, "*")) if os.path.isfile(p))
+        items, flat = [(base + "/" + f) if base not in (".", "") else f for f in files], False
     placed = []
     for rel in items:
         sp = os.path.join(ROOT, *rel.split("/"))
