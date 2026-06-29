@@ -114,21 +114,21 @@ cd nuclear-option-toolkit
 No git? On this page click the green **`< > Code ▾` → Download ZIP**, extract it, and open a
 terminal in the extracted folder.
 
-**3. Run the guided installer**
+**3. Run the guided installer** (the toolkit source lives in [`src/`](src))
 ```bash
-python installer/setup.py
+python src/installer/setup.py
 ```
-(On Windows you may need `py installer\setup.py`.) A wizard opens in your browser: it checks
-prerequisites, asks where your server runs (your own PC / external Linux-Pterodactyl /
-external Windows), takes your connection details, lets you pick which plugin features you
-want, fetches the right files, and writes a clean config. **Your credentials stay on your
-machine and never enter the repo.** More detail: **[installer/README.md](installer/README.md)**.
+(On Windows you may need `py src\installer\setup.py`.) A wizard opens in your browser: it checks
+prerequisites, asks where your server runs, takes your connection details, sets a few options,
+and writes a clean config. **Your credentials stay on your machine and never enter the repo.**
+More detail: **[src/installer/README.md](src/installer/README.md)**.
 
-> Prefer to wire it up by hand? Copy `run.bat.example` → `run.bat`, `apiKey.txt.example` →
-> `apiKey.txt`, `panel.txt.example` → `panel.txt`, fill in your values, then run `run.bat`.
+> Prefer to wire it up by hand? In `src/`, copy `run.bat.example` → `run.bat`,
+> `apiKey.txt.example` → `apiKey.txt`, `panel.txt.example` → `panel.txt`, fill in your values,
+> then run `run.bat`.
 
 > **Building the plugin from source** requires the game's managed assemblies
-> (`NukeStats/libs/`), which you supply from your own game install — they are not
+> (`src/NukeStats/libs/`), which you supply from your own game install — they are not
 > distributed here.
 
 > ⚠️ **Early / iterating.** The guided installer is under active development. If a step
@@ -141,14 +141,14 @@ machine and never enter the repo.** More detail: **[installer/README.md](install
 Pull fixes when *you* choose — the **plugin and the bot**, on a **stable** or **nightly** channel:
 
 ```bash
-python installer/updater.py check                    # what's available on your channel?
-python installer/updater.py update --component all    # download + verify (SHA-256 + minisign) + stage
+python src/installer/updater.py check                    # what's available on your channel?
+python src/installer/updater.py update --component all    # download + verify (SHA-256 + minisign) + stage
 ```
 
 Pick your channel in `~/.nuke-option-toolkit/config.json` (`update.channel`: `"stable"` or
 `"nightly"`). **Verify-before-apply is mandatory** and nothing is applied until you choose to
 deploy (plugin → `run.bat --deploy-plugin`; bot → `update --component bot --apply`).
-Maintainers publish with `scripts/release.py` (`--with-bot`, `--channel`). See **[SECURITY.md](SECURITY.md)**.
+Maintainers publish with `src/scripts/release.py` (`--with-bot`, `--channel`). See **[SECURITY.md](SECURITY.md)**.
 
 ## Community Servers
 
