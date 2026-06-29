@@ -41,7 +41,7 @@ ROOT = os.path.dirname(HERE)
 # ---------------------------------------------------------------------------
 ROOT_FILES = [
     # docs
-    "README.md", "SECURITY.md", "SERVER_DOCUMENTATION.md", "LICENSE", "VERSION",
+    "README.md", "SECURITY.md", "SERVER_DOCUMENTATION.md", "LICENSE",
     # runtime / product source
     "no_mapvote_bot.py", "cc_web.py", "command_centre.py", "map_atlas.py",
     "webcc.html", "settings_catalogue.json",

@@ -48,8 +48,9 @@ import serverconfig                     # DedicatedServerConfig template
 
 
 def _toolkit_version():
-    """The TOOLKIT version (the marker for releases + bundles) — NOT the plugin version.
-    Read from the VERSION file at the repo root; first stable is 1.0."""
+    """The version used to tag releases + name the bundle folders. Defaults to the plugin version
+    (e.g. 0.9.15) — that's the marker the project uses. An optional VERSION file at the repo root
+    can override it, but by default there isn't one."""
     try:
         with open(os.path.join(ROOT, "VERSION"), encoding="utf-8") as f:
             v = f.read().strip().lstrip("v")
@@ -57,7 +58,7 @@ def _toolkit_version():
             return v
     except OSError:
         pass
-    return bpr._plugin_version()          # fallback if VERSION is missing
+    return bpr._plugin_version()          # default: the plugin version (0.9.1x)
 
 # Binary assets the CLEAN public tree excludes — taken from the SOURCE repo.
 SRC_BEPINEX_LINUX = os.path.join(ROOT, "NukeStats", "bepinex_pack")          # libdoorstop.so + core
