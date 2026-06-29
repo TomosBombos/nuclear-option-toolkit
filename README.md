@@ -149,11 +149,13 @@ Maintainers publish with `src/scripts/release.py` (`--with-bot`, `--channel`). S
 ## Community Servers
 
 Servers running the toolkit that have opted into the public directory. Find them by **name** in the
-in-game server browser (Nuclear Option has no direct-connect).
+in-game server browser (Nuclear Option has no direct-connect). This list updates automatically every hour.
 
-👉 **[Browse the live community server directory](https://tomosbombos.github.io/nuclear-option-servers/)**
+<!-- COMMUNITY-SERVERS:START -->
+_Loading the live list…_ &nbsp; ([full directory ↗](https://tomosbombos.github.io/nuclear-option-servers/))
+<!-- COMMUNITY-SERVERS:END -->
 
-**Running a server?** Enable *List Server Publicly* in the command centre's settings to appear there —
+**Running a server?** Enable *List Server Publicly* in the command centre's settings to appear here —
 only your server's name, region, and plugin version are published (never your IP). Setup steps:
 [docs/SERVERS.md](docs/SERVERS.md).
 
