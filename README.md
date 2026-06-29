@@ -11,9 +11,43 @@ game's log + a relay + shared files, so any one can restart without taking the o
 
 ## Get started
 
-**Prerequisites:** [Python 3.8+](https://www.python.org/downloads/) (on Windows, tick
-*"Add Python to PATH"* during install). For the external / SFTP hosting options, also
-`pip install paramiko`.
+### Prerequisites — install these first
+
+You need **Python 3.8+**, the **paramiko** package, and (to clone) **Git**. Step by step:
+
+<details open>
+<summary><b>Windows</b></summary>
+
+1. **Python** — open <https://www.python.org/downloads/>, click **Download Python 3.x**, run the
+   installer, and on the first screen **tick "Add python.exe to PATH"**, then **Install Now**.
+   Open a *new* PowerShell window and check: `python --version`.
+2. **paramiko** (needed for the external / SFTP options): run `pip install paramiko`
+   (if `pip` isn't found, use `python -m pip install paramiko`).
+3. **Git** (for cloning — skip if you use *Download ZIP* below) — install from
+   <https://git-scm.com/download/win>, accept the defaults. Check: `git --version`.
+</details>
+
+<details>
+<summary><b>macOS</b></summary>
+
+```bash
+brew install python git      # or get Python from python.org and Git via: xcode-select --install
+pip3 install paramiko
+python3 --version && git --version
+```
+</details>
+
+<details>
+<summary><b>Linux (Debian/Ubuntu)</b></summary>
+
+```bash
+sudo apt update && sudo apt install -y python3 python3-pip git
+pip3 install paramiko
+python3 --version && git --version
+```
+</details>
+
+> Use `python` / `pip` on Windows, and `python3` / `pip3` on macOS & Linux.
 
 **1. Download the toolkit**
 
