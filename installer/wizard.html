@@ -39,9 +39,10 @@ code{background:#0a0f17;border:1px solid var(--bd);border-radius:5px;padding:1px
 </div>
 <script>
 const TOKEN="__TOKEN__";
-const S=["Welcome","Hosting","Connection","Features","Files","Review"];
+const S=["Welcome","Hosting","Server","Connection","Features","Files","Review"];
 let step=0;
 const state={scenario:"external_linux",connection:{},features:{},web_port:8770,power:"pterodactyl",
+  server:{mode:"install",dir:"",game_port:7777,query_port:7778,server_name:"",max_players:16,password:""},
   github_repo:"",channel:"stable",auto_check:false,catalogue:[],
   mode:"online",platformTarget:"",detected:null,offlineDir:""};
 async function api(path,body){const u=path+(path.indexOf('?')<0?'?':'&')+'t='+TOKEN;
@@ -80,10 +81,11 @@ async function render(){
       +'<label style="cursor:pointer;margin-left:14px"><input type="radio" name="mode" value="offline" '+(state.mode==='offline'?'checked':'')+' onchange="state.mode=\'offline\'"> Offline — I\'ll provide pre-downloaded files (from the official GitHubs)</label></div>'
       +'<div class="hint" style="margin-top:10px">You can change this later by re-running setup.</div></div>';
   }
-  else if(step===2){ renderConnection(p); }
-  else if(step===3){ await renderFeatures(p); }
-  else if(step===4){ await renderFiles(p); }
-  else if(step===5){ renderReview(p); }
+  else if(step===2){ renderServer(p); }
+  else if(step===3){ renderConnection(p); }
+  else if(step===4){ await renderFeatures(p); }
+  else if(step===5){ await renderFiles(p); }
+  else if(step===6){ renderReview(p); }
 }
 
 function renderConnection(p){
@@ -121,6 +123,50 @@ async function testSftp(btn){btn.disabled=true;$('#sftpmsg').textContent='testin
 async function testPanel(btn){btn.disabled=true;$('#panelmsg').textContent='testing…';const r=await api('/api/test-panel',state.connection);
   if(r.ok&&r.servers&&r.servers.length&&!state.connection.server_id){state.connection.server_id=r.servers[0].id;render();}
   $('#panelmsg').innerHTML=r.ok?'<span class="ok">✓ '+esc(r.info)+'</span>':'<span class="bad">✗ '+esc(r.error)+'</span>';btn.disabled=false;}
+
+function renderServer(p){
+  const sv=state.server, ext=(state.scenario==='external_linux');
+  const v=(k)=>esc(sv[k]==null?'':sv[k]);
+  let html='<div class="card">';
+  if(ext){
+    html+='<div class="hint">On a Pterodactyl host the panel installs the game binaries for you. Set your ports here — the installer writes them into <code>DedicatedServerConfig.json</code> (push it over SFTP / set in the panel).</div>';
+  }else{
+    html+='<label class="fl">Game server files</label><div class="row">'
+      +'<div class="opt '+(sv.mode==='install'?'sel':'')+'" onclick="state.server.mode=\'install\';render()"><b>Install for me</b><div class="hint">Download the official dedicated server via SteamCMD (Steam app 3930080). Needs internet + ~3–4 GB free.</div></div>'
+      +'<div class="opt '+(sv.mode==='existing'?'sel':'')+'" onclick="state.server.mode=\'existing\';render()"><b>I already have it</b><div class="hint">Point me at an existing dedicated-server folder.</div></div>'
+      +'</div>'
+      +'<label class="fl">'+(sv.mode==='existing'?'Existing server folder':'Install location')+'</label>'
+      +'<div class="row"><div style="flex:1"><input type="text" value="'+v('dir')+'" placeholder="C:\\\\NuclearOptionServer" oninput="state.server.dir=this.value"></div><button class="go" onclick="detectServer(this)">Detect</button></div>'
+      +'<div id="svMsg" class="msg"></div>'
+      +'<div class="row">'
+      +(sv.mode==='install'?'<button class="go" onclick="installServer(this)">Install server now (SteamCMD)</button> ':'')
+      +'<button onclick="checkServer(this)">Check '+(sv.mode==='install'?'install':'folder')+'</button> <span id="instMsg" class="msg"></span></div>';
+  }
+  html+='<hr style="border-color:var(--bd);margin:14px 0"><label class="fl">Ports</label>'
+    +'<div class="row"><div style="flex:1"><div class="hint">Game port (UDP)</div><input type="number" value="'+v('game_port')+'" oninput="state.server.game_port=this.value;portWarn()"></div>'
+    +'<div style="flex:1"><div class="hint">Query port (UDP) — must differ</div><input type="number" value="'+v('query_port')+'" oninput="state.server.query_port=this.value;portWarn()"></div></div>'
+    +'<div id="portMsg" class="msg"></div>'
+    +'<div class="hint">Open both in your firewall; forward them on your router for public play. The relay re-exposes the localhost command port on the query-port number (TCP).</div>'
+    +'<hr style="border-color:var(--bd);margin:14px 0">'
+    +'<label class="fl">Server name</label><input type="text" value="'+v('server_name')+'" placeholder="My Nuclear Option Server" oninput="state.server.server_name=this.value">'
+    +'<div class="row"><div style="flex:1"><label class="fl">Max players</label><input type="number" value="'+v('max_players')+'" oninput="state.server.max_players=this.value"></div>'
+    +'<div style="flex:2"><label class="fl">Password (optional)</label><input type="text" value="'+v('password')+'" placeholder="leave blank for a public server" oninput="state.server.password=this.value"></div></div>';
+  html+='</div>';
+  p.innerHTML=html; portWarn();
+}
+function portWarn(){const m=document.getElementById('portMsg');if(!m)return;
+  const eq=parseInt(state.server.game_port)===parseInt(state.server.query_port);
+  m.innerHTML=eq?'<span class="bad">✗ game port and query port must differ</span>':'';}
+async function detectServer(btn){btn.disabled=true;const m=document.getElementById('svMsg');m.textContent='detecting…';
+  let r;try{r=await api('/api/detect');}catch(e){r={};}btn.disabled=false;
+  if(r&&r.local_game_dir){state.server.dir=r.local_game_dir;render();}
+  else{m.innerHTML='<span class="warn">no local install detected — type the path manually</span>';}}
+async function installServer(btn){btn.disabled=true;const m=document.getElementById('instMsg');m.textContent='starting SteamCMD…';
+  let r;try{r=await api('/api/install-server',{dir:state.server.dir,platform:state.platformTarget});}catch(e){r={ok:false,error:String(e)};}
+  m.innerHTML=r.ok?'<span class="ok">'+esc(r.note)+'</span>':'<span class="bad">✗ '+esc(r.error)+'</span>';btn.disabled=false;}
+async function checkServer(btn){btn.disabled=true;const m=document.getElementById('instMsg');m.textContent='checking…';
+  let r;try{r=await api('/api/server-status?dir='+encodeURIComponent(state.server.dir||''));}catch(e){r={};}
+  m.innerHTML=r.present?'<span class="ok">✓ server found: '+esc(r.exe)+'</span>':'<span class="warn">not found yet — if SteamCMD is still downloading, wait and check again</span>';btn.disabled=false;}
 
 const PRESETS={
   full:{name:'Full community',set:{}},   // all defaults (everything on)
@@ -190,6 +236,7 @@ function renderReview(p){
   p.innerHTML='<div class="card"><b>Review</b>'
     +'<div class="row"><div style="flex:1"><label class="fl">Hosting</label>'+esc(state.scenario)+'</div>'
     +'<div style="flex:1"><label class="fl">Server</label>'+esc(state.scenario==='own_pc'?(c.local_game_dir||'(local)'):(c.sftp_host||'(not set)'))+'</div></div>'
+    +'<label class="fl">Server setup</label><div class="hint">'+esc(state.server.server_name||'(unnamed)')+' · ports game '+esc(state.server.game_port)+' / query '+esc(state.server.query_port)+' · '+esc(state.server.mode==='existing'?'existing install':(state.scenario==='external_linux'?'host-installed binaries':'SteamCMD install'))+(state.server.dir?(' · '+esc(state.server.dir)):'')+'</div>'
     +'<label class="fl">Features ON ('+on.length+')</label><div class="hint">'+on.map(esc).join(', ')+'</div>'
     +'<hr style="border-color:var(--bd);margin:14px 0">'
     +'<label class="fl">Updates (opt-in)</label><div class="hint">Connect a GitHub repo to pull plugin fixes by choice later. Leave blank to skip — you can add it anytime.</div>'

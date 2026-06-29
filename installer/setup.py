@@ -41,8 +41,10 @@ sys.path.insert(0, HERE)
 try:
     import fetcher as _fetcher        # manifest-driven source resolver/downloader
     import detect as _detect          # autodetect scenario + connectivity
+    import steamcmd as _steamcmd      # install/locate the dedicated server (SteamCMD)
+    import serverconfig as _serverconfig  # read/write DedicatedServerConfig.json (ports etc.)
 except Exception:                     # noqa: BLE001
-    _fetcher = _detect = None
+    _fetcher = _detect = _steamcmd = _serverconfig = None
 
 try:
     import paramiko                               # optional: only needed for SFTP scenarios
@@ -186,6 +188,7 @@ def _save(payload):
     scenario = payload.get("scenario", "external_linux")
     conn = payload.get("connection", {})
     features = payload.get("features", {})
+    srv = payload.get("server", {}) or {}          # the Server step (install/ports/name)
     # config.json — SAFE TO SHARE: no secrets.
     config = {
         "version": 1,
@@ -208,6 +211,17 @@ def _save(payload):
                    "channel": payload.get("channel", "stable"),
                    "auto_check": bool(payload.get("auto_check", False))},
     }
+    # fold in the Server step (ports / install location / name)
+    game_dir = (srv.get("dir") or conn.get("local_game_dir") or "").strip()
+    gp = int(srv.get("game_port") or 7777)
+    qp = int(srv.get("query_port") or 7778)
+    config["server"].update({
+        "game_port": gp, "query_port": qp,
+        "server_name": srv.get("server_name", ""),
+        "max_players": int(srv.get("max_players") or 16),
+        "install_mode": srv.get("mode", ""),       # install | existing
+        "game_dir": game_dir,
+    })
     # secrets.json — NEVER shared/committed (0600).
     secret = {
         "sftp_pass": conn.get("sftp_pass", ""),
@@ -222,7 +236,22 @@ def _save(payload):
             f.write(_render_plugin_cfg(features))
     except OSError:
         cfg_path = None
-    return {"ok": True, "config_path": CONFIG, "secrets_path": SECRETS, "cfg_path": cfg_path}
+    # write DedicatedServerConfig.json (ports/name/players) — always a ready-to-upload copy
+    # in the user dir, and directly into the game dir too when it's a local install.
+    dsc = []
+    if _serverconfig:
+        try:
+            p, _b = _serverconfig.write_config(USER_DIR, gp, qp, srv.get("server_name", ""),
+                                               srv.get("max_players") or 0, srv.get("password", ""))
+            dsc.append(p)
+            if game_dir and os.path.isdir(game_dir):
+                p2, _b2 = _serverconfig.write_config(game_dir, gp, qp, srv.get("server_name", ""),
+                                                     srv.get("max_players") or 0, srv.get("password", ""))
+                dsc.append(p2)
+        except ValueError as e:
+            dsc.append("PORTS INVALID: %s" % e)
+    return {"ok": True, "config_path": CONFIG, "secrets_path": SECRETS, "cfg_path": cfg_path,
+            "dedicated_config": dsc}
 
 
 def _api_plan(option):
@@ -272,6 +301,39 @@ def _api_fetch(payload):
         except Exception as e:                           # noqa: BLE001
             results.append({"id": dep_id, "ok": False, "note": str(e)})
     return {"option": option, "dest": dest, "results": results}
+
+
+def _platform():
+    if _detect:
+        try:
+            return _detect.platform_target()
+        except Exception:                                # noqa: BLE001
+            pass
+    return "win_x64" if sys.platform.startswith("win") else (
+        "linux_x64" if sys.platform.startswith("linux") else "unknown")
+
+
+def _api_install_server(payload):
+    """Install the official dedicated server via SteamCMD into the chosen folder.
+    Launches detached (new console / logfile) so the multi-GB download never blocks."""
+    if not (_steamcmd and _fetcher):
+        return {"ok": False, "error": "installer modules unavailable"}
+    install_dir = (payload.get("dir") or "").strip()
+    if not install_dir:
+        return {"ok": False, "error": "choose an install folder first"}
+    plat = str(payload.get("platform") or _platform())
+    platform = "windows" if plat.startswith("win") else "linux"
+    try:
+        sc = _steamcmd.ensure_steamcmd(os.path.join(USER_DIR, "steamcmd"), platform, _fetcher)
+        if not sc:
+            return {"ok": False, "error": "could not download/locate SteamCMD"}
+        cmd, where = _steamcmd.launch_install(sc, install_dir)
+        note = ("SteamCMD launched in a new console window. " if where == "console"
+                else "SteamCMD launched (logging to %s). " % where)
+        return {"ok": True, "cmd": " ".join(cmd), "where": where,
+                "note": note + "It downloads several GB — when it finishes, click 'Check install'."}
+    except Exception as e:                               # noqa: BLE001
+        return {"ok": False, "error": str(e)}
 
 
 # ----------------------------- HTTP server -----------------------------
@@ -324,6 +386,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             from urllib.parse import urlparse, parse_qs
             opt = (parse_qs(urlparse(self.path).query).get("option") or [""])[0]
             return self._send(200, json.dumps(_api_offline_list(opt)))
+        if path == "/api/server-status":
+            from urllib.parse import urlparse, parse_qs
+            d = (parse_qs(urlparse(self.path).query).get("dir") or [""])[0]
+            exe = _steamcmd.server_exe(d) if _steamcmd else ""
+            return self._send(200, json.dumps({"dir": d, "present": bool(exe), "exe": exe}))
         return self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):
@@ -344,6 +411,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps(_save(payload)))
         if path == "/api/fetch":
             return self._send(200, json.dumps(_api_fetch(payload)))
+        if path == "/api/install-server":
+            return self._send(200, json.dumps(_api_install_server(payload)))
         return self._send(404, json.dumps({"error": "not found"}))
 
 
