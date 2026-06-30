@@ -108,7 +108,8 @@ def build_block(servers):
     head = "<p><b>%d server%s</b> running the community toolkit</p>" % (n, "" if n == 1 else "s")
     table = ("<table>\n<tr><th>Server</th><th>Region</th><th>Plugin</th></tr>\n"
              + "\n".join(rows) + "\n</table>")
-    return '<div align="center">\n' + head + "\n" + table + "\n</div>"
+    foot = '<p>▶ <a href="%s"><b>Live directory</b></a> — real-time status</p>' % DIR_URL
+    return '<div align="center">\n' + head + "\n" + table + "\n" + foot + "\n</div>"
 
 
 def main():
