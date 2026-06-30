@@ -198,13 +198,15 @@ Servers running the toolkit that have opted into the public directory. Find them
 in-game server browser (Nuclear Option has no direct-connect). This list updates automatically every hour.
 
 <!-- COMMUNITY-SERVERS:START -->
-**1 server** running the toolkit &nbsp; ([full directory ↗](https://tomosbombos.github.io/nuclear-option-servers/))
 
-<a href="https://gamemonitoring.net/nuclear-option/servers/11798637"><img src="https://widgets.gamemonitoring.net/servers/11798637/560x95.webp?ts=20260630" width="560" alt="Tomo's Co-Op/PvP Mission Vote | OCE | 60hz | Ranked | no-TKs — live status on gamemonitoring.net"></a>
+<div align="center">
+<p><b>1 server</b> running the community toolkit</p>
+<table>
+<tr><th>Server</th><th>Region</th><th>Plugin</th></tr>
+<tr><td><a href="https://gamemonitoring.net/nuclear-option/servers/11798637"><img src="https://widgets.gamemonitoring.net/servers/11798637/560x95.webp?ts=20260630" width="560" alt="Tomo's Co-Op/PvP Mission Vote | OCE | 60hz | Ranked | no-TKs"></a></td><td>Oceania</td><td>v0.9.21</td></tr>
+</table>
+</div>
 
-| Server | Region | Plugin |
-|---|---|---|
-| Tomo's Co-Op/PvP Mission Vote \| OCE \| 60hz \| Ranked \| no-TKs | Oceania | v0.9.14 |
 <!-- COMMUNITY-SERVERS:END -->
 
 **Running a server?** Enable *List Server Publicly* in the command centre's settings to appear here —
