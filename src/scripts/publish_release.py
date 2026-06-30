@@ -83,8 +83,9 @@ def _tag_for(channel, version, date):
 
 
 def _changelog_section(channel, version):
-    """Pull the matching section body from CHANGELOG.md (in repo root), or '' if absent.
-    Nightly prefers [Unreleased]; stable prefers [<version>]; each falls back to the other."""
+    """Pull the [<version>] section body from CHANGELOG.md (repo root), or '' if absent.
+    Only released versions are documented there, so a nightly of an as-yet-unreleased version
+    returns '' — we never present unreleased work as a finished changelog."""
     import re as _re
     path = os.path.join(ROOT, "CHANGELOG.md")
     if not os.path.exists(path):
@@ -92,19 +93,15 @@ def _changelog_section(channel, version):
     with open(path, encoding="utf-8") as f:
         text = f.read()
     base = version.lstrip("v").split("-nightly")[0]
-    order = ["Unreleased", base] if channel == "nightly" else [base, "Unreleased"]
-    for key in order:
-        m = _re.search(r"(?m)^##\s*\[%s\][^\n]*\n" % _re.escape(key), text)
-        if not m:
-            continue
-        start = m.end()
-        nxt = _re.search(r"(?m)^##\s+", text[start:])
-        body = (text[start: start + nxt.start()] if nxt else text[start:]).strip()
-        # trim a trailing horizontal-rule/footer that belongs after the last section
-        body = _re.split(r"(?m)^---\s*$", body)[0].strip()
-        if body:
-            return body
-    return ""
+    m = _re.search(r"(?m)^##\s*\[%s\][^\n]*\n" % _re.escape(base), text)
+    if not m:
+        return ""
+    start = m.end()
+    nxt = _re.search(r"(?m)^##\s+", text[start:])
+    body = (text[start: start + nxt.start()] if nxt else text[start:]).strip()
+    # trim a trailing horizontal-rule/footer that belongs after the last section
+    body = _re.split(r"(?m)^---\s*$", body)[0].strip()
+    return body
 
 
 def _notes(channel, version, date, signed):

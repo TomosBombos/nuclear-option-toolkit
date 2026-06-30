@@ -1,61 +1,52 @@
 # Nuke-Option — Community Server Toolkit
 
-This feature set is for those wanting to easily manage their dedicated servers with some additional features that add a ranking system, improve performance and moderation tools. As well as some other things like a live map because why not?
+A toolkit for running a Nuclear Option dedicated server with more to offer your players. It adds persistent ranks, skill-based team balancing, moderation, performance limits, and a live battle map you run from your browser.
 
-It's three cooperating pieces — a server-side **plugin** (BepInEx/Harmony), a **bot** that
-runs on your PC, and a **web command centre** in your browser. They talk only through the
-game's log, a relay, and shared files, so any one can restart without taking the others down.
+It's three parts that work together: a server-side **plugin** (BepInEx/Harmony), a **bot** on your PC, and a **web command centre** in your browser. They talk through the game log, a relay, and shared files, so any one can restart without taking the others down.
+
+> 💬 **Questions or ideas?** Join the community on **[Discord](https://discord.gg/B46h4Dd7uj)**. Suggestions and feedback are welcome.
 
 ## ⬇️ Download — pick your server type
 
-Each download is a ready-to-go folder with **everything inside** — BepInEx, the NukeStats
-plugin, all 18 missions, the bot, and the web command centre. Grab the one that matches how
-your server is hosted, unzip it, and run the installer inside it. The installer asks for your
-details (each field explains **what it is** and **where to find it**) and wires everything up.
+Each download is a ready-to-go folder with everything inside: BepInEx, the NukeStats plugin, every built-in mission plus the extra maps we've tested on our dev server, the bot, and the web command centre. Grab the one that matches how your server is hosted, unzip it, and run the installer inside. The installer asks for your details (each field explains **what it is** and **where to find it**) and wires everything up.
 
-> **Which is tested?** ✅ **Pterodactyl is working and tested end-to-end.** ⚠️ The **Local**
-> (own-PC) and **Manual** (drag-and-drop) options are built but only lightly tested so far —
-> they should work, but expect rough edges and please report anything that doesn't.
+> **Which is tested?** ✅ **Pterodactyl is working and tested end-to-end.** ⚠️ The **Local** (own-PC) and **Manual** (drag-and-drop) options are built but only lightly tested. They should work, but expect rough edges, and please report anything that doesn't.
 
 | Your setup | Status | Download | What you do |
 |---|---|---|---|
-| **Pterodactyl panel** (hosted Linux) | ✅ Working | **[⬇ Pterodactyl bundle](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-pterodactyl.zip)** | Unzip → run `install.bat` (or `./install.sh`) → enter your panel's SFTP + API details → it pushes the plugin, missions and config to your server over SFTP and makes it boot modded. Then launch the bot + dashboard. |
-| **Your own PC** (Windows / Linux) | ⚠️ Beta (lightly tested) | **[⬇ Local bundle](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-local.zip)** | Unzip → run `install.bat` → it installs the dedicated server (SteamCMD), copies the toolkit in, and launches server + bot + dashboard together. |
-| **Hosting by hand / other** | ⚠️ Beta (lightly tested) | **[⬇ Manual bundle](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-manual.zip)** | Unzip → follow `README.md` to drag the files into place (both BepInEx packs included); the installer writes your config. |
+| **Pterodactyl panel** (hosted Linux) | ✅ Working | **[⬇ Pterodactyl bundle](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-pterodactyl.zip)** | Unzip, run `install.bat` (or `./install.sh`), enter your panel's SFTP and API details. It pushes the plugin, missions, and config over SFTP and makes the server boot modded. Then launch the bot and dashboard. |
+| **Your own PC** (Windows / Linux) | ⚠️ Beta (lightly tested) | **[⬇ Local bundle](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-local.zip)** | Unzip, run `install.bat`. It installs the dedicated server with SteamCMD, copies the toolkit in, and launches server, bot, and dashboard together. |
+| **Hosting by hand / other** | ⚠️ Beta (lightly tested) | **[⬇ Manual bundle](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-manual.zip)** | Unzip, follow `README.md` to drop the files into place (both BepInEx packs are included). The installer writes your config. |
 
 > All downloads live on the **[Releases page](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest)**.
 
 ### How to run the installer
 
-1. **Install Python 3.8+** if you don't have it — <https://www.python.org/downloads/>. On Windows,
-   tick **“Add python.exe to PATH”** in the installer.
+1. **Install Python 3.8+** if you don't have it: <https://www.python.org/downloads/>. On Windows, tick **"Add python.exe to PATH"** in the installer.
 2. **Download** the ZIP for your server type (above) and **unzip it** anywhere.
 3. **Run the installer** from inside the unzipped folder:
    - **Windows** — double-click **`install.bat`**
    - **macOS / Linux** — run **`./install.sh`** in a terminal
-   - *(either way it just runs `python installer/setup.py` — you can run that directly too)*
-4. A setup **wizard opens in your browser**. Work through it — every field explains **what it is**
-   and **where to find it** — then it wires everything up and you launch your server + dashboard.
+   - *(Either way it runs `python installer/setup.py`. You can run that directly too.)*
+4. A **wizard opens in your browser**. Work through it. Every field explains what it is and where to find it. Then it wires everything up and you launch your server and dashboard.
 
-That's it. There's nothing to install globally and no config to hand-edit; the wizard does it all.
-(Cloning the repo instead of downloading a bundle? See **[Get started](#get-started)** below.)
+That's it. Nothing installs globally, and there's no config to hand-edit. The wizard does it all. (Cloning the repo instead of downloading a bundle? See **[Get started](#get-started)** below.)
 
 ## What it does
 
-- **Ranks & economy** — lifetime points from real in-game score + win/placement bonuses, 11 ranks, fully audited ledgers.
-- **NuclearSkill** — a points-per-life skill rating (`!skill`), used to balance teams fairly.
-- **Team balance (PvP)** — keeps sides even; protects new joiners and **`!squadup`** friend groups; moves the player who best evens the skill totals.
-- **Anti-grief & moderation** — automated teamkill enforcement (warn → kick → ban), bans, votekick, and a network flood guard that stopped a recurring match-start mass-disconnect.
-- **AI limiter** — caps AI aircraft and clears stuck ones for performance; never touches players.
-- **Live map + web command centre** — pan/zoom battle map with player/AI/ship blips, power control, a map-change button, scheduling, and a **⚙ Settings menu to change any plugin setting live**.
-- **More** — map voting, chat rank tags, profanity filter, forfeit votes, a server-message manager, PvE timeout rules, and an opt-in **global cross-server leaderboard**.
+- **Ranks & economy** — Lifetime ranks that reward time and scoring. Play and score across matches to climb an 11-rank ladder. Points come from your real in-game score plus win, placement, and kill bonuses. The bot owns the data and backs it up daily.
+- **NuclearSkill** — A separate skill rating for how well you fly: scoring on a sortie and getting home without being shot down. It's what team balance uses, not your rank. Check it with `!skill`.
+- **Team balance (PvP)** — Keeps PvP sides even. It protects new joiners and `!squadup` groups, and moves the player who best evens out the skill between teams.
+- **Anti-grief & moderation** — Automated teamkill punishment (warn → kick → ban), bans, vote-kick, and a network flood guard that stopped a recurring match-start mass-disconnect.
+- **AI limiter** — Caps AI aircraft and clears stuck ones to protect framerate. It only ever removes AI, never players.
+- **Live map & command centre** — A pan/zoom battle map with player, AI, and ship blips. Change maps, schedule restarts, control server power, and edit any plugin setting live.
+- **More** — Map voting, chat rank tags, a slur filter, forfeit votes, a server-message manager, PvE timeout rules, and an opt-in public server directory.
 
-→ Full plain-English tour: **[docs/FEATURES.md](docs/FEATURES.md)**
+→ Full tour, feature by feature: **[docs/FEATURES.md](docs/FEATURES.md)**
 
 ## Preview — the web command centre
 
-Run your whole server from one browser dashboard: a live battle map, killfeed, persistent ranks &
-skill, chat + console, map voting, scheduling, and one-click power.
+One browser tab runs the whole server: live map, kill feed, ranks and skill, chat, console, map voting, scheduling, and power.
 
 ![Web command centre](docs/preview/header.png)
 
@@ -73,12 +64,12 @@ skill, chat + console, map voting, scheduling, and one-click power.
 
 | Doc | What it covers |
 |---|---|
-| **[docs/FEATURES.md](docs/FEATURES.md)** | What every feature does and why — in plain English |
-| **[docs/COMMANDS.md](docs/COMMANDS.md)** | Every command & tool: players, admins, the web console, the CLI |
-| **[docs/MODERATION.md](docs/MODERATION.md)** | Teamkill enforcement, anti-grief auto-kick, bans, votekick, reports |
-| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | How the three processes fit together — overview up top, deep technical reference below |
-| **[SECURITY.md](SECURITY.md)** | Update signing (minisign) + the credential/secrets stance |
-| **[CHANGELOG.md](CHANGELOG.md)** | What changed in each release (nightly + stable) |
+| **[docs/FEATURES.md](docs/FEATURES.md)** | Every feature and setting, and what each is for |
+| **[docs/COMMANDS.md](docs/COMMANDS.md)** | Every command and tool: players, admins, the web console, the CLI |
+| **[docs/MODERATION.md](docs/MODERATION.md)** | Teamkill enforcement, anti-grief auto-kick, bans, vote-kick, reports |
+| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | How the three parts fit together — overview up top, deep technical reference below |
+| **[SECURITY.md](SECURITY.md)** | Update signing (minisign) and the credentials stance |
+| **[CHANGELOG.md](CHANGELOG.md)** | What changed in each release |
 
 ## Get started
 
@@ -116,7 +107,7 @@ python3 --version && git --version
 ```
 </details>
 
-> Use `python` / `pip` on Windows, and `python3` / `pip3` on macOS & Linux.
+> Use `python` / `pip` on Windows, and `python3` / `pip3` on macOS and Linux.
 
 **2. Download the toolkit**
 
@@ -132,27 +123,27 @@ terminal in the extracted folder.
 ```bash
 python src/installer/setup.py
 ```
-(On Windows you may need `py src\installer\setup.py`.) A wizard opens in your browser: it checks
-prerequisites, asks where your server runs, takes your connection details, sets a few options,
-and writes a clean config. **Your credentials stay on your machine and never enter the repo.**
+(On Windows you may need `py src\installer\setup.py`.) A wizard opens in your browser. It checks
+prerequisites, asks where your server runs, takes your connection details, sets a few options, and
+writes a clean config. **Your credentials stay on your machine and never enter the repo.**
 More detail: **[src/installer/README.md](src/installer/README.md)**.
 
 > Prefer to wire it up by hand? In `src/`, copy `run.bat.example` → `run.bat`,
 > `apiKey.txt.example` → `apiKey.txt`, `panel.txt.example` → `panel.txt`, fill in your values,
 > then run `run.bat`.
 
-> **Building the plugin from source** requires the game's managed assemblies
-> (`src/NukeStats/libs/`), which you supply from your own game install — they are not
+> **Building the plugin from source** needs the game's managed assemblies
+> (`src/NukeStats/libs/`), which you supply from your own game install. They are not
 > distributed here.
 
-> ⚠️ **Early / iterating.** The guided installer is under active development. If a step
-> doesn't yet complete end-to-end on your setup, the manual path above works — please
-> [open an issue](https://github.com/TomosBombos/nuclear-option-toolkit/issues) with what
-> you hit so we can harden it.
+> ⚠️ **Early and iterating.** The guided installer is under active development. If a step doesn't
+> complete end-to-end on your setup, the manual path above works. Please
+> [open an issue](https://github.com/TomosBombos/nuclear-option-toolkit/issues) with what you hit
+> so we can harden it.
 
 ## Updating
 
-You're never auto-updated — you update when *you* want to. Two ways:
+You're never auto-updated. You update when *you* want to. Two ways:
 
 ### Easy way — re-download and re-run the installer
 
@@ -162,25 +153,25 @@ You're never auto-updated — you update when *you* want to. Two ways:
    - ⬇ **[Manual](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest/download/nuclear-option-toolkit-manual.zip)**
    - *(These links always point at the current **stable**. All versions: the [Releases page](https://github.com/TomosBombos/nuclear-option-toolkit/releases/latest).)*
 2. **Unzip it.**
-3. **Run the installer again** — `install.bat` (Windows) or `./install.sh` (macOS/Linux). It re-deploys the new plugin + bot and restarts. Your config, ranks and settings are kept.
+3. **Run the installer again** — `install.bat` (Windows) or `./install.sh` (macOS/Linux). It re-deploys the new plugin and bot and restarts. Your config, ranks, and settings are kept.
 
 ### In-place way — pull just the changed files (no re-download)
 
-Run these from a terminal opened **inside your toolkit folder** — the folder you unzipped, the one
-that contains `install.bat`, the `installer` folder, and `START EVERYTHING.bat`.
-*(On Windows: open that folder in File Explorer, click the address bar, type `powershell`, press Enter — that opens a terminal already in the folder.)*
+Run these from a terminal opened **inside your toolkit folder** — the one that contains
+`install.bat`, the `installer` folder, and `START EVERYTHING.bat`.
+*(On Windows: open that folder in File Explorer, click the address bar, type `powershell`, press Enter. That opens a terminal already in the folder.)*
 
 1. **See what's available** on your channel:
    ```
    python installer\updater.py check
    ```
-2. **Download + verify + stage** it (it checks the SHA-256 and the signature before staging anything):
+2. **Download, verify, and stage** it (it checks the SHA-256 and the signature before staging anything):
    ```
    python installer\updater.py update --component all
    ```
-3. **Apply it** — nothing on your server changes until this step:
-   - **Plugin** → deploy it: `run.bat --deploy-plugin` (Pterodactyl/external — `run.bat` is in this same folder), or just restart your server (local PC).
-   - **Bot** → install the new bot file:
+3. **Apply it.** Nothing on your server changes until this step:
+   - **Plugin** — deploy it with `run.bat --deploy-plugin` (Pterodactyl/external; `run.bat` is in this same folder), or just restart your server (local PC).
+   - **Bot** — install the new bot file:
      ```
      python installer\updater.py update --component bot --apply
      ```
@@ -188,37 +179,29 @@ that contains `install.bat`, the `installer` folder, and `START EVERYTHING.bat`.
 
 *(macOS/Linux: use `/` instead of `\`. From a git clone rather than a downloaded bundle, the path is `src/installer/updater.py`.)*
 
-**Channel:** in `~/.nuke-option-toolkit/config.json` set `update.channel` to `"stable"` (default —
+**Channel:** in `~/.nuke-option-toolkit/config.json` set `update.channel` to `"stable"` (default,
 polished releases) or `"nightly"` (latest build, less tested). Every download is signature-checked
-before it can be applied — see **[SECURITY.md](SECURITY.md)**.
+before it can be applied. See **[SECURITY.md](SECURITY.md)**.
 
 ## Community Servers
 
-Servers running the toolkit that have opted into the public directory. Find them by **name** in the
-in-game server browser (Nuclear Option has no direct-connect). This list updates automatically every hour.
+Servers running the toolkit that have opted into the public directory. Nuclear Option has no
+direct-connect, so find them by **name** in the in-game server browser. This list updates every hour.
 
 <!-- COMMUNITY-SERVERS:START -->
-
-<div align="center">
-<p><b>1 server</b> running the community toolkit</p>
-<table>
-<tr><th>Server</th><th>Region</th><th>Plugin</th></tr>
-<tr><td><a href="https://gamemonitoring.net/nuclear-option/servers/11798637"><img src="https://widgets.gamemonitoring.net/servers/11798637/560x95.webp?ts=20260630" width="560" alt="Tomo's Co-Op/PvP Mission Vote | OCE | 60hz | Ranked | no-TKs"></a></td><td>Oceania</td><td>v0.9.21</td></tr>
-</table>
-<p>▶ <a href="https://tomosbombos.github.io/nuclear-option-servers/"><b>Live directory</b></a> — real-time status</p>
-</div>
-
+_Loading the live list…_ &nbsp; ([full directory ↗](https://tomosbombos.github.io/nuclear-option-servers/))
 <!-- COMMUNITY-SERVERS:END -->
 
-**Running a server?** Enable *List Server Publicly* in the command centre's settings to appear here —
-only your server's name, region, and plugin version are published (never your IP). Setup steps:
+**Running a server?** Turn on *List Server Publicly* in the command centre's settings to appear here.
+Only your server's name, region, and plugin version are published, never your IP. Setup steps:
 [docs/SERVERS.md](docs/SERVERS.md).
 
 ## 💬 Community & feedback
 
-Have an idea, a feature request, or just want to chat about running a server?
-**[Join the Discord](https://discord.gg/B46h4Dd7uj)** — suggestions and feedback are very welcome.
-You can also [open an issue](https://github.com/TomosBombos/nuclear-option-toolkit/issues) for bugs or concrete proposals.
+Got an idea, a feature request, or just want to talk about running a server?
+**[Join the Discord](https://discord.gg/B46h4Dd7uj)**. Suggestions and feedback are welcome. You can
+also [open an issue](https://github.com/TomosBombos/nuclear-option-toolkit/issues) for bugs or
+concrete proposals.
 
 ## License
 
@@ -226,9 +209,10 @@ See [`LICENSE`](LICENSE) — GPL-3.0-or-later.
 
 ## Planned features
 
-On the roadmap — not built yet, but where the toolkit is headed:
+On the roadmap. Not built yet, but where the toolkit is headed:
 
-- **Config-file setup without the web command centre** — a mode where the plugin and bot are configured entirely from a config file instead of the web command centre, for people who already run their own server solution and just want the plugin + bot.
-- **Multiple plugins at once** — let the launcher load and manage several plugins running on a server simultaneously, not just the toolkit's own.
-- **Everything customisable** — make every feature configurable and changeable, not only the ones surfaced today.
-- **Ongoing polish & accessibility** — keep refining the UI and making the whole feature set easier to pick up and use.
+- **Config-file setup without the web command centre** — configure the plugin and bot entirely from a config file, for people who already run their own server and just want the plugin and bot.
+- **Multiple plugins at once** — let the launcher load and manage several plugins on a server at the same time, not only the toolkit's own.
+- **Everything customisable** — make every feature configurable, not only the ones surfaced today.
+- **Ongoing polish** — keep refining the UI and making the whole toolkit easier to pick up.
+</content>

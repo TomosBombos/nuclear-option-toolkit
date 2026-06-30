@@ -2,7 +2,7 @@
 
 This page explains how the toolkit fits together. **It's layered:** a plain-English overview
 first, then the full technical reference in [Part II](#part-ii--technical-reference) (exact
-hooks, algorithms, and data contracts). To learn what each feature *does* rather than how it's
+hooks, algorithms, and data contracts). For what each feature *does* rather than how it's
 wired, see **[FEATURES.md](FEATURES.md)**; for the command list, **[COMMANDS.md](COMMANDS.md)**.
 
 > **Plugin version:** `anz.nukestats` `0.9.14` (the `[BepInPlugin]` attribute is authoritative).
@@ -346,7 +346,7 @@ A single-threaded, self-healing Python daemon. Its `main()` loop is a 3-state ma
 **What:** Answers `!rank`, `!skill`, `!points`, `!leaderboard`, `!why`, `!help`, `!balance`, `!notk`, `!votemap` (plus `!y`/`!n` and `!1..!6` tokens). Replies are routed to all-chat.
 **How:** Each parsed chat line is lowercased and matched against literal command strings. `whisper()` sends via `send-chat-message` (not `rc.say`, to avoid double-logging) and logs one `[BOT]` activity line. `!rank` uses `rank_progress()`; `!skill` uses skill rating/ranking; `!points` shows `curLife` vs `lastLife`; `!why` dumps `recent_ledger_for(4)` (`:2219-2540`).
 **Config:** `WHISPER_VIA_TELL=False`.
-**Why:** `whisper` deliberately routes to all-chat because the plugin `tell` command no-ops on v0.7.4. **Note:** `!squadup` is advertised in `help_lines` but has no handler in the bot — it is plugin-side. Replies sanitize `|` to `/` so they can't break the pipe-delimited `plugin_cmd` protocol.
+**Why:** `whisper` deliberately routes to all-chat because the plugin `tell` command no-ops on v0.7.4. **Note:** `!squadup` is advertised in `help_lines` but has no handler in the bot — it is plugin-side. Replies sanitise `|` to `/` so they can't break the pipe-delimited `plugin_cmd` protocol.
 
 #### Welcome system (5s delayed queue)
 **What:** Welcomes each player once per session ~5s after first seen, showing rank + points (and an `!help` nudge for new pilots), and logs joins/leaves. A quick join/leave produces no welcome.
@@ -405,7 +405,7 @@ A single-threaded, self-healing Python daemon. Its `main()` loop is a 3-state ma
 #### Daily plugin-deploy pipeline (`deploy_plugin_job`)
 **What:** The guarded daily job that stages a new BepInEx DLL (only if changed) and restarts the server so the new DLL loads, never knowingly leaving the server offline.
 **How:** Takes a 15-min stale-guarded lock (`pending_plugin.dll.lock`). Computes sha256 of `pending_plugin.dll` vs `deployed_plugin.sha256`. If updating, uploads the DLL FIRST while still up via atomic SFTP put-to-tmp + `posix_rename` over `BepInEx/plugins/NukeStats.dll` (mmap-safe). Then power-cycles: `stop` → poll `_pt_state` for offline (~90s) → `start` → poll `_relay_alive()` (~120s). On relay-verified success it writes `deployed_plugin.sha256` + `deployed_plugin.json` and archives the DLL. **Guardrail:** from the stop onward, every failure path force-sends START (`:3089-3210`).
-**Why:** BepInEx has no hot-reload, so a DLL swap requires a process restart. Upload-before-stop minimizes the window. The relay is the authoritative serving check; the force-START guardrail is the central safety invariant.
+**Why:** BepInEx has no hot-reload, so a DLL swap requires a process restart. Upload-before-stop minimises the window. The relay is the authoritative serving check; the force-START guardrail is the central safety invariant.
 
 #### 05:00 Windows Scheduled Task + `deploy.bat`
 **What:** Fires the deploy pipeline automatically every day at 05:00 AEST (low-traffic).
@@ -512,10 +512,10 @@ A Flask backend on `127.0.0.1:8770` serving a single-page admin dashboard. The w
 **How:** `renderAir(st.air)` reads `{s:[{n,ai,pl}], ai,pl,totcap,teamcap}`; sorts sides by faction name to stop dictionary-order chip jitter (`webcc.html:555-570`).
 **Why:** Fixed side ordering is deliberate — the plugin emits sides in dictionary order which flips between ticks.
 
-#### Command bar — input, autocomplete, palette, `/api/commands` catalog
+#### Command bar — input, autocomplete, palette, `/api/commands` catalogue
 **What:** A command input with context-aware autocomplete (Tab/arrows/Enter), an output log, and an "≡ all commands" palette listing every server + bot/local command with args/desc and a danger marker.
 **How:** `/api/commands` = `_catalog()` = the bot's `CENTRE_SERVER_CMDS` (minus raw `say`, replaced by the local say that adds `[Admin]` + activity mirror) tagged `group:'server'`, plus `_LOCAL_CMDS` tagged `group:'bot'`, each with an `ac` autocomplete hint (mission/player/steamid/pf/pn). `suggestions()` drives the dropdown (`cc_web.py:159-191`, `webcc.html:740-800`).
-**Why:** The catalog merges live wire commands with synthetic local ones so one bar covers both relay RPCs and bot-queued actions. Dropping raw `say` avoids a duplicate without the `[Admin]` prefix/mirror.
+**Why:** The catalogue merges live wire commands with synthetic local ones so one bar covers both relay RPCs and bot-queued actions. Dropping raw `say` avoids a duplicate without the `[Admin]` prefix/mirror.
 
 #### Change-Map button + modal
 **What:** A header button opening a searchable mission picker that ENDS the current match and cuts over immediately (without the auto map-vote overriding it).
@@ -533,37 +533,37 @@ A Flask backend on `127.0.0.1:8770` serving a single-page admin dashboard. The w
 
 A baked terrain atlas generated offline from in-game grid screenshots, calibrated to the game's own printed grid labels, that the web CC pans/zooms over while drawing a live `a1..p` grid plus blips fed by the plugin's `pos`/`air`/`ent` telemetry.
 
-#### Terrain atlas + PNG generation (`build_map_atlas.py`)
+### Terrain atlas + PNG generation (`build_map_atlas.py`)
 **What:** Offline build that turns the two source screenshots (`map-build/heartland.png`, `map-build/ignus.png`) into the runtime artifacts: a clean green-on-black PNG per map (`heartland_map.png` / `ignus_map.png` in ROOT) and `map_atlas.py` (an `ATLAS` dict of name, cols/rows, calibrated bounds, `xmin/cell/znorth`, base catalogue, and a coarse `terr` grid for the legacy TUI).
-**How:** `main()` loops `MAPS`, calls `build_terrain(m)` which opens the screenshot, calibrates via `label_calibrate.calibrate()`, computes a per-pixel greenness map, optionally strips/de-artifacts the baked grid, downsamples, removes specks/thin lines, and renders a recolored RGBA PNG. Outputs are written to ROOT where cc_web/bot read them (`build_map_atlas.py:210-410`).
+**How:** `main()` loops `MAPS`, calls `build_terrain(m)` which opens the screenshot, calibrates via `label_calibrate.calibrate()`, computes a per-pixel greenness map, optionally strips/de-artifacts the baked grid, downsamples, removes specks/thin lines, and renders a recoloured RGBA PNG. Outputs are written to ROOT where cc_web/bot read them (`build_map_atlas.py:210-410`).
 **Why:** Rebuild with `python map-build\build_map_atlas.py`. The `terr` ASCII grid is kept only for the legacy TUI, not the web map.
 
-#### Per-map calibration pinned to printed grid labels
+### Per-map calibration pinned to printed grid labels
 **What:** Establishes the exact pixel↔world affine transform per screenshot by reading the game's OWN printed row letters (E..L) and column numbers in the margins. This is what makes blips, bases and the grid line up with real game coordinates.
 **How:** `label_calibrate.detect_labels()` scans margins for near-white text, clusters runs, takes weighted centroids; `calibrate()` least-squares-fits `z = az*py + bz` (row E = grid index 4) and `x = ax*px + bx` (col 4..); bounds `x0=bx, x1=ax*W+bx, z0=bz, z1=az*H+bz` (`label_calibrate.py:38-84`).
 **Why:** PER-MAP `xmin` is load-bearing and differs: Heartland col1 = `xmin -70000` (verified by 12 airbase refs); Ignus is wider, col1 = `xmin -110000` (verified via Broken Atoll world x). Calibration validated against a RANSAC ground-truth fit.
 
-#### Faithful green-on-black terrain render
+### Faithful green-on-black terrain render
 **What:** Produces a clean topographic PNG keeping green where the source is green and black where it is water/void — deliberately NOT solid-filling the interior — and strips the screenshot's baked grid/labels/markers so the web map draws its own grid.
-**How:** `greenness()` computes per-pixel green-dominance; non-green (water, UI, markers) reads 0. The work map is downsampled taking the brightest green per cell; components/specks and thin line-fragments removed via BFS; a final recolor maps `g<=18 → WATER (6,13,22)` and ramps brighter greens (`build_map_atlas.py:106-332`).
+**How:** `greenness()` computes per-pixel green-dominance; non-green (water, UI, markers) reads 0. The work map is downsampled taking the brightest green per cell; components/specks and thin line-fragments removed via BFS; a final recolour maps `g<=18 → WATER (6,13,22)` and ramps brighter greens (`build_map_atlas.py:106-332`).
 **Why:** Two grid-removal strategies coexist: Heartland uses `strip_grid=True` (detect+interpolate the real baked grid lines) plus optional morphological deartifact; Ignus is left on the ORIGINAL filter path so its already-perfect render stays byte-for-byte identical.
 
-#### Base catalogue (12 Heartland refs + Ignus detected/admin bases)
+### Base catalogue (12 Heartland refs + Ignus detected/admin bases)
 **What:** Populates each atlas's `bases` list — faction-coloured airfield/heliport rings. Heartland uses 12 exact admin-supplied grid refs (ground truth); Ignus auto-detects coloured markers and adds admin-supplied bases the detector misses.
 **How:** `bases_for()` branches on map key. Heartland: `HEART_BASES` (12 entries) → `ref_world()`. Ignus: `analyze_maps.detect()` finds yellow (Primeva)/purple (Boscali) markers, converted to world; `drop_refs={'H5','H18'}` excludes two SHIPS mis-detected as airbases; `IGNUS_EXTRA` admin bases decoded via `decode_ref()` (`build_map_atlas.py:355-378`).
 **Why:** Heartland refs are admin ground truth so bases are placed exactly. Feldspar International was moved from the cell centre (over water) to its actual airfield SW of centre, rendered Neutral (grey).
 
-#### Grid system (a1..p major + 10×10 minor)
+### Grid system (a1..p major + 10×10 minor)
 **What:** A hierarchical grid drawn live over the terrain: major cells A1..P{gcols} (rows A..P = 16) each subdividing into a 10×10 minor grid shown only when zoomed in. Terrain + pips occupy the exact calibrated sub-region while the grid is roamable out to the full map extent.
 **How:** Atlas stores `xmin/cell(10000)/znorth(80000)/gcols`. webcc derives the full extent `ext()` from `xmin + gcols*cell`; `grid_ref()` maps world→major label; `drawMinorGrid()` renders the sub-grid past a zoom threshold (`build_map_atlas.py:33-41`, `webcc.html:339-518`).
 **Why:** `gcols` = the FULL in-game grid width (Heartland 15, Ignus 23) so the web map can pan/zoom OUT to the whole extent even though terrain+pips stay at their calibrated sub-region (cols 4–11 Heartland / 4–19 Ignus).
 
-#### Plugin `pos`/`air`/`ent` telemetry → live coordinates
+### Plugin `pos`/`air`/`ent` telemetry → live coordinates
 **What:** Real-time feed: the plugin emits JSON the bot ingests into in-memory state and the web CC renders as blips. `pos` = flying-player positions (~2s), `air` = counts (perf panel), `ent` = AI-aircraft + ships (~5s).
 **How:** Bot dispatch: `pos` updates `POS[sid]=(x,z,ts,k)` and clears `DOWNED`; `air` sets `AIR`; `ent` sets `ENT={'a':[…],'s':[…]}` with per-unit instance id `i`. `write_dashboard_state()` exposes players (x/z + dead/downed flag), air, entities (omitted when stale >15s). A life death/eject sets `DOWNED` so the map shows a player dead instantly (`no_mapvote_bot.py:240-414`, `:1464-1510`).
 **Why:** `ent` units carry per-unit `i` specifically for client-side glide interpolation; AI/ships have no SteamID so render without a name label — the bot-vs-player tell. Stale pos (>~6s) ⇒ the player is no longer flying ⇒ rendered dead/ejected.
 
-#### World-to-screen coordinate transform
+### World-to-screen coordinate transform
 **What:** The math converting a game world coordinate (x east, z north) to a canvas pixel, accounting for pan/zoom, so the PNG, the grid, and every blip stay registered. Z is inverted (north up).
 **How:** `w2cx(wx) = mapM().ix + (wx-atlas.x0)*view.scale + view.panX`; `w2cy(wz) = mapM().iy + (atlas.z0-wz)*view.scale + view.panY`. The PNG is drawn at `w2cx(atlas.x0)/w2cy(atlas.z0)` scaled by `span()*view.scale`, so image and blips share one transform. Inverse `c2wx/c2wy` recover world from the cursor (`webcc.html:365-446`).
 **Why:** A single transform anchored to the calibrated `x0/z0` (not the full grid extent) keeps PNG/grid/blips registered. Z is inverted because world-z increases north but canvas-y increases down. Interpolation renders one observed interval in the past so the factor falls between two known anchors.
@@ -750,7 +750,7 @@ Every plugin→bot telemetry line is `[NOSTATS] {json}` written via `Debug.Log` 
 | `/` | GET | Serve `webcc.html`. |
 | `/api/state` | GET | Unified 1s snapshot (state + activity + console + map_key + server_age + deploy). `?raw=1` disables console filtering. |
 | `/api/cmd` | POST | The command dispatcher (see below). |
-| `/api/commands` | GET | The command catalog (server + bot commands with args/desc/danger). |
+| `/api/commands` | GET | The command catalogue (server + bot commands with args/desc/danger). |
 | `/api/map?key=` | GET | Atlas metadata (bounds, bases, gcols) for a map. |
 | `/api/mapimg?key=` | GET | The terrain PNG for a map. |
 | `/api/power` | POST | Pterodactyl power signal (start/stop/restart/kill). |

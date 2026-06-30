@@ -1,49 +1,32 @@
 # Changelog
 
-All notable changes to the **Nuclear Option community toolkit** — the server-side
-**NukeStats plugin**, the **mapvote bot**, the **web command centre**, and the **installer**.
+What changed in each release. Versioned by the plugin version (`0.9.x`). Every release on GitHub shows
+its own section from this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/). The toolkit is versioned by
-its plugin version (`0.9.x`). Every nightly and stable release pulls its notes from the matching
-section below.
-
-> **Maintainers:** add changes under **[Unreleased]** as you make them. Nightly builds publish the
-> **[Unreleased]** notes; when you cut a stable release, rename **[Unreleased]** to the new version
-> with today's date and start a fresh empty **[Unreleased]**.
-
-## [Unreleased]
-
-### Added
-- **Community directory banners** — opted-in servers can show their live
-  [gamemonitoring.net](https://gamemonitoring.net/nuclear-option/servers/) 560×95 status banner in
-  the README server list (auto-matched by address, or via a pasted URL).
-- **Signed auto-updates** — every release asset is minisign-signed; the opt-in updater verifies the
-  signature and SHA-256 before applying. Public key ships as `installer/trusted.pub`.
-- **Nightly builds** — automatic nightly pre-releases (the most recent 3 are kept), alongside
-  deliberate stable releases.
-- **One-click installers** — per-host bundles (Pterodactyl / Local / Manual), each a full
-  self-contained install driven by a guided web setup wizard.
-- **Public server directory** — opt-in list of community servers (name, region, plugin version only;
-  never IPs or player data).
-
-### Changed
-- README community list is now a centered table with the live banner embedded in the Server column.
-
-### Fixed
-- _Nothing yet._
+> **Maintainers:** when you cut a stable release, add a new `## [<version>] — <date>` section at the
+> top describing what's in it. Only list things that ship in that release — nothing unreleased.
 
 ## [0.9.14] — 2026-06-29
 
-First public **stable** release — the complete toolkit:
+First public release. The full toolkit, in three parts.
 
-- **Plugin (NukeStats):** persistent ranks + economy, NuclearSkill per-life rating, PvP team
-  balancing with squad and new-joiner protection, automated teamkill enforcement, anti-grief
-  auto-kick, AI aircraft limiter, and a network flood guard (fixes a match-start mass-disconnect).
-- **Bot:** map voting and `!votemap`, chat rank tags, profanity filter, forfeit votes, admin
-  commands, and a live activity feed.
-- **Web command centre:** pan/zoom live battle map, players/ranks/skill, chat + console, a settings
-  menu to change any plugin setting live, scheduling, a server-message manager, and power control.
+**Plugin (runs in the game server)**
+- Persistent ranks and economy: lifetime points on an 11-rank ladder, from real in-game score plus win, placement, and kill bonuses.
+- NuclearSkill: a separate per-sortie skill rating, used to balance teams.
+- PvP team balance, with new-joiner and squad protection.
+- Teamkill punishment, anti-grief auto-kick, and a flood guard that fixed a match-start mass-disconnect.
+- AI aircraft limiter to protect framerate.
+- Map voting, a slur filter, forfeit votes, and PvE timeout rules.
 
----
+**Bot (runs on your PC)**
+- Owns all saved data (ranks, skill, backups), runs the map vote, and carries out admin actions.
 
-_Earlier 0.x development predates this changelog; see the release history on GitHub._
+**Web command centre (runs in your browser)**
+- Live battle map, player table, activity feed, console, and kill feed.
+- Change maps, grant points, move/kick/ban, schedule restarts, and edit settings live.
+- Power control wired to your hosting panel.
+
+**Install and updates**
+- One-click bundles for Pterodactyl, local, and manual hosting, with a guided web installer.
+- Signed releases (minisign) and an opt-in updater that verifies a download before applying it.
+- Opt-in public server directory (name and region only, never your IP).
