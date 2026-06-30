@@ -64,6 +64,11 @@ def region_of(s):
     return "Other"
 
 
+def esc(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
 def gm_id(s):
     """Return the gamemonitoring.net server id as a digits-only string, or None.
     Validated (digits only) because the value may originate from operator input."""
@@ -75,33 +80,35 @@ def gm_id(s):
 
 
 def build_block(servers):
+    """Centered HTML table. The Server column shows the server's live gamemonitoring.net
+    560x95 banner when it has a gamemonitoring_id, else its name. Region + Plugin kept."""
     if not servers:
-        return "_No servers are listed yet — be the first._ &nbsp; ([directory ↗](%s))" % DIR_URL
+        return ('<div align="center">\n'
+                '<p><em>No servers are listed yet — be the first.</em></p>\n'
+                '</div>')
     servers.sort(key=lambda s: (REGION_ORDER.index(region_of(s)), str(s.get("name", "")).lower()))
     n = len(servers)
     # daily cache-bust: GitHub proxies (camo) and caches external images, so a stable URL would
     # freeze the banner. A token that changes once per UTC day makes the proxy refetch ~daily
-    # (and yields at most one README commit/day). The live directory page shows it in real time.
+    # (and yields at most one README commit/day).
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
-    head = "**%d server%s** running the toolkit &nbsp; ([full directory ↗](%s))" % (
-        n, "" if n == 1 else "s", DIR_URL)
-    banners = []
+    rows = []
     for s in servers:
         gid = gm_id(s)
-        if not gid:
-            continue
-        alt = str(s.get("name", "")).replace('"', "&quot;")
-        banners.append(
-            '<a href="https://gamemonitoring.net/nuclear-option/servers/%s">'
-            '<img src="https://widgets.gamemonitoring.net/servers/%s/560x95.webp?ts=%s" '
-            'width="560" alt="%s — live status on gamemonitoring.net"></a>' % (gid, gid, ts, alt))
-    rows = ["| Server | Region | Plugin |", "|---|---|---|"]
-    for s in servers:
-        rows.append("| %s | %s | %s |" % (
-            str(s.get("name", "")).replace("|", "\\|"),
-            REGION_NAMES.get(region_of(s), region_of(s)),
-            ("v" + str(s["plugin_version"])) if s.get("plugin_version") else "—"))
-    return "\n\n".join([head] + banners + ["\n".join(rows)])
+        name = str(s.get("name", ""))
+        if gid:
+            cell = ('<a href="https://gamemonitoring.net/nuclear-option/servers/%s">'
+                    '<img src="https://widgets.gamemonitoring.net/servers/%s/560x95.webp?ts=%s" '
+                    'width="560" alt="%s"></a>' % (gid, gid, ts, esc(name)))
+        else:
+            cell = "<b>%s</b>" % esc(name)
+        region = REGION_NAMES.get(region_of(s), region_of(s))
+        ver = ("v" + str(s["plugin_version"])) if s.get("plugin_version") else "—"
+        rows.append("<tr><td>%s</td><td>%s</td><td>%s</td></tr>" % (cell, esc(region), esc(ver)))
+    head = "<p><b>%d server%s</b> running the community toolkit</p>" % (n, "" if n == 1 else "s")
+    table = ("<table>\n<tr><th>Server</th><th>Region</th><th>Plugin</th></tr>\n"
+             + "\n".join(rows) + "\n</table>")
+    return '<div align="center">\n' + head + "\n" + table + "\n</div>"
 
 
 def main():
@@ -112,7 +119,7 @@ def main():
         print("markers not found in %s — nothing to do" % README)
         return 0
     new = re.sub(re.escape(START) + r".*?" + re.escape(END),
-                 START + "\n" + block + "\n" + END, txt, flags=re.S)
+                 START + "\n\n" + block + "\n\n" + END, txt, flags=re.S)
     if new != txt:
         with open(README, "w", encoding="utf-8", newline="\n") as f:
             f.write(new)

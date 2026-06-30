@@ -78,6 +78,7 @@ skill, chat + console, map voting, scheduling, and one-click power.
 | **[docs/MODERATION.md](docs/MODERATION.md)** | Teamkill enforcement, anti-grief auto-kick, bans, votekick, reports |
 | **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | How the three processes fit together — overview up top, deep technical reference below |
 | **[SECURITY.md](SECURITY.md)** | Update signing (minisign) + the credential/secrets stance |
+| **[CHANGELOG.md](CHANGELOG.md)** | What changed in each release (nightly + stable) |
 
 ## Get started
 

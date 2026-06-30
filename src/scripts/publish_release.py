@@ -82,6 +82,31 @@ def _tag_for(channel, version, date):
     return ("v%s-nightly.%s" % (v, date), "Nightly %s (v%s)" % (date, v), True)
 
 
+def _changelog_section(channel, version):
+    """Pull the matching section body from CHANGELOG.md (in repo root), or '' if absent.
+    Nightly prefers [Unreleased]; stable prefers [<version>]; each falls back to the other."""
+    import re as _re
+    path = os.path.join(ROOT, "CHANGELOG.md")
+    if not os.path.exists(path):
+        return ""
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    base = version.lstrip("v").split("-nightly")[0]
+    order = ["Unreleased", base] if channel == "nightly" else [base, "Unreleased"]
+    for key in order:
+        m = _re.search(r"(?m)^##\s*\[%s\][^\n]*\n" % _re.escape(key), text)
+        if not m:
+            continue
+        start = m.end()
+        nxt = _re.search(r"(?m)^##\s+", text[start:])
+        body = (text[start: start + nxt.start()] if nxt else text[start:]).strip()
+        # trim a trailing horizontal-rule/footer that belongs after the last section
+        body = _re.split(r"(?m)^---\s*$", body)[0].strip()
+        if body:
+            return body
+    return ""
+
+
 def _notes(channel, version, date, signed):
     lines = ["Automated %s release of the Nuclear Option community toolkit." % channel,
              "", "- Plugin + bot version: **%s**" % version.lstrip("v")]
@@ -91,7 +116,11 @@ def _notes(channel, version, date, signed):
               "- Updater assets: NukeStats.dll, no_mapvote_bot.py.",
               "- %s" % ("All assets are **minisign-signed**; the public key ships as `installer/trusted.pub`."
                         if signed else "**Unsigned build** (testing).")]
-    return "\n".join(lines)
+    note = "\n".join(lines)
+    changes = _changelog_section(channel, version)
+    if changes:
+        note += "\n\n---\n\n### What's changed\n\n" + changes
+    return note
 
 
 def main(argv=None):
