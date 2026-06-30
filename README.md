@@ -211,3 +211,11 @@ only your server's name, region, and plugin version are published (never your IP
 ## License
 
 See [`LICENSE`](LICENSE) — GPL-3.0-or-later.
+
+## Planned features
+
+On the roadmap — not built yet, but where the toolkit is headed:
+
+- **Config-file setup without the web command centre** — a mode where the plugin and bot are configured entirely from a config file instead of the web command centre, for people who already run their own server solution and just want the plugin + bot.
+- **Everything customisable** — make every feature configurable and changeable, not only the ones surfaced today.
+- **Ongoing polish & accessibility** — keep refining the UI and making the whole feature set easier to pick up and use.
