@@ -208,6 +208,12 @@ in-game server browser (Nuclear Option has no direct-connect). This list updates
 only your server's name, region, and plugin version are published (never your IP). Setup steps:
 [docs/SERVERS.md](docs/SERVERS.md).
 
+## 💬 Community & feedback
+
+Have an idea, a feature request, or just want to chat about running a server?
+**[Join the Discord](https://discord.gg/B46h4Dd7uj)** — suggestions and feedback are very welcome.
+You can also [open an issue](https://github.com/TomosBombos/nuclear-option-toolkit/issues) for bugs or concrete proposals.
+
 ## License
 
 See [`LICENSE`](LICENSE) — GPL-3.0-or-later.
