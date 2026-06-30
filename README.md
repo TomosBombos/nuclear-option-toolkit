@@ -199,6 +199,8 @@ in-game server browser (Nuclear Option has no direct-connect). This list updates
 <!-- COMMUNITY-SERVERS:START -->
 **1 server** running the toolkit &nbsp; ([full directory ↗](https://tomosbombos.github.io/nuclear-option-servers/))
 
+<a href="https://gamemonitoring.net/nuclear-option/servers/11798637"><img src="https://widgets.gamemonitoring.net/servers/11798637/560x95.webp?ts=20260630" width="560" alt="Tomo's Co-Op/PvP Mission Vote | OCE | 60hz | Ranked | no-TKs — live status on gamemonitoring.net"></a>
+
 | Server | Region | Plugin |
 |---|---|---|
 | Tomo's Co-Op/PvP Mission Vote \| OCE \| 60hz \| Ranked \| no-TKs | Oceania | v0.9.14 |
