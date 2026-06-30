@@ -48,6 +48,23 @@ domain. It reads only the public JSON — no tokens, nothing secret.
 
 ---
 
+## Live status banner (optional)
+
+If your server is also listed on **[gamemonitoring.net](https://gamemonitoring.net/nuclear-option/servers/)**,
+the directory and README can show its live **560×95 status banner** (player count, map, online state).
+
+- **Automatic:** nothing to do beyond being listed there — the bot finds your gamemonitoring entry by
+  matching your server's address against the public Nuclear Option list and publishes only its numeric
+  banner id (`gamemonitoring_id`). Your IP is still never written to the directory.
+- **Manual override:** paste your gamemonitoring server URL (e.g.
+  `https://gamemonitoring.net/nuclear-option/servers/11798637`) in the command centre under
+  *Game Settings → Public Listing* to pin a specific listing.
+
+One-time prerequisite: add your server on gamemonitoring.net first (their *Add server* flow) so it has a
+banner to show. Only the public banner image and a link to your gamemonitoring page are displayed; on the
+GitHub README the banner is a near-daily snapshot (GitHub proxies images), while the live directory page
+shows it in real time.
+
 ## To delist
 Turn the **List Server Publicly** toggle off (or clear `NO_GH_REPO` / `NO_GH_TOKEN` and restart) —
 the bot removes your entry from the directory.
