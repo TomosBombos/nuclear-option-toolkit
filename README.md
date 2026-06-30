@@ -223,5 +223,6 @@ See [`LICENSE`](LICENSE) — GPL-3.0-or-later.
 On the roadmap — not built yet, but where the toolkit is headed:
 
 - **Config-file setup without the web command centre** — a mode where the plugin and bot are configured entirely from a config file instead of the web command centre, for people who already run their own server solution and just want the plugin + bot.
+- **Multiple plugins at once** — let the launcher load and manage several plugins running on a server simultaneously, not just the toolkit's own.
 - **Everything customisable** — make every feature configurable and changeable, not only the ones surfaced today.
 - **Ongoing polish & accessibility** — keep refining the UI and making the whole feature set easier to pick up and use.
