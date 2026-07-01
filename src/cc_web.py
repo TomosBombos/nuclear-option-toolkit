@@ -483,6 +483,8 @@ def _server_alive():
 def _local_power(signal):
     import subprocess
     import sys
+    if signal not in ("start", "stop", "restart", "kill"):   # unlike _pt_power this had NO guard; an unknown signal skipped the kill branch and launched a 2nd server
+        return False, "bad signal"
     gd = _local_game_dir()
     if not gd or not os.path.isdir(gd):
         return False, "no local game dir configured"
@@ -522,10 +524,116 @@ def _local_resources():
     return {"configured": True, "local": True, "state": "running" if _server_alive() else "offline"}
 
 
+# ── Toolkit version + GitHub updater (github/productization fork's installer/updater.py) ──────
+# We READ deployed_toolkit.json + the toolkit config and CALL the fork's updater (never edit installer/).
+# Inert in a dev checkout (no deployed_toolkit.json / no ~/.nuke-option-toolkit/config.json -> "not configured").
+TOOLKIT_META = os.path.join(HERE, "deployed_toolkit.json")
+_USER_DIR    = os.environ.get("NOST_DATA_DIR") or os.path.join(os.path.expanduser("~"), ".nuke-option-toolkit")
+_TOOLKIT_CFG = os.path.join(_USER_DIR, "config.json")
+_toolkit_chk = {"ts": 0.0, "data": None}   # cached result of the last (network) update check
+
+
+def _json_version(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return str((json.load(f) or {}).get("version", "") or "")
+    except (OSError, ValueError):
+        return ""
+
+
+def _toolkit_cfg():
+    try:
+        with open(_TOOLKIT_CFG, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _updater_mod():
+    import sys as _sys
+    idir = os.path.join(HERE, "installer")
+    if idir not in _sys.path:
+        _sys.path.insert(0, idir)
+    import updater
+    return updater
+
+
 # ── routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
     return send_from_directory(HERE, "webcc.html")
+
+
+@app.route("/api/toolkit")
+def api_toolkit():
+    """Fast/local: installed toolkit + plugin versions, the configured channel, and the last cached check."""
+    upd = (_toolkit_cfg().get("update") or {})
+    return jsonify({
+        "toolkit_version": _json_version(TOOLKIT_META) or None,
+        "plugin_version":  _json_version(DEPLOYED_META) or None,
+        "channel":         upd.get("channel") or "stable",
+        "configured":      bool((upd.get("github_repo") or "").strip()),
+        "check":           _toolkit_chk["data"],
+        "checked_age":     (round(time.time() - _toolkit_chk["ts"], 1) if _toolkit_chk["ts"] else None),
+    })
+
+
+@app.route("/api/toolkit/check", methods=["POST"])
+def api_toolkit_check():
+    """On-demand: ask GitHub (via the fork's updater.check) whether a newer release exists on the channel."""
+    upd = (_toolkit_cfg().get("update") or {})
+    try:
+        info = _updater_mod().check(("plugin", "bot"), verbose=False)
+    except Exception as e:                               # noqa: BLE001
+        return jsonify({"ok": False, "error": str(e)})
+    if not info:                                         # no repo configured or GitHub unreachable
+        d = {"configured": bool((upd.get("github_repo") or "").strip()),
+             "installed": _json_version(TOOLKIT_META) or None, "latest": None, "newer": None,
+             "channel": upd.get("channel") or "stable", "note": "updater not configured or GitHub unreachable"}
+    else:
+        rel = info.get("release") or {}
+        d = {"configured": True, "installed": info.get("installed") or None, "latest": info.get("latest") or None,
+             "newer": bool(info.get("newer")), "channel": info.get("channel"), "repo": info.get("repo"),
+             "url": rel.get("html_url"), "components": info.get("components")}
+    _toolkit_chk.update(ts=time.time(), data=d)
+    return jsonify({"ok": True, **d})
+
+
+@app.route("/api/toolkit/channel", methods=["POST"])
+def api_toolkit_channel():
+    """Set the update channel (stable/nightly) in ~/.nuke-option-toolkit/config.json."""
+    ch = (request.get_json(silent=True) or {}).get("channel")
+    if ch not in ("stable", "nightly"):
+        return jsonify({"ok": False, "error": "channel must be 'stable' or 'nightly'"})
+    cfg = _toolkit_cfg()
+    cfg.setdefault("update", {})["channel"] = ch
+    try:
+        os.makedirs(_USER_DIR, exist_ok=True)
+        with open(_TOOLKIT_CFG, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except OSError as e:
+        return jsonify({"ok": False, "error": str(e)})
+    _toolkit_chk["data"] = None                          # channel changed -> stale check
+    return jsonify({"ok": True, "channel": ch})
+
+
+@app.route("/api/toolkit/update", methods=["POST"])
+def api_toolkit_update():
+    """Download + VERIFY + STAGE the latest (plugin -> pending_plugin.dll, bot -> pending_bot.py). Does NOT
+    auto-apply: the staged plugin deploys via the normal Schedule / --deploy-plugin flow (no surprise restart)."""
+    import subprocess
+    import sys as _sys
+    upy = os.path.join(HERE, "installer", "updater.py")
+    if not os.path.exists(upy):
+        return jsonify({"ok": False, "error": "installer/updater.py not present"})
+    try:
+        r = subprocess.run([_sys.executable, upy, "update", "--component", "all"],
+                           cwd=HERE, capture_output=True, text=True, timeout=300)
+        return jsonify({"ok": r.returncode == 0, "output": (r.stdout or "")[-4000:],
+                        "error": ((r.stderr or "").strip()[-1000:] or None)})
+    except Exception as e:                               # noqa: BLE001
+        return jsonify({"ok": False, "error": str(e)})
 
 
 @app.route("/api/state")
@@ -543,6 +651,7 @@ def api_state():
                      else "ignus" if ("ignus" in m or "terminal" in m) else None)
     st["server_age"] = round(time.time() - st.get("ts", 0), 1) if st.get("ts") else None
     st["deploy"] = _deploy_status()
+    st["toolkit_version"] = _json_version(TOOLKIT_META) or None   # header chip; None in a dev checkout
     return jsonify(st)
 
 
@@ -648,12 +757,21 @@ def api_mission_upload():
     return jsonify({"ok": True})
 
 
+_VOTEMAP_KEYS = {
+    "enabled", "coop_count", "pvp_count", "coop_mode", "pvp_mode", "include_pvp", "include_custom",
+    "coop_weights", "pvp_weights", "guaranteed", "avoid_recent",
+    "force_pvp_enabled", "force_pvp_players", "force_pvp_coop", "force_pvp_pvp",
+    "ballot_size", "mode",                       # legacy aliases (bot maps them); harmless to keep
+}
+
+
 @app.route("/api/votemap", methods=["POST"])
 def api_votemap():
-    """webcc Votemap settings: set one vote-pool config key (ballot_size/mode/include_pvp/include_custom)."""
+    """webcc Votemap settings: set one vote-pool config key. The bot is the sole validator/writer; the
+    weight keys carry a {name: number} object as their value."""
     b = request.get_json(force=True, silent=True) or {}
     key = str(b.get("key", "")).strip()
-    if key not in ("ballot_size", "mode", "include_pvp", "include_custom"):
+    if key not in _VOTEMAP_KEYS:
         return jsonify({"ok": False, "error": "unknown key"})
     _queue_admin({"action": "setvotemap", "key": key, "value": b.get("value")})
     return jsonify({"ok": True})
@@ -663,6 +781,28 @@ def api_votemap():
 def api_banaudit():
     """webcc Moderation 'Banned' tab: ask the bot to re-read plugin_bans.txt (data via /api/state)."""
     _queue_admin({"action": "banaudit"})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/logban", methods=["POST"])
+def api_logban():
+    """webcc Reports 'Log ban' button: record a ban in the persistent ban-log (repeat-offender tracking)."""
+    b = request.get_json(force=True, silent=True) or {}
+    sid = str(b.get("sid", "")).strip()
+    if not re.fullmatch(r"\d{6,20}", sid):
+        return jsonify({"ok": False, "error": "bad steamid"})
+    _queue_admin({"action": "logban", "sid": sid, "name": str(b.get("name", ""))[:64], "reason": str(b.get("reason", ""))[:200]})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/banlog/remove", methods=["POST"])
+def api_banlog_remove():
+    """webcc Ban log 🗑 button: delete one player's logged-ban history. Separate from clearing reports."""
+    b = request.get_json(force=True, silent=True) or {}
+    sid = str(b.get("sid", "")).strip()
+    if not re.fullmatch(r"\d{6,20}", sid):
+        return jsonify({"ok": False, "error": "bad steamid"})
+    _queue_admin({"action": "rmbanlog", "sid": sid, "name": str(b.get("name", ""))[:64]})
     return jsonify({"ok": True})
 
 
@@ -707,6 +847,77 @@ def api_sysmessages():
                 return jsonify({"ok": False, "error": f"{nk} must be a number"})
     _queue_admin({"action": "sysmsg", "key": key, "fields": fields})
     return jsonify({"ok": True})
+
+
+@app.route("/api/helpcfg", methods=["POST"])
+def api_helpcfg():
+    """webcc Help editor: show/hide a command in the dynamic !help list. The bot owns help_config.json;
+    command TEXT edits reuse /api/sysmessages (key 'help_<cmd>')."""
+    b = request.get_json(force=True, silent=True) or {}
+    cmd = str(b.get("cmd", "")).strip()
+    if not re.fullmatch(r"[a-z]{2,16}", cmd):
+        return jsonify({"ok": False, "error": "bad cmd"})
+    _queue_admin({"action": "helpcfg", "cmd": cmd, "on": bool(b.get("on", True))})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/rankladder", methods=["POST"])
+def api_rankladder():
+    """webcc Ranks modal: replace the whole rank ladder + rank-up template. The bot owns
+    rank_ladder.json and is the SOLE validator; this does cheap shape checks and queues."""
+    b = request.get_json(force=True, silent=True) or {}
+    if str(b.get("op", "save")).strip().lower() != "save":
+        return jsonify({"ok": False, "error": "bad op"})
+    ranks = b.get("ranks")
+    if not isinstance(ranks, list) or not ranks:
+        return jsonify({"ok": False, "error": "need at least one rank"})
+    if len(ranks) > 40:
+        return jsonify({"ok": False, "error": "too many ranks (max 40)"})
+    clean = []
+    for r in ranks:
+        if not isinstance(r, dict):
+            return jsonify({"ok": False, "error": "bad rank row"})
+        try:
+            th = int(float(r.get("threshold", 0)))
+        except (TypeError, ValueError, OverflowError):
+            return jsonify({"ok": False, "error": "threshold must be a number"})
+        clean.append({"threshold": th,
+                      "name": str(r.get("name", ""))[:40],
+                      "abbr": str(r.get("abbr", ""))[:12],
+                      "color": str(r.get("color", ""))[:7]})
+    tmpl = str(b.get("rankup_template", ""))[:240]
+    _queue_admin({"action": "rankladder", "payload": {"ranks": clean, "rankup_template": tmpl}})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/sharedranks", methods=["POST"])
+def api_sharedranks():
+    """webcc Shared Ranks card: enable/disable cross-server rank sharing + set the shared dir.
+    The bot owns shared_ranks.json and does the publish/read; this just queues."""
+    b = request.get_json(force=True, silent=True) or {}
+    enabled = bool(b.get("enabled"))
+    dir_ = str(b.get("dir", "") or "").strip()[:500]
+    if enabled and not dir_:
+        return jsonify({"ok": False, "error": "enter the shared folder path"})
+    _queue_admin({"action": "sharedranks", "enabled": enabled, "dir": dir_})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/sharedranks/validate", methods=["POST"])
+def api_sharedranks_validate():
+    """Advisory server-side path check for the Shared Ranks card. NOTE: cc_web writability is
+    not the bot's writability (separate processes) - the bot publisher's success is the real signal."""
+    b = request.get_json(force=True, silent=True) or {}
+    dir_ = str(b.get("dir", "") or "").strip()
+    if not dir_:
+        return jsonify({"ok": False, "error": "no path"})
+    import glob as _glob
+    exists = os.path.isdir(dir_)
+    writable = bool(exists and os.access(dir_, os.W_OK))
+    network = dir_.startswith("\\\\") or dir_.startswith("//")
+    peers = len(_glob.glob(os.path.join(dir_, "rankshare_*.json"))) if exists else 0
+    return jsonify({"ok": True, "exists": exists, "writable": writable,
+                    "network": bool(network), "peer_files": peers})
 
 
 _MSG_TRIGGERS = ("interval", "clock", "match_start", "match_end")
@@ -778,12 +989,26 @@ def api_settings():
     except (OSError, ValueError):
         bov = {}
     have_live = bool(live)
+    # Public-listing opt-in is AUTHORITATIVE in global_optin.json (the bot persists the operator's choice
+    # there the moment they toggle it). The plugin's Global.ListServer bind defaults FALSE and only reports
+    # via dumpcfg when a player is online, so on an empty/just-restarted server the menu would fall back to
+    # the catalogue default and "keep turning off". Always overlay these two from the opt-in file. (fixes the recurring revert)
+    try:
+        gc = bot._global_cfg()
+    except Exception:                                    # noqa: BLE001
+        gc = None
     out, groups = [], []
     for s in cat:
         key = s.get("key", "")
         owner = s.get("owner", "plugin")
         val = s.get("default")
-        if owner == "plugin" and key in live:
+        if gc is not None and key == "Global.ListServer":
+            val = bool(gc["list"])
+        elif gc is not None and key == "Global.Region":
+            val = gc["region"]
+        elif gc is not None and key == "Global.Gamemonitoring":
+            val = gc.get("gm", "")
+        elif owner == "plugin" and key in live:
             val = live[key]
         elif owner == "bot":
             short = key.split(".")[-1].split(":")[-1]
@@ -1008,9 +1233,15 @@ def api_cmd():
             return jsonify({"ok": True, "info": f"queued: {label} -> {fac}"})
         if name == "copysid":
             return jsonify({"ok": True, "sid": sid})
-        # server alias or raw wire command
+        # server wire command: WHITELIST to known CENTRE_SERVER_CMDS verbs (no raw passthrough).
+        # Everything else is either handled by an explicit branch above or is rejected here.
         entry = next((e for e in bot.CENTRE_SERVER_CMDS if e[0] == name or e[1] == name), None)
-        wire = entry[1] if entry else name
+        if not entry:
+            return jsonify({"ok": False, "error": f"unknown command '{name}'"})
+        # basic arg sanity: reject control/newline/null chars that could corrupt the [code][len][body] relay framing
+        if any(any(ord(ch) < 0x20 for ch in a) for a in args):
+            return jsonify({"ok": False, "error": "command arguments contain invalid characters"})
+        wire = entry[1]
         res = _send_cmd(wire, args)
         ok = True
         info = None
@@ -1024,6 +1255,8 @@ def api_cmd():
 @app.route("/api/power", methods=["POST"])
 def api_power():
     sig = (request.get_json(force=True, silent=True) or {}).get("signal", "").strip()
+    if sig not in ("start", "stop", "restart", "kill"):   # gate BOTH power paths; an unknown sig fell through _local_power -> launched a duplicate server
+        return jsonify({"ok": False, "message": "bad signal"})
     ok, msg = (_local_power(sig) if _is_local_power() else _pt_power(sig))
     return jsonify({"ok": ok, "message": msg})
 

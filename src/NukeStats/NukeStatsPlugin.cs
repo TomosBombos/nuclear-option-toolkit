@@ -46,7 +46,7 @@ namespace NukeStats
     public class NukeStatsPlugin : BaseUnityPlugin
     {
         public const string Guid = "anz.nukestats";
-        public const string Version = "0.9.14";
+        public const string Version = "0.9.21";
         internal static ManualLogSource Log;
         internal static NukeStatsPlugin Instance;
 
@@ -76,6 +76,7 @@ namespace NukeStats
         internal static ConfigEntry<bool> FloodLogDrops, FloodDropDeadNet;
         internal static ConfigEntry<bool> MirageRaiseSendBuffer;  // anti mass-DC Layer C: raise the reliable-send-buffer cap
         internal static ConfigEntry<int>  MirageSendBufferLimit;  // target for MaxReliablePacketsInSendBufferPerConnection
+        internal static ConfigEntry<bool> DiagNetProbe;          // ONE-OFF diagnostic: dump the connection object's fields to LogOutput.log to settle whether per-player RTT is reachable on this Mirage build (OFF by default)
         internal static ConfigEntry<string> CommandPolicy, CommandAllowedJsonKeys;  // restrict which units can be CmdSetDestination'd
         internal static ConfigEntry<bool>   CommandDiagLog;
         internal static ConfigEntry<float> SwapAltitude;         // !swapteam/!forceteamswap: Cricket spawn altitude (world-Y m)
@@ -182,7 +183,7 @@ namespace NukeStats
                 "NuclearSkill: skill points added to a LOSER's final life at match end (before the 5s auto-eject).");
             BalanceBySkill  = Config.Bind("Skill", "BalanceBySkill", true,
                 "NuclearSkill: auto-balance by skill rating (plugin_skill.txt) instead of server rank.");
-            TimeoutForceDefeat = Config.Bind("PvE", "TimeoutForceDefeat", false,
+            TimeoutForceDefeat = Config.Bind("PvE", "TimeoutForceDefeat", true,
                 "PvE co-op: when the mission timer expires and humans haven't won, declare the human team " +
                 "DEFEATED (the AI faction 'wins') instead of silently rotating. No effect in PvP. " +
                 "Default OFF until observed on a live timeout - flip to true in the config once verified.");
@@ -270,6 +271,14 @@ namespace NukeStats
                 + "it's finally dropped. Clamped to never go BELOW the game default 3000 (and never LOWERS an already-higher "
                 + "value). Try 24000 (8x) if a burst still overflows. Live-tunable via the webcc settings menu, but only "
                 + "applies at the NEXT match host.");
+            DiagNetProbe = Config.Bind("Diag", "NetProbe", false,
+                "ONE-OFF DIAGNOSTIC (default OFF). When on AND at least one player is connected, dump the first online "
+                + "player's network-connection object to BepInEx/LogOutput.log (concrete type + every numeric/string field & "
+                + "property, recursing one level into any AckSystem member) plus NetworkTime.Rtt, ONCE per process (a few "
+                + "snapshots, then it stops). Pure read-only reflection, never touches the netcode, emits NOTHING to players. "
+                + "Purpose: settle empirically whether per-player server-side RTT is even reachable on this Mirage build before "
+                + "any ping feature is built (research says NetworkTime.Rtt is client-fed ~0 on a headless server). Turn ON, "
+                + "capture one LogOutput.log dump, turn OFF.");
             GriefAutoKick = Config.Bind("Grief", "AutoKick", true,
                 "Anti-grief: automatically KICK a single player who is mass-commanding units to brick the server (the "
                 + "reliable-buffer flood that mass-disconnects everyone). Kicks the OFFENDER, not the lobby, and emits a "
@@ -296,6 +305,13 @@ namespace NukeStats
             GriefExemptAdmins = Config.Bind("Grief", "ExemptAdmins", true,
                 "Never auto-kick a player whose SteamID is in [Admin] SteamIds (an admin may legitimately mass-command "
                 + "units for a scenario). Set false to include admins (e.g. to self-test the detector).");
+            GriefBreakerDistinct = Config.Bind("Grief", "BreakerDistinctPlayers", 3,
+                "Server-wide CIRCUIT BREAKER (mirrors the bot's flood-breaker). If THIS many DISTINCT players trip the "
+                + "grief detector within BreakerWindowSeconds, it is treated as a synchronized order/lag SPIKE (server "
+                + "congestion), NOT grief -- ALL kicks/bans for that window are SUPPRESSED (reports still emit). Stops a "
+                + "shared lag hitch from mass-kicking the lobby. 0 = disabled (legacy: kick each tripper).");
+            GriefBreakerWindow = Config.Bind("Grief", "BreakerWindowSeconds", 6,
+                "The rolling window (seconds) over which BreakerDistinctPlayers is counted for the grief circuit breaker.");
 
             LoadBans();
             LoadSquads();
@@ -352,6 +368,25 @@ namespace NukeStats
             }
             catch (Exception e) { Log.LogError("[flood] ConfigureNetwork patch failed (Layers A/B still active): " + e); }
 
+            // CONNECTION-HEALTH telemetry: record the DisconnectReason on each forced drop. The PUBLIC
+            // NetworkServer.Disconnected event hands us the player but NOT the reason; the reason only exists
+            // on the PRIVATE Peer_OnDisconnected(IConnection, DisconnectReason) callback. Manual patch (private
+            // target). Read-only postfix: it just tallies per-SteamID forced-DC count + last reason for the
+            // {"t":"net"} telemetry line. Fail-open: if the method can't be resolved, no-op (never blocks load).
+            try
+            {
+                var nsT = AccessTools.TypeByName("Mirage.NetworkServer");
+                var onDisc = nsT != null ? AccessTools.Method(nsT, "Peer_OnDisconnected") : null;
+                if (onDisc != null)
+                {
+                    _harmony.Patch(onDisc, postfix: new HarmonyMethod(
+                        typeof(DcReasonPatch).GetMethod("Postfix", BindingFlags.Static | BindingFlags.NonPublic)));
+                    Log.LogInfo("[diag] Peer_OnDisconnected patched (net-health: capture DisconnectReason)");
+                }
+                else Log.LogWarning("[net] NetworkServer.Peer_OnDisconnected not found; per-DC reason capture disabled (net telemetry still emits, lastDc stays empty)");
+            }
+            catch (Exception e) { Log.LogError("[net] Peer_OnDisconnected patch failed (net telemetry still emits): " + e); }
+
             Log.LogInfo($"NukeStats {Version} loaded (+ team balance: autobalance fires ONLY on a LEAVE, then WARNS and waits before moving; protection tiers = new joiners (<{(BalanceNewJoinerSeconds!=null?BalanceNewJoinerSeconds.Value:900)}s, strongest) > squads > then the best skill-evening pick; join-the-fuller-side = INSTANT spectate, no warning; + PvP !forfeit team-surrender vote (cd {ForfeitCooldownSeconds.Value}s); + PvP start-rank floor={PvpStartingRank.Value}; + admin !setrank/!setfunds/!addfunds; + live-map entity feed: AI aircraft + ships, heli/plane; + AI aircraft limiter: per-team {AiPerTeamCap.Value}/total {AiTotalCap.Value} caps + {AiStuckSeconds.Value}s stuck-runway clear @5s scan; AI-only, never players; SKILL = PERSISTENT points-per-death: life ends ONLY on death/air-eject, survives disconnect + match-end (no match-end eject), balance/admin moves are life-NEUTRAL, captures emit capbonus; strategic-strike announce removed; PvP balance: joinable-only team detect [spectate-move]; radar/spotting + jamming score SUPPRESSED [anti-exploit]; FLOOD GUARD: A=per-player CmdSetDestination rate-limit {(FloodPerSec!=null?FloodPerSec.Value:3)}/s burst {(FloodBurst!=null?FloodBurst.Value:6)} [drop excess, no kick], B=silent-drop ServerRpc to dead netId [{(FloodDropDeadNet!=null&&FloodDropDeadNet.Value?"on":"off")}] -> stops match-start mass-DC; autobalance: never under MinPlayers={(BalanceMinPlayers!=null?BalanceMinPlayers.Value:6)} + {(BalanceWarnSeconds!=null?BalanceWarnSeconds.Value:300)}s WARNED hold, then MOVES the picked player via the swap mechanic (landed Cricket); admin !swapteam/!forceteamswap [team swap + Cricket spawn HIGH over open ocean + eject -> UI reset, life/points-neutral]; + !squadup friend groups (max {SquadMax}, persist across matches, protected from auto-balance below new joiners); + LIVE CONFIG (webcc settings menu via setcfg/dumpcfg -> live ConfigEntry edit + Config.Save)). RankFile={RankFilePath}");
             DumpCfg();   // emit an initial [NOSTATS] cfg snapshot so the webcc settings menu has live values on load
             try { var tgo = new GameObject("NukeStatsTicker"); DontDestroyOnLoad(tgo); tgo.AddComponent<Ticker>(); Log.LogInfo("[diag] NukeStatsTicker up (drives PollCommands when the server is empty)"); }
@@ -388,6 +423,8 @@ namespace NukeStats
                     _snapDiag++;
                 }
                 EmitAll("snap");
+                NetHealthTick();                     // connection-health telemetry ({"t":"net"}); always-works, no RTT needed
+                NetProbe();                          // one-off diagnostic dump (no-op unless Diag.NetProbe is on); settles RTT reachability
                 PruneLeavers();                      // forget RankInName bookkeeping for players who left
             }
             catch (Exception e) { Log?.LogError("MaybeSnapshot: " + e); }
@@ -433,6 +470,7 @@ namespace NukeStats
                 float tokens = Mathf.Min(cap, b.tokens + (now - b.last) * rate);
                 if (tokens >= 1f) { _orderBucket[id] = (tokens - 1f, now); return true; }
                 _orderBucket[id] = (tokens, now);                          // empty: keep the clock moving
+                try { _netDrops[id] = (_netDrops.TryGetValue(id, out var nd) ? nd : 0) + 1; } catch { }   // net-health: per-player rate-dropped order count (reset each emit)
                 if (FloodLogDrops != null && FloodLogDrops.Value)
                 {
                     if (!_orderDropLog.TryGetValue(id, out var t) || now - t > 5f)
@@ -536,6 +574,213 @@ namespace NukeStats
                 return $"{u.GetType().Name}/{jk ?? nm ?? "?"}";
             }
             catch { return u.GetType().Name; }
+        }
+
+        // ======================= CONNECTION-HEALTH telemetry + RTT probe =======================
+        // Two read-only, fail-open, never-throw additions for the connection-stress webcc panel.
+        //  (A) NetHealthTick(): emit a {"t":"net"} line every snapshot when humans>0 -- per-player order/drop
+        //      rate, anti-grief streak, forced-DC count + last reason -- using ONLY existing counters plus the
+        //      two tiny tallies below. NEEDS NO RTT, so it ships regardless of whether ping is reachable.
+        //  (B) NetProbe(): a ONE-OFF diagnostic (Diag.NetProbe, default false) that dumps the first online
+        //      player's connection object's fields to LogOutput.log to settle whether per-player RTT is reachable.
+        // Everything is try/catch-swallowed and read-only; nothing here can disturb the netcode.
+
+        // per-player tallies for the {"t":"net"} line, reset on each emit (lightweight, no allocation churn)
+        static readonly Dictionary<string, int> _netOrders = new Dictionary<string, int>();   // CmdSetDestination attempts since last emit
+        static readonly Dictionary<string, int> _netDrops  = new Dictionary<string, int>();    // rate-dropped orders since last emit
+        // forced-DC bookkeeping, populated by DcReasonPatch (keyed on SteamID)
+        internal static readonly Dictionary<string, int>    _dcCount  = new Dictionary<string, int>();
+        internal static readonly Dictionary<string, string> _dcReason = new Dictionary<string, string>();
+        static float _netEmitElapsedAnchor = -1f;
+
+        // Reflectively read NetworkTime.Rtt (proves it reads ~0 on a headless server). Empty string if unresolved.
+        static string ProbeRttString()
+        {
+            try
+            {
+                var ntT = AccessTools.TypeByName("Mirage.NetworkTime");
+                if (ntT == null) return "";
+                var rttP = AccessTools.Property(ntT, "Rtt");
+                if (rttP != null && rttP.GetMethod != null && rttP.GetMethod.IsStatic)
+                    return System.Convert.ToString(rttP.GetValue(null), CultureInfo.InvariantCulture);
+                return "";
+            }
+            catch { return ""; }
+        }
+
+        // Reflectively read the per-connection reliable-send-buffer cap (Layer C target) for the bufCap field.
+        static int ProbeSendBufferCap()
+        {
+            try
+            {
+                var nmno = NetworkManagerNuclearOption.i;
+                if (nmno == null) return 0;
+                var server = ReflectGet(nmno, "Server");
+                var peerCfg = server != null ? ReflectGet(server, "PeerConfig") : null;
+                var v = peerCfg != null ? ReflectGet(peerCfg, "MaxReliablePacketsInSendBufferPerConnection") : null;
+                return v != null ? System.Convert.ToInt32(v) : 0;
+            }
+            catch { return 0; }
+        }
+
+        // field-or-property reflective getter (read-only, swallow)
+        static object ReflectGet(object o, string name)
+        {
+            try
+            {
+                if (o == null) return null;
+                var t = o.GetType();
+                var p = AccessTools.Property(t, name);
+                if (p != null && p.GetMethod != null) return p.GetValue(o);
+                var f = AccessTools.Field(t, name);
+                return f != null ? f.GetValue(o) : null;
+            }
+            catch { return null; }
+        }
+
+        // Connection-health line. NO RTT. Emits only existing counters; omits any field we can't compute.
+        internal static void NetHealthTick()
+        {
+            try
+            {
+                var humans = Humans();
+                if (humans.Count == 0) return;
+                float now = Time.time;
+                float elapsed = _netEmitElapsedAnchor < 0f ? 1f : Mathf.Max(0.5f, now - _netEmitElapsedAnchor);
+                _netEmitElapsedAnchor = now;
+
+                var sb = new StringBuilder(256);
+                sb.Append("{\"t\":\"net\",\"p\":[");
+                bool first = true;
+                foreach (var p in humans)
+                {
+                    string id = Sid(p);
+                    if (string.IsNullOrEmpty(id) || id == "0") continue;
+                    int orders = _netOrders.TryGetValue(id, out var o2) ? o2 : 0;
+                    int drops  = _netDrops.TryGetValue(id, out var d2) ? d2 : 0;
+                    int ordPerSec = (int)(orders / elapsed);
+                    int streak = _griefStreak.TryGetValue(id, out var st) ? st : 0;
+                    int sbDc   = _dcCount.TryGetValue(id, out var dc) ? dc : 0;
+                    string lastDc = _dcReason.TryGetValue(id, out var dr) ? dr : "";
+                    if (!first) sb.Append(',');
+                    first = false;
+                    sb.Append("{\"id\":\"").Append(id).Append("\",\"ord\":").Append(ordPerSec)
+                      .Append(",\"drop\":").Append(drops)
+                      .Append(",\"streak\":").Append(streak)
+                      .Append(",\"sbDc\":").Append(sbDc)
+                      .Append(",\"lastDc\":\"").Append(Esc(lastDc)).Append("\"}");
+                }
+                sb.Append("],\"deadNet\":").Append(_deadNetDrops)
+                  .Append(",\"bufCap\":").Append(ProbeSendBufferCap()).Append('}');
+                Out(sb.ToString());
+                _netOrders.Clear(); _netDrops.Clear();   // reset per-emit tallies (forced-DC tallies persist for the panel)
+            }
+            catch (Exception e) { Log?.LogError("NetHealthTick: " + e); }
+        }
+
+        // ONE-OFF RTT-reachability probe. Pure read-only reflection; emits to LogOutput.log only, never to players.
+        static int _netProbeRuns; static bool _netProbeDone;
+        internal static void NetProbe()
+        {
+            try
+            {
+                if (DiagNetProbe == null || !DiagNetProbe.Value || _netProbeDone) return;
+                var humans = Humans();
+                if (humans.Count == 0) return;
+                if (_netProbeRuns++ >= 3) { _netProbeDone = true; return; }   // a few snapshots then stop (throttle)
+
+                Player p = humans[0];
+                object owner = ReflectGet(p, "Owner");                        // INetworkPlayer
+                Log?.LogInfo($"[netprobe] run #{_netProbeRuns}: NetworkTime.Rtt={ProbeRttString()} (expect ~0 on a headless server) bufCap={ProbeSendBufferCap()}");
+                if (owner == null) { Log?.LogInfo("[netprobe] Owner is null (no INetworkPlayer); cannot reach a connection object"); return; }
+                Log?.LogInfo($"[netprobe] Owner concrete type: {owner.GetType().FullName}");
+                object conn = ReflectGet(owner, "Connection");               // IConnection (Mirror/Mirage fork-specific)
+                if (conn == null) { DumpMembers("Owner", owner, 0); return; } // no Connection member -> dump the player object itself
+                DumpMembers("Connection", conn, 0);
+                _netProbeDone = (_netProbeRuns >= 3);
+            }
+            catch (Exception e) { Log?.LogError("NetProbe: " + e); }
+        }
+
+        // Log every numeric/string field & property of `o`; recurse ONE level into any AckSystem-ish member.
+        static void DumpMembers(string label, object o, int depth)
+        {
+            try
+            {
+                if (o == null) { Log?.LogInfo($"[netprobe] {label}: <null>"); return; }
+                var t = o.GetType();
+                Log?.LogInfo($"[netprobe] {label} type={t.FullName} (depth {depth})");
+                const BindingFlags BF = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+                foreach (var f in t.GetFields(BF))
+                {
+                    try { object v = f.GetValue(o); ProbeMember(label, f.Name, f.FieldType, v, depth); }
+                    catch { }
+                }
+                foreach (var pr in t.GetProperties(BF))
+                {
+                    try
+                    {
+                        if (pr.GetMethod == null || pr.GetIndexParameters().Length > 0) continue;
+                        object v = pr.GetValue(o);
+                        ProbeMember(label, pr.Name, pr.PropertyType, v, depth);
+                    }
+                    catch { }
+                }
+            }
+            catch (Exception e) { Log?.LogError("DumpMembers: " + e); }
+        }
+
+        static void ProbeMember(string label, string name, Type type, object v, int depth)
+        {
+            try
+            {
+                string tn = type != null ? type.Name : "?";
+                bool ackish = (tn.IndexOf("AckSystem", StringComparison.OrdinalIgnoreCase) >= 0)
+                              || name.StartsWith("ack", StringComparison.OrdinalIgnoreCase)
+                              || name.IndexOf("AckSystem", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (v == null) { Log?.LogInfo($"[netprobe]   {label}.{name} ({tn}) = null"); return; }
+                if (type != null && (type.IsPrimitive || type.IsEnum || v is string || v is decimal))
+                    Log?.LogInfo($"[netprobe]   {label}.{name} ({tn}) = {System.Convert.ToString(v, CultureInfo.InvariantCulture)}");
+                else
+                    Log?.LogInfo($"[netprobe]   {label}.{name} ({tn}) = <object>");
+                if (ackish && depth < 1)
+                    DumpMembers(label + "." + name, v, depth + 1);
+            }
+            catch { }
+        }
+
+        // Map a Mirage IConnection (the arg to Peer_OnDisconnected) to the SteamID of a CURRENT player, by
+        // reflectively comparing each online player's Owner.Connection. Read-only; "" if no live match.
+        internal static string SidForConnection(object conn)
+        {
+            try
+            {
+                if (conn == null) return "";
+                foreach (var p in Humans())
+                {
+                    try
+                    {
+                        object owner = ReflectGet(p, "Owner");
+                        object pConn = owner != null ? ReflectGet(owner, "Connection") : null;
+                        if (pConn != null && ReferenceEquals(pConn, conn)) return Sid(p);
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            return "";   // player already removed from the lookup by the time we run -> unmapped (telemetry just omits it)
+        }
+
+        // Record a forced disconnect (count + last reason) for the {"t":"net"} telemetry line. Called from DcReasonPatch.
+        internal static void NoteForcedDc(string sid, string reason)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(sid) || sid == "0") return;
+                _dcCount[sid] = (_dcCount.TryGetValue(sid, out var c) ? c : 0) + 1;
+                _dcReason[sid] = reason ?? "";
+            }
+            catch { }
         }
 
         // Layer B bookkeeping: count silently-dropped dead-netId ServerRpcs (the log/alloc amplifier),
@@ -968,10 +1213,42 @@ namespace NukeStats
         {
             try
             {
-                var cm = Cm ?? (Cm = UnityEngine.Object.FindObjectOfType<ChatManager>());   // cache for callers before any chat
+                var cm = Cm;
+                if (cm == null) cm = (Cm = UnityEngine.Object.FindObjectOfType<ChatManager>());   // Unity-null-safe: `??` would keep a DESTROYED ref (fake-null)
                 if (cm != null && p != null && p.Owner != null) cm.RpcTargetServerMessage(p.Owner, msg, false);
+                else Log?.LogWarning($"[tell] SKIP send: cm={(cm != null)} p={(p != null)} owner={(p != null && p.Owner != null)} len={(msg != null ? msg.Length : 0)}");
             }
             catch (Exception e) { Log?.LogError("TellPlayer: " + e); }
+        }
+
+        // Private command list (the !help reply). Sent natively from the plugin via TellPlayer -- the SAME
+        // path as !spec's confirmation, which renders reliably -- instead of the bot's relayed 'tell' verb
+        // (which logged "delivering" but never rendered). Built here so no text is relayed. ONE message with
+        // \n line breaks; the diagnostic log records the size + ChatManager state so a non-render is visible.
+        // NOTE: keep this list in sync with help_lines() in no_mapvote_bot.py (the all-chat fallback there).
+        internal void SendHelp(Player p)
+        {
+            try
+            {
+                string[] lines = {                                      // keep IN SYNC with help_lines() in no_mapvote_bot.py
+                    "<color=#FFFF00>=== SERVER COMMANDS ===</color>",
+                    "<color=#55FF55>!votemap</color> - vote to change the map",
+                    "<color=#55FF55>!rank</color> - your rank & points to next",
+                    "<color=#55FF55>!skill</color> - your skill rating (points/life)",
+                    "<color=#55FF55>!points</color> - points this life / last life",
+                    "<color=#55FF55>!leaderboard</color> - top pilots",
+                    "<color=#55FF55>!spec</color> - go to spectator",
+                    "<color=#55FF55>!balance</color> - how team balancing works",
+                    "<color=#55FF55>!squadup <player></color> - squad up for PvP (!y to accept)",
+                    "<color=#55FF55>!forfeit</color> - vote to surrender (PvP; !ff)",
+                    "<color=#55FF55>!notk</color> - no-team-killing policy",
+                    "<color=#55FF55>!help</color> - this command list",
+                };
+                string msg = string.Join("\n", lines);
+                Log?.LogInfo($"[help] -> {Sid(p)} : {lines.Length} lines, {msg.Length} chars, Cm={(Cm != null)}");
+                TellPlayer(p, msg);
+            }
+            catch (Exception e) { Log?.LogError("SendHelp: " + e); }
         }
 
         // -------- player-vs-player kill (for the +bonus + "splashed" announce) --------
@@ -1477,6 +1754,10 @@ namespace NukeStats
         static readonly HashSet<string> _tkBanned = new HashSet<string>(StringComparer.Ordinal);                  // persistent
         static readonly HashSet<string> _tkRankZero = new HashSet<string>(StringComparer.Ordinal);               // rank 0 on next sight
         static readonly List<KeyValuePair<string, float>> _tkKicks = new List<KeyValuePair<string, float>>();    // delayed kicks
+        static readonly Dictionary<string, string> _tkLastVictim = new Dictionary<string, string>(StringComparer.Ordinal);  // killer sid -> last teammate killed (moderation log cause)
+        static readonly Dictionary<string, string> _tkLastMethod = new Dictionary<string, string>(StringComparer.Ordinal);  // killer sid -> how the last TK happened (weapon/splash/SAM/ram) for the report
+        static readonly Dictionary<string, float>  _tkLastEventAt = new Dictionary<string, float>(StringComparer.Ordinal);  // killer sid -> last time we enqueued a TK offence (per-EVENT dedup, see TK_EVENT_DEDUP)
+        const float TK_EVENT_DEDUP = 1.5f;   // one blast/event (same instigator within this window) = AT MOST one offence, even if it kills several friendlies
         static System.Reflection.FieldInfo _dmgCreditFI;
         static float _nextTkScan;
 
@@ -1491,7 +1772,62 @@ namespace NukeStats
             try { File.WriteAllText(BanFilePath, string.Join("\n", _tkBanned) + "\n"); }
             catch (Exception e) { Log?.LogError("SaveBans: " + e); }
         }
-        internal static void ClearMatchTeamkills() { _tkCount.Clear(); _tkRankZero.Clear(); }   // per-match reset (bans persist)
+        internal static void ClearMatchTeamkills() { _tkCount.Clear(); _tkRankZero.Clear(); _tkLastVictim.Clear(); _tkLastMethod.Clear(); _tkLastEventAt.Clear(); }   // per-match reset (bans persist)
+
+        // Emit a teamkill-moderation event to the bot ([NOSTATS] line it tails) -> activity log + the webcc
+        // Moderation tab, recording WHAT caused the eject/kick/ban (the teammate killed + the offense count).
+        // ts=0 -> the bot stamps the real time on ingest.
+        static void EmitTkMod(string sid, Player p, string action, int count)
+        {
+            string nm = p != null ? RawNameOf(p) : sid;
+            string victim = (_tkLastVictim.TryGetValue(sid, out var v) && !string.IsNullOrEmpty(v)) ? v : "a teammate";
+            // method = HOW the last TK happened (direct weapon vs splash vs SAM/CRAM vs ram), for the moderation report
+            string method = (_tkLastMethod.TryGetValue(sid, out var m) && !string.IsNullOrEmpty(m)) ? m : "weapon";
+            Out("{\"t\":\"tk\",\"id\":\"" + sid + "\",\"n\":\"" + Esc(nm)
+                + "\",\"victim\":\"" + Esc(victim) + "\",\"method\":\"" + Esc(method) + "\",\"count\":" + count
+                + ",\"action\":\"" + action + "\",\"ts\":0}");
+        }
+
+        // Heli-dropped SAM/CRAM/AA names that auto-engage (deployed defenses) -- their friendly kills are AI-tasked,
+        // not a deliberate human trigger-pull. Kept name-only (the damaging unit's definition.unitName, already
+        // resolved at the kill site) so this never depends on a game-API member that could break plugin load.
+        static bool IsAutoDefenseUnit(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            string n = name.ToLowerInvariant();
+            return n.Contains("sam") || n.Contains("cram") || n.Contains("c-ram") || n.Contains("phalanx")
+                || n.Contains("flak") || n.Contains(" aa") || n.EndsWith("aa") || n.Contains("anti-air") || n.Contains("anti air");
+        }
+
+        // Classify HOW a friendly kill happened from the damaging unit's name + agency, AND whether it counts as a
+        // DELIBERATE teamkill. A directly-piloted weapon (a pilot's gun/missile/bomb, a player ramming) IS
+        // deliberate; an auto-engaging deployed defense (heli-dropped SAM/CRAM/AA) or an AI-tasked / strategic
+        // launcher fired itself and must NOT escalate the human owner through warn->kick->BAN (the #6 innocent-ban
+        // bug). Fail-open: on any ambiguity treat it as a deliberate weapon kill (preserves catch-genuine-TK).
+        // `unitName` = the damaging unit's definition.unitName (may be null/empty); `killer` non-null = a resolved
+        // human controller. Out `deliberate` => count it as an offence; returns the report-method tag.
+        static string ClassifyTkMethod(string unitName, Player killer, out bool deliberate)
+        {
+            deliberate = true;
+            try
+            {
+                string ln = !string.IsNullOrEmpty(unitName) ? unitName.ToLowerInvariant() : "";
+                bool strategic = IsStrategicLauncher(unitName);
+                bool autoDef   = IsAutoDefenseUnit(unitName);
+                if (strategic || autoDef)
+                {
+                    deliberate = false;   // auto/AI-tasked -> report it, but do NOT escalate the owner
+                    if (ln.Contains("cram") || ln.Contains("c-ram") || ln.Contains("phalanx")) return "CRAM (auto)";
+                    if (ln.Contains("sam")) return "SAM (auto)";
+                    if (strategic) return "strategic launcher (auto)";
+                    return "AA (auto)";
+                }
+                // Directly-piloted weapon kill. Default to "weapon" when the damaging unit name is unknown.
+                if (!string.IsNullOrEmpty(unitName)) return "weapon (" + unitName + ")";
+            }
+            catch { }
+            return "weapon";
+        }
 
         static void Kick(Player p)
         {
@@ -1548,12 +1884,13 @@ namespace NukeStats
                     foreach (System.Collections.DictionaryEntry e in dc)
                     { float v; try { v = Convert.ToSingle(e.Value); } catch { continue; } if (v > top) { top = v; topKey = e.Key; } }
 
-                Player killer = null; FactionHQ killerHQ = null; string killerName = null;
+                Player killer = null; FactionHQ killerHQ = null; string killerName = null; string dmgUnitName = null;
                 if (topKey != null && UnitRegistry.TryGetPersistentUnit((PersistentID)topKey, out var pu))
                 {
                     try { killer = pu.player; } catch { }
                     try { killerHQ = pu.GetHQ(); } catch { }
-                    try { killerName = (killer != null) ? RawNameOf(killer) : (pu.definition != null ? SafeText(pu.definition.unitName) : null); } catch { }
+                    try { dmgUnitName = pu.definition != null ? SafeText(pu.definition.unitName) : null; } catch { }   // the damaging UNIT (used for TK method/agency, even when piloted)
+                    try { killerName = (killer != null) ? RawNameOf(killer) : dmgUnitName; } catch { }
                 }
 
                 // KILLFEED -> bot: every human death with who/what downed them (player name OR AI/unit name).
@@ -1565,7 +1902,8 @@ namespace NukeStats
                     bool ff = kPlayer && killerHQ != null && deadHQ != null && killerHQ == deadHQ;
                     Out("{\"t\":\"down\",\"v\":\"" + Sid(victim) + "\",\"vn\":\"" + Esc(RawNameOf(victim))
                         + "\",\"k\":\"" + Esc(kdisp) + "\",\"ks\":\"" + (kPlayer ? Sid(killer) : "")
-                        + "\",\"kp\":" + (kPlayer ? 1 : 0) + ",\"ff\":" + (ff ? 1 : 0) + "}");
+                        + "\",\"kp\":" + (kPlayer ? 1 : 0) + ",\"ff\":" + (ff ? 1 : 0)
+                        + ",\"w\":\"" + Esc(dmgUnitName ?? "") + "\"}");   // w = the damaging UNIT name (killer's aircraft / SAM / launcher; empty on env/crash) for the webcc weapon column
                 }
 
                 // player shot-down message (skip enemy-player kills -> the bot says "X splashed Y")
@@ -1593,7 +1931,36 @@ namespace NukeStats
                 if (tkOn && killer != null && killerHQ != null && deadHQ != null && killerHQ == deadHQ && killer != victim)
                 {
                     string sid = Sid(killer);
-                    if (!string.IsNullOrEmpty(sid) && sid != "0") { _tkQueue.Add(sid); Log?.LogInfo($"[tk] friendly kill by {RawNameOf(killer)}"); }
+                    if (!string.IsNullOrEmpty(sid) && sid != "0")
+                    {
+                        // #6: agency check -- a SAM/CRAM/AA/strategic-launcher auto-engaged on its own AI, NOT a
+                        // deliberate human trigger-pull. Record the method for the report but DON'T escalate the
+                        // owner. Genuine direct-weapon TKs (deliberate==true) still queue and escalate as before.
+                        bool deliberate; string method = ClassifyTkMethod(dmgUnitName, killer, out deliberate);
+                        _tkLastVictim[sid] = RawNameOf(victim);
+                        _tkLastMethod[sid] = method;
+                        if (!deliberate)
+                        {
+                            Log?.LogInfo($"[tk] AUTO friendly kill by {RawNameOf(killer)} ({method}) -> {RawNameOf(victim)} -- NOT counted (auto/AI-tasked)");
+                        }
+                        else
+                        {
+                            // #5: per-EVENT dedup -- one blast (AoE/nuke/bomb splash) that catches several
+                            // teammates fires CheckTeamkill once PER victim in the same tick/short window, with the
+                            // SAME instigator. Count it as AT MOST ONE offence so a single splash can't jump a player
+                            // straight to BAN. We still refresh victim/method above so the report shows the latest.
+                            float nowT = Time.time;
+                            bool dup = _tkLastEventAt.TryGetValue(sid, out var lastT) && (nowT - lastT) < TK_EVENT_DEDUP;
+                            _tkLastEventAt[sid] = nowT;
+                            if (dup)
+                                Log?.LogInfo($"[tk] friendly kill by {RawNameOf(killer)} -> {RawNameOf(victim)} ({method}) -- same event, deduped (already counted this blast)");
+                            else
+                            {
+                                _tkQueue.Add(sid);
+                                Log?.LogInfo($"[tk] friendly kill by {RawNameOf(killer)} -> {RawNameOf(victim)} ({method})");
+                            }
+                        }
+                    }
                 }
             }
             catch (Exception e) { Log?.LogError("CheckTeamkill: " + e); }
@@ -1618,6 +1985,7 @@ namespace NukeStats
                             AdminEject(p);   // life-neutral: a teamkill-warning eject must not end a skill-life
                             Instance?.TellPlayer(p, "<color=#FF5555>FRIENDLY FIRE - first warning.</color> <color=#FFD200>Check your targets. Do it again this match and you'll be removed.</color>");
                         }
+                        EmitTkMod(sid, p, "warn", n);
                         Log?.LogInfo($"[tk] warn+eject {sid} (1)");
                     }
                     else if (n == 2)
@@ -1625,6 +1993,7 @@ namespace NukeStats
                         _tkRankZero.Add(sid);
                         if (p != null) Instance?.TellPlayer(p, "<color=#FF5555>FRIENDLY FIRE - second warning. The next one is a BAN.</color>");
                         _tkKicks.Add(new KeyValuePair<string, float>(sid, now + 2.5f));   // let the message land, then kick
+                        EmitTkMod(sid, p, "kick", n);
                         Log?.LogInfo($"[tk] kick {sid} (2)");
                     }
                     else
@@ -1632,6 +2001,7 @@ namespace NukeStats
                         _tkBanned.Add(sid); SaveBans();
                         if (p != null) Instance?.TellPlayer(p, "<color=#FF0000>BANNED for repeated team killing.</color>");
                         _tkKicks.Add(new KeyValuePair<string, float>(sid, now + 2.5f));
+                        EmitTkMod(sid, p, "ban", n);
                         Log?.LogInfo($"[tk] BAN {sid} (3+)");
                     }
                 }
@@ -1661,10 +2031,12 @@ namespace NukeStats
         // so a legit base-builder who 'select-all + move once' is never kicked. Reuses the teamkill kick/ban
         // path (Kick / _tkKicks / _tkBanned). Fail-open everywhere. =====
         internal static ConfigEntry<bool> GriefAutoKick, GriefRequireFlooding, GriefHardBan, GriefReportOnly, GriefExemptAdmins;
-        internal static ConfigEntry<int>  GriefOwnedThreshold, GriefFloodPerSec;
+        internal static ConfigEntry<int>  GriefOwnedThreshold, GriefFloodPerSec, GriefBreakerDistinct, GriefBreakerWindow;
         static readonly Dictionary<string, int>   _orderAttempts = new Dictionary<string, int>();   // CmdSetDestination attempts since last GriefTick
         static readonly Dictionary<string, int>   _griefStreak   = new Dictionary<string, int>();    // consecutive high-rate ticks per player
         static readonly Dictionary<string, float> _griefActed    = new Dictionary<string, float>();  // last action time (throttle re-acting)
+        static readonly Dictionary<string, float> _griefTrips    = new Dictionary<string, float>();  // sid -> last trip time (server-wide circuit breaker)
+        static float _griefStormAt;   // last time a storm-suppression line was logged (throttle)
         static float _nextGriefScan, _lastGriefScan;
         const float GRIEF_INTERVAL = 2f;
 
@@ -1676,6 +2048,7 @@ namespace NukeStats
                 if (p == null) return; string id = Sid(p);
                 if (string.IsNullOrEmpty(id) || id == "0") return;
                 _orderAttempts[id] = (_orderAttempts.TryGetValue(id, out var c) ? c : 0) + 1;
+                try { _netOrders[id] = (_netOrders.TryGetValue(id, out var no) ? no : 0) + 1; } catch { }   // net-health: per-player order count since last emit (reset each emit)
             }
             catch { }
         }
@@ -1699,6 +2072,8 @@ namespace NukeStats
                 bool hardBan      = GriefHardBan != null && GriefHardBan.Value;
                 bool exemptAdmins = GriefExemptAdmins == null || GriefExemptAdmins.Value;
                 bool diag         = CommandDiagLog != null && CommandDiagLog.Value;
+                int  breakerDist  = GriefBreakerDistinct != null ? Mathf.Max(0, GriefBreakerDistinct.Value) : 3;   // 0 = breaker off
+                float breakerWin  = GriefBreakerWindow != null ? Mathf.Max(1, GriefBreakerWindow.Value) : 6f;
 
                 // snapshot + reset the per-player order-attempt counters for this window
                 var attempts = new Dictionary<string, int>(_orderAttempts);
@@ -1755,13 +2130,33 @@ namespace NukeStats
                     if (_griefActed.TryGetValue(sid, out var t) && now - t < 15f) continue;   // throttle re-acting
                     _griefActed[sid] = now;
 
-                    string action = reportOnly ? "report" : (hardBan ? "ban" : "kick");
-                    Log?.LogWarning($"[grief] {action} {RawNameOf(p)} ({sid}) owned={owned} rate={rateNow}/s streak={streak}");
+                    // SERVER-WIDE CIRCUIT BREAKER (#8): record this trip + prune the window. If MANY DISTINCT
+                    // players trip together it's a synchronized order/lag SPIKE (congestion), not grief -> SUPPRESS
+                    // all kicks/bans (we still emit each report so admins see it). Mirrors the bot's flood-breaker.
+                    _griefTrips[sid] = now;
+                    if (breakerWin > 0)
+                        foreach (var s in new List<string>(_griefTrips.Keys))
+                            if (now - _griefTrips[s] > breakerWin) _griefTrips.Remove(s);
+                    bool storm = breakerDist > 0 && _griefTrips.Count >= breakerDist;
+
+                    string action = reportOnly ? "report" : (storm ? "report" : (hardBan ? "ban" : "kick"));
+                    if (storm)
+                    {
+                        if (now - _griefStormAt > 30f)
+                        {
+                            _griefStormAt = now;
+                            Log?.LogWarning($"[grief] STORM: {_griefTrips.Count} players tripped together within {breakerWin}s "
+                                + "-> treated as server congestion (not grief); auto-kicks SUPPRESSED");
+                        }
+                    }
+                    else
+                        Log?.LogWarning($"[grief] {action} {RawNameOf(p)} ({sid}) owned={owned} rate={rateNow}/s streak={streak}");
                     // emit the report ([NOSTATS] line the bot tails); ts=0 -> the bot stamps the real time on ingest
                     Out("{\"t\":\"report\",\"id\":\"" + sid + "\",\"n\":\"" + Esc(RawNameOf(p))
-                        + "\",\"reason\":\"command-spam (sustained order rate)\",\"count\":" + owned + ",\"rate\":" + rateNow
+                        + "\",\"reason\":\"" + (storm ? "command-spam (SUPPRESSED: server-wide storm, likely congestion)" : "command-spam (sustained order rate)")
+                        + "\",\"count\":" + owned + ",\"rate\":" + rateNow
                         + ",\"action\":\"" + action + "\",\"ts\":0}");
-                    if (reportOnly) continue;
+                    if (reportOnly || storm) continue;   // storm -> report only, never kick (don't amplify congestion into a mass-kick)
                     Instance?.TellPlayer(p, "<color=#FF0000>Auto-removed: commanding too many units at once (server protection).</color>");
                     if (hardBan) { _tkBanned.Add(sid); SaveBans(); }
                     _tkKicks.Add(new KeyValuePair<string, float>(sid, now + 2.5f));   // delayed kick (let the msg land) -> drained by TkTick
@@ -1974,6 +2369,11 @@ namespace NukeStats
                 if (verb == "spec" || verb == "spectate" || verb == "unteam")
                 {
                     Instance?.RequestMove(target, null, true);          // immediate (ejects if flying)
+                    return;
+                }
+                if (verb == "help")                                     // private command list, delivered like !spec's reply
+                {
+                    Instance?.SendHelp(target);
                     return;
                 }
                 if (verb == "move" || verb == "join" || verb == "team")
@@ -2923,6 +3323,31 @@ namespace NukeStats
         sealed class SwapJob { public Player p, admin; public FactionHQ destHQ; public bool force; public SwapPhase phase; public float due, deadline; }
         static readonly List<SwapJob> _swaps = new List<SwapJob>();
 
+        // PUBLIC: a player moves THEMSELVES to the other team via bare !swapteam, allowed ONLY when that team
+        // has FEWER players (so it can never make PvP more lopsided). PvE is excluded automatically (TwoSides
+        // is false with only one joinable faction). Keeps their points + life. Admin !swapteam <player> /
+        // !forceteamswap (no balance check) stay separate, below the admin gate.
+        internal void HandlePublicSwap(Player p)
+        {
+            try
+            {
+                if (!TwoSides(out var A, out var B)) { TellPlayer(p, "<color=#FFC857>!swapteam only works in a PvP match with two teams.</color>"); return; }
+                FactionHQ mine = null; try { mine = p.HQ; } catch { }
+                if (mine == null || (!ReferenceEquals(mine, A) && !ReferenceEquals(mine, B)))
+                { TellPlayer(p, "<color=#FFC857>Pick a team first, then type !swapteam to switch to the smaller side.</color>"); return; }
+                FactionHQ other = ReferenceEquals(mine, A) ? B : A;
+                int mineN = Side(mine).Count, otherN = Side(other).Count;
+                string on = other.faction != null ? other.faction.factionName : "the other team";
+                if (otherN >= mineN)
+                {
+                    TellPlayer(p, $"<color=#FFC857>Can't swap to {on} - it isn't smaller ({otherN} vs your {mineN}). !swapteam only lets you move to the team with FEWER players, to keep it fair.</color>");
+                    return;
+                }
+                BeginSwap(p, p, false);   // self-swap (swapteam mechanic): spectate -> swap -> brief Cricket -> eject; keeps points + life
+            }
+            catch (Exception e) { Log?.LogError("HandlePublicSwap: " + e); }
+        }
+
         internal void BeginSwap(Player tgt, Player admin, bool force)
         {
             try
@@ -3096,6 +3521,9 @@ namespace NukeStats
                 {
                     Cm = cm; RequestMove(p, null, true); return true;
                 }
+                // PUBLIC: a bare !swapteam moves YOU to the other team, but only if it has FEWER players (PvP
+                // balance). Admin "!swapteam <player>" / !forceteamswap fall through to the admin gate below.
+                if (cmd == "swapteam" && parts.Length == 1) { Cm = cm; HandlePublicSwap(p); return true; }
 
                 // PUBLIC: !squadup - team up with friends (up to MaxSize) so PvP auto-balance won't split you.
                 if (cmd == "squadup" || cmd == "squad" || cmd == "su") { Cm = cm; HandleSquadup(p, parts); return true; }
@@ -3826,6 +4254,30 @@ namespace NukeStats
                 }
             }
             catch (Exception e) { NukeStatsPlugin.Log?.LogError("MirageBufferRaise: " + e); }
+        }
+    }
+
+    // NET-HEALTH: capture the DisconnectReason for each forced drop. Mirage's PUBLIC Disconnected event
+    // gives us the player but NOT the reason; the reason only exists on the PRIVATE
+    // NetworkServer.Peer_OnDisconnected(IConnection, DisconnectReason) callback. We postfix it (read-only)
+    // to tally per-SteamID forced-DC count + last reason for the {"t":"net"} telemetry line. Applied MANUALLY
+    // from Awake (private target); fail-open -- if the method can't be resolved at load, the patch is simply
+    // never installed (net telemetry still emits, lastDc just stays empty). Never throws into the netcode.
+    internal static class DcReasonPatch
+    {
+        static bool _fired;
+        static void Postfix(object __0, object __1)   // __0 = IConnection, __1 = DisconnectReason (kept loose to avoid a hard ref)
+        {
+            try
+            {
+                if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] Peer_OnDisconnected postfix ACTIVE (net-health DisconnectReason capture)"); }
+                if (__0 == null) return;
+                string reason = __1 != null ? __1.ToString() : "";
+                string sid = NukeStatsPlugin.SidForConnection(__0);
+                if (string.IsNullOrEmpty(sid)) return;     // couldn't map this IConnection to a current player
+                NukeStatsPlugin.NoteForcedDc(sid, reason);
+            }
+            catch (Exception e) { NukeStatsPlugin.Log?.LogError("DcReason: " + e); }
         }
     }
 

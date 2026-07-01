@@ -31,6 +31,7 @@ Command centre (legacy):     python no_mapvote_bot.py --centre   (or centre.bat)
 """
 
 import json
+import math
 import os
 import random
 import re
@@ -124,6 +125,11 @@ TERMINAL_CONTROL_MISSIONS = [
 # does NOT exist on the server - only its co-op variants.)
 PVP_MISSIONS = [
     "Escalation",
+    "Terminal Control",
+    "Altercation",
+    "Confrontation",
+    "Domination",
+    "Breakout",
 ]
 
 # The curated OFFICIAL mission pool this server ships (every mission in the stock MissionRotation). Any
@@ -143,6 +149,10 @@ MAX_DARK_PER_VOTE = 3
 PVP_OPTIONS = [
     ("BuiltIn", "Escalation",       "Escalation <color=#FF5555>[PVP]</color>"),
     ("BuiltIn", "Terminal Control", "Terminal Control <color=#FF5555>[PVP]</color>"),
+    ("BuiltIn", "Altercation",      "Altercation <color=#8FA9C9>· dogfight focus</color>"),
+    ("BuiltIn", "Confrontation",    "Confrontation <color=#8FA9C9>· combined arms</color>"),
+    ("BuiltIn", "Domination",       "Domination <color=#8FA9C9>· air superiority</color>"),
+    ("BuiltIn", "Breakout",         "Breakout <color=#8FA9C9>· naval attack</color>"),
 ]
 
 # Current ballot, rebuilt each vote by open_vote(). Keys "1".."6" map to
@@ -223,6 +233,13 @@ RANKS = [
     (50000,  "Air Marshal",       "AIRMSHL", "#D2D6DB"),  # silver
     (100000, "Air Chief Marshal", "ACM",     "#FFD700"),  # gold
 ]
+# The ladder above is the built-in DEFAULT. The live ladder (titles/thresholds/abbrs/colours +
+# the rank-up announcement template) is editable from the webcc "Ranks" modal and persisted to
+# rank_ladder.json; load_rank_ladder() rebuilds RANKS from it at startup (fail-open to DEFAULT).
+DEFAULT_RANKS           = list(RANKS)
+DEFAULT_RANKUP_TEMPLATE = "<color={color}>** RANK UP ** {name} is now {rank} ({abbr})!</color>"
+RANKUP_TEMPLATE         = DEFAULT_RANKUP_TEMPLATE
+RANK_LADDER_FILE        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rank_ladder.json")
 RANK_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ranks.json")
 RANK_DATA    = {}            # steamid -> {"name": str, "points": int}
 PLAYER_NAMES = {}            # steamid -> last-seen display name (for chat rank lines)
@@ -246,6 +263,9 @@ CUR_MATCH          = None    # active match accumulator (see match_*), None betw
 SCORE_ACCUM        = {}       # sid -> [name, total in-game score gained this match]; one ledger
                              # "score" line per player flushed at match_finalize (snaps are too
                              # frequent to ledger individually). See ledger_award / _flush_score_accum.
+GAIN_CLAMP_MAX     = 1000.0   # hard upper clamp on a single snap's credited gain (defence-in-depth vs the
+                             # 2026-06-24 score-explosion class): the SPIKE alert still fires on the RAW gain,
+                             # but never more than this is actually banked into points/curLife in one tick.
 SPIKE_THRESHOLD    = 1000.0   # a single snap gain above this is logged + flagged live (exploit tripwire,
                              # cf. the 2026-06-24 score-explosion). Informational only (pts:0 in ledger).
 CURRENT_MISSION    = "(unknown)"  # name of the mission currently running (for match records)
@@ -264,6 +284,7 @@ _ms_mission        = None                         # mission the milestone state 
 _ms_last_elapsed   = 0.0                          # previous elapsed reading (detect the reset to ~0)
 _ms_cycle_at       = 0.0                          # wall-time a start-bonus cycle last opened (anti-double)
 _ms_start_done     = False                        # start bonus already granted this mission (one-shot at the 1-min mark)
+START_BONUS_FILE   = os.path.join(_BASE_DIR, "start_bonus_granted.json")  # persists {match_key: [sids granted]} so a mid-match bot restart never re-awards the +250
 _ms_start_said     = False                        # announced the kickoff line this mission
 _ms_stay_fired     = set()                        # which STAY_MARKS have fired this mission
 
@@ -279,6 +300,8 @@ KILLFEED_MAX       = 30
 _recent_kill       = {}      # victim sid -> {kname,ksid,kfac,kp,ts}: who/what downed them (from kill/down events; correlated onto the killfeed)
 AIR                = None     # latest AI/player aircraft counts from the plugin's "air" line (perf panel)
 AIR_TS             = 0.0      # when AIR was last updated (stale => hide the panel)
+NET                = None     # latest connection-health/RTT-probe telemetry from the plugin's "net" line (Connection Stress panel)
+NET_TS             = 0.0      # when NET was last updated (stale => omit from state)
 ENT                = None     # latest {"a":[AI aircraft],"s":[ships]} from the plugin's "ent" line (live map; ~5s)
 ENT_TS             = 0.0      # when ENT was last updated (stale => omit from state)
 
@@ -287,8 +310,11 @@ PLUGIN_CFG         = {}       # "Section.Key" -> current value, reported live by
 PLUGIN_CFG_TS      = 0.0      # when PLUGIN_CFG was last refreshed
 # bot-owned settings the bot reads at startup (a bot restart fully applies them). Overrides set via the
 # settings menu are persisted to bot_overrides.json and re-applied here on the next start.
+TICK_RATE = 60   # server engine frame/tick rate (Hz). 30-120. Applied by the launch wrapper on the next
+                 # SERVER (re)start, NOT by a bot restart. The wrapper generator reads _read_tick_rate().
 _BOT_OVERRIDE_KEYS = ("MISSION_MAX_TIME", "VOTE_DURATION", "APPROVAL_DURATION",
-                      "KILL_BONUS", "UNDERDOG_PER_PLAYER", "START_BONUS_PTS", "START_BONUS_WINDOW")
+                      "KILL_BONUS", "UNDERDOG_PER_PLAYER", "START_BONUS_PTS", "START_BONUS_WINDOW",
+                      "TICK_RATE")
 try:
     with open(os.path.join(_BASE_DIR, "bot_overrides.json"), "r", encoding="utf-8") as _bof:
         _bo = json.load(_bof)
@@ -402,7 +428,7 @@ def write_dashboard_state(*, state, server_up, online, votes, vote_ends_at,
             rec  = RANK_DATA.get(sid, {})
             meta = STATS_META.get(sid, {})
             ros  = ROSTER_BY_SID.get(sid, {})
-            pts  = rec.get("points", 0.0)
+            pts  = player_points(sid)                          # COMBINED across the host's servers when sharing is on (display)
             _, rname, abbr, color = RANKS[rank_index_for(pts)]
             # live map: fresh pos => flying; DOWNED (just died/ejected) or stale pos => shot-down at LAST location
             _pp = POS.get(sid)
@@ -462,14 +488,19 @@ def write_dashboard_state(*, state, server_up, online, votes, vote_ends_at,
             "approval":     approval,
             "players":      players,
             "air":          AIR if (AIR and now - AIR_TS < 15) else None,   # AI/player aircraft counts (perf panel)
+            "net":          ({**NET, "ts": round(NET_TS, 2)} if (NET and now - NET_TS < 15) else None),   # connection-health telemetry + reading timestamp (so the webcc NET graph samples once per reading, not per poll)
             "entities":     ENT if (ENT and now - ENT_TS < 15) else None,   # AI aircraft + ships for the live map
             "killfeed":     [k for k in KILLFEED[:KILLFEED_MAX] if now - k.get("ts", 0) < 1200],  # recent deaths (newest first, <20 min) for the webcc killfeed
-            "plugin_cfg":   PLUGIN_CFG if PLUGIN_CFG else None,   # live plugin config values for the webcc settings menu
+            "plugin_cfg":   _dashboard_plugin_cfg(),             # live plugin config (public-listing keys overlaid from global_optin.json so they don't 'keep turning off')
             "mission_pool": mission_pool_state(),                # votemap pool toggles for the webcc Mission Pool modal
             "server_messages": server_messages_state(),          # automated chat messages for the webcc Messages modal
+            "rank_ladder": rank_ladder_state(),                  # editable rank ladder (titles/points/colours/template) for the webcc Ranks modal
+            "shared_ranks": shared_ranks_state(),                # cross-server shared-rank status + combined board for the webcc Shared Ranks card
             "reports": reports_state(),                          # anti-grief auto-kick/flag reports for the webcc Reports tab
+            "ban_log": ban_log_state(),                          # persistent per-SteamID ban log (repeat-offender tracking) for the webcc Reports tab
             "server_config": server_config_state(),              # DedicatedServerConfig.json fields for the webcc Server Settings tab
             "sys_messages": sysmsg_state(),                       # built-in automated-message overrides for the webcc Messages tab
+            "help_config": help_state(),                          # !help command list (text + show/hide gates) for the webcc Help editor
             "mission_audit": mission_audit_state(),               # official vs custom/workshop missions + integrity + eligibility (webcc Mission Pool)
             "votemap": votemap_cfg_state(),                       # dynamic vote-pool config (ballot size/mode/includes) for the webcc Votemap settings
             "banned_players": banned_players_state(),             # plugin_bans.txt -> webcc Moderation 'Banned' tab
@@ -843,49 +874,162 @@ def mission_pool_state():
             for n, c in _all_pool_missions()]
 
 
-# ── Votemap (dynamic vote pool) configuration: ballot size, composition mode, what's eligible ──────
+# ── Votemap (dynamic vote pool) configuration ─────────────────────────────────────────────────────
+# The end-of-mission / !votemap ballot is sized from TWO pools INDEPENDENTLY so the count of each map
+# TYPE is explicit (the old single "ballot_size" only counted the co-op maps, which was confusing):
+#   * coop_count  PvE co-op (+ enabled custom) maps  — drawn from _votemap_pool()
+#   * pvp_count   PvP built-in modes                 — drawn from the ENABLED PVP_OPTIONS only
+# Default 4 + 2 = the regular 6-option ballot. Each pool has a selection MODE that controls the
+# likelihood mix (balanced/random/weighted for co-op; fixed/random/weighted for PvP) and an optional
+# per-category / per-mode weight table for "weighted". A high-population rule can override the split
+# into a PvP-heavy ballot once enough players are online (force_pvp_*). Decoupling pvp_count from the
+# pool toggles is deliberate: enabling extra built-in modes in the Mission Pool enlarges what the PvP
+# slots can draw from WITHOUT growing the ballot (so the regular 6 stays 6).
 VOTEMAP_CONFIG_FILE = os.path.join(_BASE_DIR, "votemap_config.json")
-_VOTEMAP_DEFAULTS = {"ballot_size": 4, "mode": "balanced", "include_pvp": True, "include_custom": True}
+_VOTEMAP_DEFAULTS = {
+    "enabled":           True,       # master kill-switch: off => no auto map-vote (server rotation advances)
+    "coop_count":        4,          # PvE co-op (+custom) maps on the ballot
+    "pvp_count":         2,          # PvP built-in modes on the ballot
+    "coop_mode":         "balanced", # balanced (even round-robin) | random (uniform) | weighted
+    "pvp_mode":          "fixed",    # fixed (PVP_OPTIONS order) | random | weighted
+    "include_pvp":       True,       # master toggle for the PvP slots
+    "include_custom":    True,       # let enabled custom USER missions into the co-op pool
+    "coop_weights":      {},         # {category: relative_likelihood} for coop_mode == weighted
+    "pvp_weights":       {},         # {pvp_mission_name: relative_likelihood} for pvp_mode == weighted
+    "guaranteed":        [],         # mission NAMES always pinned onto every ballot (they count toward the
+                                     # relevant type's slot count; like the always-on PvP pair, generalised)
+    "avoid_recent":      0,          # don't re-offer the last N winning maps (0 = off; only the exact-ballot
+                                     # anti-repeat applies). Guaranteed missions are exempt.
+    "force_pvp_enabled": True,       # high-pop override: force a PvP-heavy ballot (Tomo wants this ON)
+    "force_pvp_players": 24,         # ... once at least this many players are online
+    "force_pvp_coop":    0,          # co-op maps while forcing (0 = PvP-only)
+    "force_pvp_pvp":     6,          # PvP modes while forcing (capped by how many are enabled)
+}
+_COOP_CATEGORIES = ("Escalation", "Terminal Control", "Custom")   # weightable co-op pool keys
+
+
+def _vm_int(v, default, lo, hi):
+    try:
+        return max(lo, min(hi, int(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _vm_weights(v):
+    """Normalize a {name: number>=0} weight table; drop junk. Empty dict == all-equal."""
+    out = {}
+    if isinstance(v, dict):
+        for k, w in v.items():
+            try:
+                w = float(w)
+            except (TypeError, ValueError):
+                continue
+            # w >= 0 already rejects NaN; also reject +inf so it can't dominate weighted sampling
+            if isinstance(k, str) and 0 <= w != float("inf"):
+                out[k] = w
+    return out
+
+
+def _vm_strlist(v):
+    """Normalize a list of mission-name strings (dedup, preserve order, drop blanks/junk)."""
+    out, seen = [], set()
+    if isinstance(v, list):
+        for x in v:
+            if isinstance(x, str) and x.strip() and x not in seen:
+                seen.add(x)
+                out.append(x)
+    return out
 
 
 def _votemap_cfg():
     cfg = dict(_VOTEMAP_DEFAULTS)
+    raw = {}
     try:
         with open(VOTEMAP_CONFIG_FILE, encoding="utf-8") as f:
             j = json.load(f)
         if isinstance(j, dict):
-            for k in cfg:
-                if k in j:
-                    cfg[k] = j[k]
+            raw = dict(j)
     except (OSError, ValueError):
         pass
-    try:
-        cfg["ballot_size"] = max(1, min(10, int(cfg["ballot_size"])))
-    except (TypeError, ValueError):
-        cfg["ballot_size"] = 4
-    if cfg["mode"] not in ("balanced", "random"):
-        cfg["mode"] = "balanced"
-    cfg["include_pvp"] = bool(cfg["include_pvp"])
+    # migrate the v1 schema (ballot_size -> coop_count, mode -> coop_mode)
+    if "coop_count" not in raw and "ballot_size" in raw:
+        raw["coop_count"] = raw["ballot_size"]
+    if "coop_mode" not in raw and "mode" in raw:
+        raw["coop_mode"] = raw["mode"]
+    for k in cfg:
+        if k in raw:
+            cfg[k] = raw[k]
+    _np = len(PVP_OPTIONS)
+    cfg["coop_count"]        = _vm_int(cfg["coop_count"], 4, 0, 12)
+    cfg["pvp_count"]         = _vm_int(cfg["pvp_count"], 2, 0, _np)
+    cfg["force_pvp_players"] = _vm_int(cfg["force_pvp_players"], 24, 1, 200)
+    cfg["force_pvp_coop"]    = _vm_int(cfg["force_pvp_coop"], 0, 0, 12)
+    cfg["force_pvp_pvp"]     = _vm_int(cfg["force_pvp_pvp"], 6, 0, _np)
+    if cfg["coop_mode"] not in ("balanced", "random", "weighted"):
+        cfg["coop_mode"] = "balanced"
+    if cfg["pvp_mode"] not in ("fixed", "random", "weighted"):
+        cfg["pvp_mode"] = "fixed"
+    cfg["include_pvp"]    = bool(cfg["include_pvp"])
     cfg["include_custom"] = bool(cfg["include_custom"])
+    cfg["enabled"]        = bool(cfg["enabled"])
+    cfg["coop_weights"]   = _vm_weights(cfg["coop_weights"])
+    cfg["pvp_weights"]    = _vm_weights(cfg["pvp_weights"])
+    cfg["guaranteed"]     = _vm_strlist(cfg["guaranteed"])
+    cfg["avoid_recent"]   = _vm_int(cfg["avoid_recent"], 0, 0, 10)
+    # never let the NORMAL split collapse to an empty ballot via config alone (guaranteed missions also
+    # backstop this, but a 0/0 split with nothing pinned would otherwise fall through to the safety net)
+    if cfg["coop_count"] + (cfg["pvp_count"] if cfg["include_pvp"] else 0) < 1 and not cfg["guaranteed"]:
+        cfg["coop_count"] = 1
     return cfg
 
 
+# per-key integer bounds (lo, hi); clamp at the SOURCE so the file never stores out-of-range values
+_VOTEMAP_INT_BOUNDS = {
+    "coop_count":        (0, 12),
+    "pvp_count":         (0, len(PVP_OPTIONS)),
+    "avoid_recent":      (0, 10),
+    "force_pvp_players": (1, 200),
+    "force_pvp_coop":    (0, 12),
+    "force_pvp_pvp":     (0, len(PVP_OPTIONS)),
+}
+_VOTEMAP_BOOL_KEYS = ("enabled", "include_pvp", "include_custom", "force_pvp_enabled")
+_VOTEMAP_ALIASES   = {"ballot_size": "coop_count", "mode": "coop_mode"}
+
+
 def set_votemap_cfg(key, value):
+    key = _VOTEMAP_ALIASES.get(key, key)            # accept v1 keys from an un-refreshed webcc
     if key not in _VOTEMAP_DEFAULTS:
         return False
     cfg = _votemap_cfg()
-    if key == "ballot_size":
-        try:
-            value = max(1, min(10, int(value)))
-        except (TypeError, ValueError):
+    if key in _VOTEMAP_INT_BOUNDS:
+        lo, hi = _VOTEMAP_INT_BOUNDS[key]
+        v = _vm_int(value, None, lo, hi)
+        if v is None:
             return False
-    elif key == "mode":
-        if str(value) not in ("balanced", "random"):
+        cfg[key] = v
+    elif key == "coop_mode":
+        if str(value) not in ("balanced", "random", "weighted"):
             return False
-        value = str(value)
+        cfg[key] = str(value)
+    elif key == "pvp_mode":
+        if str(value) not in ("fixed", "random", "weighted"):
+            return False
+        cfg[key] = str(value)
+    elif key == "coop_weights":
+        allow = set(_COOP_CATEGORIES)
+        cfg[key] = {k: w for k, w in _vm_weights(value).items() if k in allow}   # whitelist pool categories
+    elif key == "pvp_weights":
+        allow = {p[1] for p in PVP_OPTIONS}
+        cfg[key] = {k: w for k, w in _vm_weights(value).items() if k in allow}   # whitelist built-in modes
+    elif key == "guaranteed":
+        allow = _votable_names()
+        cfg[key] = [n for n in _vm_strlist(value) if n in allow]                 # only pin real votable maps
+    elif key in _VOTEMAP_BOOL_KEYS:
+        cfg[key] = value if isinstance(value, bool) else str(value).lower() in ("1", "true", "on", "yes")
     else:
-        value = value if isinstance(value, bool) else str(value).lower() in ("1", "true", "on", "yes")
-    cfg[key] = value
+        return False
+    cfg.pop("ballot_size", None)            # strip any legacy v1 keys so the file converges to clean v2
+    cfg.pop("mode", None)
     try:
         tmp = VOTEMAP_CONFIG_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -899,6 +1043,21 @@ def set_votemap_cfg(key, value):
 def votemap_cfg_state():
     c = _votemap_cfg()
     c["vote_duration"] = VOTE_DURATION
+    # convenience for the webcc: live totals + the rows the weight/force/guaranteed UI needs
+    pvp_n = c["pvp_count"] if c["include_pvp"] else 0
+    c["total_normal"] = c["coop_count"] + pvp_n
+    c["total_forced"] = c["force_pvp_coop"] + (c["force_pvp_pvp"] if c["include_pvp"] else 0)
+    c["pvp_options"]  = [{"name": p[1], "on": mission_enabled(p[1])} for p in PVP_OPTIONS]
+    c["pvp_enabled_count"] = sum(1 for p in PVP_OPTIONS if mission_enabled(p[1]))
+    pool = _votemap_pool()
+    c["coop_categories"]   = [cat for cat in _COOP_CATEGORIES if cat in pool]
+    c["coop_available"]    = sum(len(ms) for ms in pool.values())     # enabled co-op/custom maps in the pool
+    # the full votable universe (for the "add guaranteed" picker) + friendly labels for the current pins
+    votable = [{"name": n, "label": friendly_label(n), "cat": cat} for n, cat in _all_pool_missions()]
+    votable += [{"name": n, "label": friendly_label(n), "cat": "Custom"} for n in _enabled_custom_names()]
+    c["votable"] = votable
+    c["guaranteed_labels"] = [{"name": n, "label": friendly_label(n),
+                               "pvp": n in PVP_MISSIONS, "on": mission_enabled(n)} for n in c["guaranteed"]]
     return c
 
 
@@ -939,11 +1098,23 @@ def _new_msg_id():
     return "msg_" + format(int(time.time() * 1000), "x") + format(_msg_id_seq, "x")
 
 
+def _balance_color_tags(t):
+    """Drop a trailing unterminated tag (a hard length-cap can cut a <color=#hex> in half,
+    which would corrupt every following chat line) and auto-close any dangling <color> tags."""
+    t = re.sub(r"</?c(?:o(?:l(?:o(?:r(?:=#?[0-9A-Fa-f]{0,6})?)?)?)?)?$", "", t)   # strip a trailing cut color-tag prefix (<c.. or </c..); a bare '<' or real text is kept
+    opens = len(re.findall(r"<color=#[0-9A-Fa-f]{6}>", t))
+    closes = len(re.findall(r"</color>", t))
+    if opens > closes:
+        t += "</color>" * (opens - closes)
+    return t
+
+
 def _msg_sanitize_text(text):
-    """One-line, control-char-free, length-capped chat text (the message goes straight to rc.say)."""
+    """One-line, control-char-free, length-capped chat text (the message goes straight to rc.say).
+    Tag-aware: the length cap never leaves a half-cut <color> tag, and dangling tags auto-close."""
     t = re.sub(r"[\x00-\x1f\x7f]", " ", str(text if text is not None else ""))
     t = re.sub(r"\s+", " ", t).strip()
-    return t[:MSG_TEXT_MAX]
+    return _balance_color_tags(t[:MSG_TEXT_MAX])
 
 
 def _msg_clean(m):
@@ -969,6 +1140,8 @@ def _msg_clean(m):
         at = "12:00"
     color = str(m.get("color") or "").strip()
     if not _MSG_HEX_RE.match(color):
+        color = ""
+    if re.search(r"<color=#[0-9A-Fa-f]{6}>", text):    # per-word colours already in the text -> no outer wrap (avoid bleed)
         color = ""
     mid = str(m.get("id") or "")
     if not _MSG_ID_RE.match(mid):
@@ -1004,6 +1177,376 @@ def save_server_messages():
 
 def server_messages_state():
     return [dict(m) for m in _server_messages]
+
+
+# ── editable rank ladder (webcc "Ranks" modal) ─────────────────────────────────────
+def _rank_ladder_validate(ranks, template):
+    """Validate + normalise a proposed ladder. Returns (rows_tuples, template, warnings)
+    or raises ValueError. rows = list of (threshold, name, abbr, colour)."""
+    if not isinstance(ranks, list) or not ranks:
+        raise ValueError("need at least one rank")
+    rows = []
+    for r in ranks:
+        if not isinstance(r, dict):
+            raise ValueError("bad rank row")
+        try:
+            th = int(float(r.get("threshold", 0)))
+        except (TypeError, ValueError):
+            raise ValueError("threshold must be a number")
+        if th < 0:
+            th = 0
+        name = str(r.get("name") or "").strip()
+        abbr = str(r.get("abbr") or "").strip()
+        color = str(r.get("color") or "").strip()
+        if not name or any(c in name for c in "|\n\r"):
+            raise ValueError("a rank name is required and cannot contain | or newlines")
+        name = name[:40]
+        if not abbr or any(c in abbr for c in "|[]\n\r \t"):
+            raise ValueError("an abbreviation is required and cannot contain spaces, [, ], | or newlines")
+        abbr = abbr[:12]
+        if not _MSG_HEX_RE.match(color):
+            raise ValueError(f"the colour for '{name}' must be #RRGGBB")
+        rows.append([th, name, abbr, color])
+    rows.sort(key=lambda x: x[0])
+    rows[0][0] = 0                                       # the lowest rank is always the floor (0 points)
+    for i in range(1, len(rows)):
+        if rows[i][0] <= rows[i - 1][0]:
+            raise ValueError("thresholds must be strictly ascending and unique")
+    if len({r[1] for r in rows}) != len(rows):
+        raise ValueError("rank names must be unique")
+    if len({r[2] for r in rows}) != len(rows):
+        raise ValueError("abbreviations must be unique")
+    warnings = []
+    if any(len(r[2]) <= 2 for r in rows):
+        warnings.append("a very short abbreviation can be mistaken for a clan tag in chat")
+    tmpl = str(template if template is not None else DEFAULT_RANKUP_TEMPLATE).strip()
+    if not tmpl:
+        raise ValueError("the rank-up template cannot be empty")
+    if "{name}" not in tmpl:
+        raise ValueError("the rank-up template must include {name}")
+    if tmpl.count("<color") != tmpl.count("</color>"):
+        raise ValueError("the rank-up template has unbalanced <color> tags")
+    if len(tmpl) > 240:
+        raise ValueError("the rank-up template is too long")
+    return [tuple(r) for r in rows], tmpl, warnings
+
+
+def save_rank_ladder(ranks, template):
+    """Atomic write of the ladder (+ .bak). ranks = list of (threshold, name, abbr, colour)."""
+    try:
+        payload = {"version": 1, "rankup_template": template,
+                   "ranks": [{"threshold": r[0], "name": r[1], "abbr": r[2], "color": r[3]} for r in ranks]}
+        if os.path.exists(RANK_LADDER_FILE):
+            try:
+                with open(RANK_LADDER_FILE, "rb") as _src, open(RANK_LADDER_FILE + ".bak", "wb") as _dst:
+                    _dst.write(_src.read())
+            except OSError:
+                pass
+        tmp = RANK_LADDER_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=1)
+        os.replace(tmp, RANK_LADDER_FILE)
+    except OSError:
+        pass
+
+
+def load_rank_ladder():
+    """Load rank_ladder.json into RANKS + RANKUP_TEMPLATE (fail-open to the built-in default).
+    Seeds the file with today's ladder on first run. Resets the rank-tag regex cache so a
+    renamed abbr cannot leak its old tag into PLAYER_NAMES / ranks.json via _strip_rank_tag."""
+    global RANKS, RANKUP_TEMPLATE, _RANK_TAG_RE
+    try:
+        with open(RANK_LADDER_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("rank_ladder.json root must be an object")
+        rows, tmpl, _ = _rank_ladder_validate(data.get("ranks"), data.get("rankup_template"))
+        RANKS = rows
+        RANKUP_TEMPLATE = tmpl
+    except FileNotFoundError:
+        RANKS = list(DEFAULT_RANKS)
+        RANKUP_TEMPLATE = DEFAULT_RANKUP_TEMPLATE
+        save_rank_ladder(RANKS, RANKUP_TEMPLATE)         # seed today's ladder verbatim (no visible change)
+    except (OSError, ValueError, TypeError, AttributeError) as e:
+        print(f"[rank-ladder] using the default ladder ({e})")
+        RANKS = list(DEFAULT_RANKS)
+        RANKUP_TEMPLATE = DEFAULT_RANKUP_TEMPLATE
+    _RANK_TAG_RE = None
+
+
+def rank_ladder_state():
+    return {"rankup_template": RANKUP_TEMPLATE,
+            "ranks": [{"threshold": r[0], "name": r[1], "abbr": r[2], "color": r[3]} for r in RANKS]}
+
+
+def rank_ladder_apply(payload):
+    """Validate + persist + rebuild RANKS in place. Returns {ok, error?, warnings?}. The caller
+    pushes plugin_ranks + logs activity on success (cc_web 'ok' means queued, not yet applied)."""
+    global RANKS, RANKUP_TEMPLATE, _RANK_TAG_RE
+    try:
+        rows, tmpl, warnings = _rank_ladder_validate((payload or {}).get("ranks"),
+                                                      (payload or {}).get("rankup_template"))
+    except (ValueError, TypeError, AttributeError) as e:
+        return {"ok": False, "error": str(e)}
+    RANKS = rows
+    RANKUP_TEMPLATE = tmpl
+    _RANK_TAG_RE = None
+    save_rank_ladder(RANKS, RANKUP_TEMPLATE)
+    return {"ok": True, "warnings": warnings}
+
+
+def rankup_line(name, rname, abbr, color):
+    """Render the configurable rank-up announcement. Strips < > from the player name so a
+    hostile display name cannot hijack the surrounding colour tags."""
+    safe = str(name).replace("<", "").replace(">", "")
+    tmpl = RANKUP_TEMPLATE or DEFAULT_RANKUP_TEMPLATE     # never broadcast a blank line
+    try:
+        return (tmpl.replace("{color}", color).replace("{name}", safe)
+                .replace("{rank}", rname).replace("{abbr}", abbr))
+    except Exception:                                    # noqa: BLE001 - never break a rank-up
+        return f"<color={color}>** RANK UP ** {safe} is now {rname} ({abbr})!</color>"
+
+
+# ── cross-server shared ranks (write-own-file aggregate; display only) ───────────────
+# A host running several of these servers can point them all at one shared directory; each
+# bot keeps writing its OWN local ranks.json unchanged (the ms-baseline math, ledger and
+# --audit invariant are NEVER touched) and additionally publishes a copy as ranks_<id>.json
+# into the share. A combined leaderboard sums points per SteamID across those files at READ
+# time only. No lock, no merge, no foreign-file mutation -> zero concurrent-writer hazard.
+SHARED_RANKS_FILE    = os.path.join(_BASE_DIR, "shared_ranks.json")
+SHARED_RANKS_ENABLED = False
+SHARED_RANKS_DIR     = ""
+SERVER_INSTANCE_ID   = ""
+_SHARED_PUB_AT       = 0.0           # last aggregate publish (throttle)
+_SHARED_BOARD_CACHE  = ([], 0.0)     # (rows, computed_at): cache the combined board off the 1Hz dashboard
+
+# #2 daemon-thread shared I/O: the publish into the (possibly slow/locked/network) shared dir runs
+# on a background daemon, NEVER on the bot's main loop. maybe_publish_aggregate()/enable just set a
+# pending flag; the worker drains it. Concurrency-safe by construction (write-own-file + atomic replace).
+_SHARED_PUB_PENDING  = False         # set by the throttle / enable; cleared by the daemon after a publish
+
+
+def _shared_pub_worker():
+    """Daemon: publishes this server's rankshare file off the main loop so a slow/locked shared
+    folder can never stall the bot tick. publish_ranks_aggregate() is already OSError-fail-open;
+    this loop additionally swallows everything so the daemon can never die."""
+    global _SHARED_PUB_PENDING, _OTHER_RANKS_CACHE
+    while True:
+        try:
+            pending = _SHARED_PUB_PENDING
+            _SHARED_PUB_PENDING = False
+            if pending:
+                publish_ranks_aggregate()
+            if SHARED_RANKS_ENABLED:          # #XSRV-2: keep the READ caches warm OFF the main loop so a
+                _OTHER_RANKS_CACHE = (_compute_other_ranks(), time.time())   # rank display/award never globs the share inline
+                try:
+                    shared_ranks_state()      # warms the board (30s) + peer-count (30s) caches off-loop too
+                except Exception:             # noqa: BLE001
+                    pass
+        except Exception:                     # noqa: BLE001 - a publish failure must never kill the daemon
+            pass
+        time.sleep(2)
+
+
+def _start_shared_pub_worker():
+    """Start the publish daemon once (idempotent-ish; only called at load)."""
+    try:
+        import threading
+        threading.Thread(target=_shared_pub_worker, name="shared-ranks-pub", daemon=True).start()
+    except Exception as e:                     # noqa: BLE001 - sharing stays off rather than crash boot
+        print(f"[shared-ranks] worker start failed: {e}")
+
+
+def _gen_instance_id():
+    """Deterministic per (host, install dir): two server folders -- even a verbatim clone -- get DIFFERENT
+    ids, so they never publish the same rankshare_<id>.json and clobber each other (the folder-clone
+    collision that silently breaks carry-over). Stable across restarts (same host+dir -> same id)."""
+    import hashlib, socket
+    seed = (socket.gethostname() + "|" + os.path.abspath(_BASE_DIR)).encode("utf-8", "replace")
+    return hashlib.sha1(seed).hexdigest()[:12]
+
+
+def save_shared_ranks_cfg(enabled, dir_, instance_id=None):
+    try:
+        iid = instance_id if instance_id is not None else (SERVER_INSTANCE_ID or _gen_instance_id())
+        tmp = SHARED_RANKS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"enabled": bool(enabled), "dir": str(dir_ or ""), "instance_id": iid}, f, indent=1)
+        os.replace(tmp, SHARED_RANKS_FILE)
+    except OSError:
+        pass
+
+
+def load_shared_ranks_cfg():
+    global SHARED_RANKS_ENABLED, SHARED_RANKS_DIR, SERVER_INSTANCE_ID
+    data = {}
+    try:
+        with open(SHARED_RANKS_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError):
+        data = {}
+    SHARED_RANKS_ENABLED = bool(data.get("enabled", False))
+    SHARED_RANKS_DIR = str(data.get("dir", "") or "")
+    # ALWAYS derive the id from host+dir (don't trust a persisted/copied value) so a folder clone can't
+    # inherit another instance's id and collide on the shared rankshare_<id>.json. Persist if it changed.
+    iid = _gen_instance_id()
+    SERVER_INSTANCE_ID = iid
+    if str(data.get("instance_id", "") or "").strip() != iid:
+        save_shared_ranks_cfg(SHARED_RANKS_ENABLED, SHARED_RANKS_DIR, iid)
+
+
+def publish_ranks_aggregate():
+    """Write THIS server's lifetime ranks into the shared dir as ranks_<id>.json (atomic,
+    write-own-file only). Best-effort; a failure logs and never blocks the bot."""
+    if not (SHARED_RANKS_ENABLED and SHARED_RANKS_DIR and SERVER_INSTANCE_ID):
+        return
+    try:
+        if not os.path.isdir(SHARED_RANKS_DIR):
+            return
+        # list() snapshots under the GIL so the MAIN loop mutating RANK_DATA (award/snap) can't raise
+        # "dictionary changed size during iteration" on this daemon thread (#XSRV-1).
+        snap = {sid: {"name": rec.get("name", ""), "points": rec.get("points", 0),
+                      "wins": rec.get("wins", 0), "losses": rec.get("losses", 0)}
+                for sid, rec in list(RANK_DATA.items()) if isinstance(rec, dict)}
+        dest = os.path.join(SHARED_RANKS_DIR, f"rankshare_{SERVER_INSTANCE_ID}.json")
+        tmp = dest + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"server": SERVER_INSTANCE_ID, "updated": int(time.time()), "ranks": snap}, f)
+        os.replace(tmp, dest)
+    except OSError as e:                          # noqa: BLE001
+        print(f"[shared-ranks] publish failed: {e}")
+
+
+def maybe_publish_aggregate():
+    """Throttled (>=45s) request, called from save_ranks(). NON-BLOCKING: only flags the daemon
+    publisher (#2), so a slow/locked shared folder can never stall the bot's main loop. Never raises."""
+    global _SHARED_PUB_AT, _SHARED_PUB_PENDING
+    if not SHARED_RANKS_ENABLED:
+        return
+    now = time.time()
+    if now - _SHARED_PUB_AT < 45:
+        return
+    _SHARED_PUB_AT = now
+    _SHARED_PUB_PENDING = True
+
+
+def read_aggregate_ranks():
+    """Sum points (+ W/L) per SteamID across every ranks_*.json in the shared dir. DISPLAY ONLY;
+    never folded back into RANK_DATA or the ms baseline. Tolerant of a peer file mid-replace."""
+    import glob
+    agg = {}
+    if not (SHARED_RANKS_DIR and os.path.isdir(SHARED_RANKS_DIR)):
+        return agg
+    for path in glob.glob(os.path.join(SHARED_RANKS_DIR, "rankshare_*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            continue
+        ranks = d.get("ranks", {}) if isinstance(d, dict) else {}
+        for sid, rec in (ranks.items() if isinstance(ranks, dict) else []):
+            if not isinstance(rec, dict):
+                continue
+            a = agg.setdefault(sid, {"name": "", "points": 0.0, "wins": 0, "losses": 0})
+            try:
+                a["points"] += float(rec.get("points", 0) or 0)
+                a["wins"] += int(rec.get("wins", 0) or 0)
+                a["losses"] += int(rec.get("losses", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            if rec.get("name"):
+                a["name"] = rec["name"]
+    return agg
+
+
+_OTHER_RANKS_CACHE = ({}, 0.0)
+_SHARED_PEERS_CACHE = (0, 0.0)       # (count, computed_at): cache the peer-file glob so the 1Hz dashboard doesn't list the share each tick (#XSRV-2)
+
+
+def _compute_other_ranks():
+    """Glob + sum the OTHER servers' rankshare files (excludes our own). This does the file I/O; it is
+    called OFF the main loop by the shared-ranks daemon (#XSRV-2) so a slow/locked share never stalls a
+    rank display/award. Tolerant of a peer file mid-replace. Empty unless sharing is enabled."""
+    out = {}
+    if SHARED_RANKS_ENABLED and SHARED_RANKS_DIR and os.path.isdir(SHARED_RANKS_DIR):
+        import glob
+        mine = f"rankshare_{SERVER_INSTANCE_ID}.json"
+        for path in glob.glob(os.path.join(SHARED_RANKS_DIR, "rankshare_*.json")):
+            if os.path.basename(path) == mine:
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    d = json.load(f)
+                ranks = d.get("ranks", {}) if isinstance(d, dict) else {}
+            except (OSError, ValueError):
+                continue
+            for sid, rec in (ranks.items() if isinstance(ranks, dict) else []):
+                if isinstance(rec, dict):
+                    try:
+                        out[sid] = out.get(sid, 0.0) + float(rec.get("points", 0) or 0)
+                    except (TypeError, ValueError):
+                        pass
+    return out
+
+
+def _other_ranks():
+    """Cached {sid: points} summed across the OTHER servers (excludes our own file). The shared-ranks
+    daemon keeps this cache warm every ~2s, so a rank display/award on the MAIN loop reads the cache and
+    never globs the (possibly slow) share inline (#XSRV-2). The inline refresh below is only a fallback
+    if the daemon hasn't updated in 60s (e.g. not started). Empty unless sharing is enabled."""
+    global _OTHER_RANKS_CACHE
+    cached, at = _OTHER_RANKS_CACHE
+    now = time.time()
+    if now - at < 60:
+        return cached
+    out = _compute_other_ranks()
+    _OTHER_RANKS_CACHE = (out, now)
+    return out
+
+
+def shared_ranks_state():
+    """Status (+ a cached combined top-12) for the webcc Shared Ranks card."""
+    global _SHARED_BOARD_CACHE
+    global _SHARED_PEERS_CACHE
+    exists = bool(SHARED_RANKS_DIR and os.path.isdir(SHARED_RANKS_DIR))
+    peers, board = 0, []
+    if SHARED_RANKS_ENABLED and exists:
+        pcached, pat = _SHARED_PEERS_CACHE          # 30s-cached so the 1Hz dashboard never lists a slow share each tick (#XSRV-2)
+        if time.time() - pat < 30:
+            peers = pcached
+        else:
+            try:
+                import glob
+                peers = len(glob.glob(os.path.join(SHARED_RANKS_DIR, "rankshare_*.json")))
+            except OSError:
+                peers = 0
+            _SHARED_PEERS_CACHE = (peers, time.time())
+        cached, at = _SHARED_BOARD_CACHE
+        now = time.time()
+        if now - at < 30:
+            board = cached
+        else:
+            agg = read_aggregate_ranks()
+            rows = sorted(agg.items(), key=lambda kv: kv[1]["points"], reverse=True)[:12]
+            board = [{"name": v["name"] or sid, "points": round(v["points"], 1),
+                      "wins": v["wins"], "losses": v["losses"], "rank": rank_index_for(v["points"])}
+                     for sid, v in rows]
+            _SHARED_BOARD_CACHE = (board, now)
+    return {"enabled": SHARED_RANKS_ENABLED, "dir": SHARED_RANKS_DIR, "server_id": SERVER_INSTANCE_ID,
+            "exists": exists, "peer_files": peers, "board": board}
+
+
+def set_shared_ranks(enabled, dir_):
+    global SHARED_RANKS_ENABLED, SHARED_RANKS_DIR, _SHARED_PUB_AT, _SHARED_BOARD_CACHE
+    SHARED_RANKS_ENABLED = bool(enabled)
+    SHARED_RANKS_DIR = str(dir_ or "").strip()
+    save_shared_ranks_cfg(SHARED_RANKS_ENABLED, SHARED_RANKS_DIR)
+    _SHARED_BOARD_CACHE = ([], 0.0)
+    if SHARED_RANKS_ENABLED:
+        _SHARED_PUB_AT = 0.0
+        global _SHARED_PUB_PENDING
+        _SHARED_PUB_PENDING = True               # #2: flag the daemon to publish (off the main loop), not inline
+    return {"ok": True}
 
 
 def _msg_find(mid):
@@ -1105,6 +1648,9 @@ def fire_event_messages(rc, event):
 
 
 load_server_messages()
+load_rank_ladder()
+load_shared_ranks_cfg()
+_start_shared_pub_worker()                       # #2: start the off-loop shared-ranks publisher daemon
 
 
 # --- Anti-grief reports: the plugin emits "[NOSTATS] {t:report}" when it auto-kicks/flags a single
@@ -1134,6 +1680,74 @@ def save_reports():
         os.replace(tmp, REPORTS_FILE)
     except OSError:
         pass
+
+
+# --- Ban log: a persistent record of every ban an operator logs from the Reports tab, keyed by SteamID,
+# so REPEAT offenders (banned more than once) are visible across matches/restarts. This is the audit trail,
+# separate from the live plugin/game enforcement ban lists.
+BAN_LOG_FILE = os.path.join(_BASE_DIR, "ban_log.json")
+_ban_log = {}          # sid -> {"name": str, "entries": [{"ts": int, "reason": str}]}
+
+
+def load_ban_log():
+    global _ban_log
+    try:
+        with open(BAN_LOG_FILE, encoding="utf-8") as f:
+            j = json.load(f)
+        _ban_log = j if isinstance(j, dict) else {}
+    except (OSError, ValueError):
+        _ban_log = {}
+
+
+def save_ban_log():
+    try:
+        tmp = BAN_LOG_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_ban_log, f, indent=1)
+        os.replace(tmp, BAN_LOG_FILE)
+    except OSError:
+        pass
+
+
+def log_ban(sid, name, reason):
+    """Append a ban event under this SteamID; returns the player's total logged-ban count."""
+    sid = str(sid or "").strip()
+    if not sid:
+        return 0
+    rec = _ban_log.setdefault(sid, {"name": "", "entries": []})
+    if name:
+        rec["name"] = str(name)
+    rec["entries"].append({"ts": int(time.time()), "reason": str(reason or "")[:200]})
+    rec["entries"] = rec["entries"][-50:]      # cap per-player history
+    save_ban_log()
+    return len(rec["entries"])
+
+
+def ban_log_state():
+    """Summary for the webcc, repeat offenders first."""
+    out = []
+    for sid, rec in _ban_log.items():
+        ents = rec.get("entries", []) if isinstance(rec, dict) else []
+        if not ents:
+            continue
+        out.append({"id": sid, "name": rec.get("name", "") or sid, "count": len(ents),
+                    "last_ts": ents[-1].get("ts", 0), "last_reason": ents[-1].get("reason", "")})
+    out.sort(key=lambda x: (x["count"], x["last_ts"]), reverse=True)
+    return out
+
+
+def remove_ban_log(sid):
+    """Delete a player's whole ban-log history (the webcc 🗑 button). Returns True if anything was removed.
+    This is SEPARATE from clearing reports -- the moderation 'Clear all' only touches reports, never this log."""
+    sid = str(sid or "").strip()
+    if sid and sid in _ban_log:
+        _ban_log.pop(sid, None)
+        save_ban_log()
+        return True
+    return False
+
+
+load_ban_log()
 
 
 def add_report(rec):
@@ -1245,6 +1859,15 @@ _GRIEF_FLOOD_DEFAULTS = {
     "window_sec": 3.0,       # ...within this rolling window (30/3s ~= 25 cmd/s OVER the cap -> macro only)
     "cooldown_sec": 30.0,    # don't re-act on the same sid within this many seconds
     "exempt_admins": True,   # never auto-kick an ADMIN_SIDS member (set false to self-test)
+    # ONLY these RPCs (matched on the name suffix) can trigger a flood-kick. Griefing is a unit MOVE-order
+    # storm (CmdSetDestination). A server-wide drop storm on a NON-command RPC like CmdUpdateTrackingInfo is
+    # network congestion (a BufferFull blip), NOT grief, and must never mass-kick -- the 2026-06-30 incident
+    # kicked ~15 players at once on CmdUpdateTrackingInfo. Empty list [] = allow any RPC (legacy behaviour).
+    "rpc_allow": ["CmdSetDestination"],
+    # Circuit breaker: if this many DIFFERENT players trip within breaker_window_sec, it's a server-wide
+    # storm -> suppress ALL flood-kicks (never amplify a congestion event into a mass-kick). 0 = disabled.
+    "breaker_distinct": 3,
+    "breaker_window_sec": 6.0,
 }
 
 
@@ -1269,13 +1892,22 @@ RATELIMIT_DROP_RE = re.compile(
 
 _rl_drops = {}   # sid -> [timestamps within the rolling window]
 _rl_acted = {}   # sid -> last auto-action time (cooldown gate)
+_rl_trips = {}   # sid -> last trip time (for the server-wide circuit breaker)
+_rl_storm_at = 0.0   # last time a storm-suppression line was logged (throttle)
 
 
 def note_ratelimit_drop(sid, rpc, now):
-    """One rate-limit-drop line seen for `sid`; trip the auto-kick on a sustained storm."""
+    """One rate-limit-drop line seen for `sid`. Trip the auto-kick only on a SUSTAINED, SINGLE-connection
+    move-order storm: drops on non-command RPCs (congestion, e.g. CmdUpdateTrackingInfo) are ignored, and a
+    near-simultaneous storm across many players is suppressed by the circuit breaker (server congestion)."""
+    global _rl_storm_at
     cfg = _GRIEF_FLOOD
     if not cfg.get("enabled", True) or not sid:
         return
+    short = rpc.split(".")[-1] if rpc else ""
+    allow = cfg.get("rpc_allow") or []
+    if allow and short not in allow:
+        return                          # not a grief (move-order) RPC -> a drop here is congestion, never a kick
     try:
         win = float(cfg.get("window_sec", 3.0))
         thr = int(cfg.get("drops_per_window", 30))
@@ -1296,6 +1928,21 @@ def note_ratelimit_drop(sid, rpc, now):
     _rl_acted[sid] = now
     n = len(dq)
     dq.clear()
+    # circuit breaker: a near-simultaneous trip by many DISTINCT players = server-wide congestion, not grief.
+    try:
+        bwin = float(cfg.get("breaker_window_sec", 6.0))
+        bdist = int(cfg.get("breaker_distinct", 3))
+    except (TypeError, ValueError):
+        bwin, bdist = 6.0, 3
+    _rl_trips[sid] = now
+    for s in [s for s, t in _rl_trips.items() if now - t > bwin]:
+        _rl_trips.pop(s, None)
+    if bdist > 0 and len(_rl_trips) >= bdist:
+        if now - _rl_storm_at > 30:
+            _rl_storm_at = now
+            activity(f"Command-flood STORM: {len(_rl_trips)} players hit the rate-limiter together "
+                     f"-> treated as server congestion (not grief); auto-kicks SUPPRESSED", "!")
+        return
     _grief_flood_act(sid, rpc, n, win)
 
 
@@ -1349,7 +1996,38 @@ _SYSMSG_DEFS = [
     ("spectip", "Spectate / team-switch tip", False, "", True, SPECTIP_INTERVAL, False, 0,
      "Shows how to spectate / switch to the smaller team (PvP matches only)."),
 ]
-_SYSMSG_KEYS = {d[0] for d in _SYSMSG_DEFS}
+
+# ── !help command editor (#6) ──────────────────────────────────────────────────────────────────────
+# The in-game !help list is built from this registry. Each command's LINE TEXT is editable (stored in the
+# sysmsg store under "help_<id>", but deliberately NOT in _SYSMSG_DEFS so it doesn't clutter the automated
+# Messages list) and each command can be SHOWN/HIDDEN. "Auto-hide when a feature is off" is authoritative
+# for votemap (reads the votemap kill-switch); plugin-owned commands (spec/swapteam/squadup/forfeit) can be
+# hidden from the LIST here, but the plugin still answers them until a future plugin flag (display-only).
+#   entry = (id, group, color_hex, label_default, gate_default, gate_kind)
+#   gate_kind: "bot" enforced toggle | "votemap" -> _votemap_cfg()["enabled"] | "plugin" display-only
+#              | "always_on" (help) | the label_default carries its own <color> tags (verbatim current text)
+HELP_CFG_FILE = os.path.join(_BASE_DIR, "help_config.json")
+_HELP_REGISTRY = [
+    ("rank",        "stats", "#55FF55", "<color=#55FF55>!rank</color> - rank & points",                        True, "bot"),
+    ("skill",       "stats", "#55FF55", "<color=#55FF55>!skill</color> - average points per life rating",      True, "bot"),
+    ("points",      "stats", "#55FF55", "<color=#55FF55>!points</color> - life points",                        True, "bot"),
+    ("leaderboard", "stats", "#55FF55", "<color=#55FF55>!leaderboard</color> - top pilots",                    True, "bot"),
+    ("spec",        "teams", "#36FFD0", "<color=#36FFD0>!spec</color> - spectate",                             True, "plugin"),
+    ("swapteam",    "teams", "#36FFD0", "<color=#36FFD0>!swapteam</color> - switch to the smaller team",       True, "plugin"),
+    ("balance",     "teams", "#36FFD0", "<color=#36FFD0>!balance</color> - how balancing works",               True, "bot"),
+    ("squadup",     "teams", "#36FFD0", "<color=#36FFD0>!squadup <player></color> - squad up (PvP)",           True, "plugin"),
+    ("votemap",     "match", "#FFC857", "<color=#FFC857>!votemap</color> - vote a new map",                    True, "votemap"),
+    ("forfeit",     "match", "#FFC857", "<color=#FFC857>!forfeit</color> - surrender (PvP)",                   True, "plugin"),
+    ("notk",        "info",  "#cfd8e3", "<color=#cfd8e3>!notk</color> - no team-killing",                      True, "bot"),
+    ("help",        "info",  "#cfd8e3", "<color=#cfd8e3>!help</color> - this list",                            True, "always_on"),
+]
+_HELP_GROUP_ORDER   = ("stats", "teams", "match", "info")
+_HELP_DEFAULT_GATES = {e[0]: e[4] for e in _HELP_REGISTRY}
+# editable text keys (live in the sysmsg store, not the automated Messages list)
+_HELP_TEXT_DEFAULTS = {("help_" + e[0]): e[3] for e in _HELP_REGISTRY}
+_HELP_TEXT_DEFAULTS["help_header"] = "<color=#FFFF00>=== SERVER COMMANDS ===</color>"
+
+_SYSMSG_KEYS = {d[0] for d in _SYSMSG_DEFS} | set(_HELP_TEXT_DEFAULTS)
 
 
 def load_sysmsg():
@@ -1410,7 +2088,7 @@ def sysmsg_set(key, fields):
     if "enabled" in fields:
         v["enabled"] = bool(fields["enabled"])
     if "text" in fields:
-        v["text"] = re.sub(r"[\x00-\x1f\x7f]", " ", str(fields["text"] or ""))[:240]
+        v["text"] = _msg_sanitize_text(str(fields["text"] or ""))   # tag-safe trim (don't slice a <color=> tag)
     if "interval" in fields:
         try:
             v["interval"] = max(10.0, float(fields["interval"]))
@@ -1441,6 +2119,64 @@ def sysmsg_state():
 load_sysmsg()
 
 
+def _help_cfg():
+    gates = dict(_HELP_DEFAULT_GATES)
+    try:
+        with open(HELP_CFG_FILE, encoding="utf-8") as f:
+            j = json.load(f)
+        if isinstance(j, dict) and isinstance(j.get("gates"), dict):
+            for k, val in j["gates"].items():
+                if k in gates:
+                    gates[k] = bool(val)
+    except (OSError, ValueError):
+        pass
+    return {"gates": gates}
+
+
+def set_help_gate(cmd_id, on):
+    if cmd_id not in _HELP_DEFAULT_GATES or cmd_id in ("help", "votemap"):
+        return False                                    # help is always shown; votemap follows its kill-switch
+    cfg = _help_cfg()
+    cfg["gates"][cmd_id] = bool(on)
+    try:
+        tmp = HELP_CFG_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"gates": cfg["gates"]}, f, indent=1)
+        os.replace(tmp, HELP_CFG_FILE)
+    except OSError:
+        return False
+    return True
+
+
+def _help_gate_open(entry, hcfg, vm_enabled=None):
+    """Is this command currently shown in the !help list? vm_enabled lets the caller pass the votemap
+    kill-switch once (avoids a votemap_config.json read per command on the ~1Hz dashboard path)."""
+    cmd_id, kind = entry[0], entry[5]
+    if kind == "always_on":
+        return True
+    if kind == "votemap":                                # authoritative: track the votemap kill-switch
+        return bool(_votemap_cfg()["enabled"] if vm_enabled is None else vm_enabled)
+    return bool(hcfg["gates"].get(cmd_id, True))         # bot-enforced + plugin display-only toggles
+
+
+def help_state():
+    """Rows for the webcc Help editor: each command's group/colour, editable text (raw; empty == default),
+    and whether it's currently shown. The header line is editable too."""
+    hcfg = _help_cfg()
+    vm_enabled = _votemap_cfg()["enabled"]
+    rows = []
+    for e in _HELP_REGISTRY:
+        cmd_id, grp, col, lbl_default, _gd, kind = e
+        rows.append({"cmd": cmd_id, "group": grp, "color": col, "kind": kind,
+                     "sysmsg_key": "help_" + cmd_id, "label_default": lbl_default,
+                     "text": _sysmsg_rec("help_" + cmd_id).get("text", ""),
+                     "shown": _help_gate_open(e, hcfg, vm_enabled),
+                     "gate_locked": cmd_id in ("help", "votemap")})
+    return {"rows": rows, "order": list(_HELP_GROUP_ORDER),
+            "header": _sysmsg_rec("help_header").get("text", ""),
+            "header_default": _HELP_TEXT_DEFAULTS["help_header"]}
+
+
 def _as_ballot(missions):
     """Turn an ordered list of mission names into a {"1": (...), ...} ballot."""
     return {str(i): (MISSION_GROUP, n, MISSION_MAX_TIME, friendly_label(n))
@@ -1469,25 +2205,94 @@ def _votemap_pool():
     return pool
 
 
-def build_ballot(prev_set=None):
-    """Build the random part of the ballot from the dynamic vote pool per the votemap config:
-      * ballot_size maps total, either 'balanced' (round-robin across categories) or 'random'
-      * at most MAX_DARK_PER_VOTE 'dark' maps, and avoid repeating the exact previous set
-    Returns (ballot, chosen_set). open_vote appends the PvP options. Falls back safely."""
-    cfg = _votemap_cfg()
-    size, mode = cfg["ballot_size"], cfg["mode"]
-    pool = _votemap_pool()
+def _weighted_sample(items, weights, keyfn, n):
+    """Pick up to n of items WITHOUT replacement by relative weight. A missing key defaults to 1.0; an
+    explicit 0 excludes (unless every remaining item is 0, then it falls back to uniform among them)."""
+    pool = list(items)
+    n = min(n, len(pool))
+    out = []
+    while len(out) < n and pool:
+        ws = []
+        for it in pool:
+            w = weights.get(keyfn(it), 1.0)
+            ws.append(w if (isinstance(w, (int, float)) and w > 0) else 0.0)
+        tot = sum(ws)
+        if tot <= 0:
+            pick = random.choice(pool)
+        else:
+            r = random.uniform(0, tot); acc = 0.0; pick = pool[-1]
+            for it, w in zip(pool, ws):
+                acc += w
+                if r <= acc:
+                    pick = it
+                    break
+        out.append(pick)
+        pool.remove(pick)
+    return out
+
+
+# Friendly labels for the built-in PvP modes (these carry the [PVP] / descriptor tag).
+_PVP_LABEL = {p[1]: p[2] for p in PVP_OPTIONS}
+
+# Recent winning maps (newest last); open_vote keeps the last avoid_recent of them off the co-op fill.
+_recent_winners = []
+
+
+def _votable_names():
+    """Every mission NAME that can legitimately appear on a ballot: the co-op variants + the PvP modes +
+    enabled custom USER missions. Used to validate guaranteed pins."""
+    names = {n for n, _ in _all_pool_missions()}
+    names.update(_enabled_custom_names())
+    return names
+
+
+def _ballot_entry(name):
+    """(group, name, max_time, label) for a votable mission name (co-op variant, custom, or PvP mode)."""
+    label = _PVP_LABEL.get(name) or friendly_label(name)
+    return (mission_group(name), name, MISSION_MAX_TIME, label)
+
+
+def _coop_cat(name):
+    """Which co-op category a mission name belongs to (matches _votemap_pool() keys)."""
+    if name in ESCALATION_MISSIONS:
+        return "Escalation"
+    if name in TERMINAL_CONTROL_MISSIONS:
+        return "Terminal Control"
+    return "Custom"
+
+
+def build_coop(prev_set, target, cfg, exclude):
+    """Return (names, chosen_set) for the random CO-OP/custom portion: `target` maps from _votemap_pool()
+    minus `exclude` (guaranteed maps already placed + recently-played maps), honouring coop_mode:
+        balanced -> even round-robin across categories (Escalation / Terminal Control / Custom)
+        random   -> uniform across the flat pool
+        weighted -> pick a category per slot by coop_weights, then a random map from it
+    Keeps at most MAX_DARK_PER_VOTE 'dark' maps and avoids the exact previous set when possible. Returns
+    ([], frozenset()) when there's nothing to pick. open_vote() assembles the full ordered ballot."""
+    mode = cfg["coop_mode"]
+    weights = cfg["coop_weights"]
+    pool = {c: [n for n in ms if n not in exclude] for c, ms in _votemap_pool().items()}
+    pool = {c: ms for c, ms in pool.items() if ms}
     flat = [n for ms in pool.values() for n in ms]
-    if not flat:
-        return {}, None                              # nothing co-op/custom enabled -> open_vote adds PvP / fallback
+    if target <= 0 or not flat:
+        return [], frozenset()
     cats = list(pool.keys())
-    target = min(size, len(flat))
+    target = min(target, len(flat))
 
     def _pick():
         if mode == "random" or len(cats) <= 1:
             return random.sample(flat, target)
         bins = {c: random.sample(pool[c], len(pool[c])) for c in cats}   # shuffled copy per category
-        chosen, i = [], 0
+        chosen = []
+        if mode == "weighted":
+            while len(chosen) < target:
+                live = [c for c in cats if bins[c]]
+                if not live:
+                    break
+                cat = _weighted_sample(live, weights, lambda c: c, 1)[0]
+                chosen.append(bins[cat].pop())
+            return chosen
+        i = 0                                                            # balanced round-robin
         while len(chosen) < target:
             b = bins[cats[i % len(cats)]]; i += 1
             if b:
@@ -1496,30 +2301,81 @@ def build_ballot(prev_set=None):
                 break
         return chosen
 
+    # Previous ballot's per-category subsets (>=2 maps): avoid re-offering a whole family pair two votes
+    # in a row, which the exact-full-set check alone misses (it only rejects when ALL slots repeat).
+    prev_by_cat = {}
+    if prev_set:
+        for nm in prev_set:
+            prev_by_cat.setdefault(_coop_cat(nm), set()).add(nm)
+        prev_by_cat = {c: frozenset(s) for c, s in prev_by_cat.items() if len(s) >= 2}
+
+    def _family_repeat(chosen):
+        by_cat = {}
+        for nm in chosen:
+            by_cat.setdefault(_coop_cat(nm), set()).add(nm)
+        return any(frozenset(by_cat.get(c, ())) == sub for c, sub in prev_by_cat.items())
+
     best = None
     for _ in range(400):
         chosen = _pick()
         if sum(is_dark(n) for n in chosen) > MAX_DARK_PER_VOTE:
             continue
-        best = chosen
-        if prev_set is None or frozenset(chosen) != prev_set:
-            return _as_ballot(chosen), frozenset(chosen)
+        best = chosen                                          # a dark-cap-valid fallback if we can't do better
+        if prev_set is None or (frozenset(chosen) != prev_set and not _family_repeat(chosen)):
+            return chosen, frozenset(chosen)
     chosen = best if best is not None else _pick()   # over the dark cap with no alternative, or a forced repeat
-    return _as_ballot(chosen), frozenset(chosen)
+    return chosen, frozenset(chosen)
 
 
-def open_vote():
-    """Build a fresh ballot into VOTE_OPTIONS, remembering its mission set for next time. The leading
-    keys are the random co-op/custom maps; the trailing keys are the PvP options (when enabled)."""
+def _pick_pvp(n, cfg, exclude=()):
+    """Pick up to n PvP built-in mode NAMES, only from those toggled ON in the mission pool and not in
+    `exclude`. Decoupled from how many modes are enabled: 'fixed' keeps the historical leading pair
+    (Escalation + Terminal Control) regardless of how many extra modes are enabled."""
+    enabled = [p[1] for p in PVP_OPTIONS if mission_enabled(p[1]) and p[1] not in exclude]
+    if n <= 0 or not enabled:
+        return []
+    mode = cfg["pvp_mode"]
+    if mode == "random":
+        return random.sample(enabled, min(n, len(enabled)))
+    if mode == "weighted":
+        return _weighted_sample(enabled, cfg["pvp_weights"], lambda x: x, n)
+    return enabled[:n]                               # fixed: PVP_OPTIONS order (Escalation, Terminal Control, ...)
+
+
+def open_vote(online_count=0):
+    """Build a fresh ballot into VOTE_OPTIONS. Layout: [guaranteed co-op][random co-op][guaranteed PvP]
+    [random PvP], numbered 1..N. coop_count + pvp_count size the two pools independently (default 4 + 2 =
+    the regular 6). Guaranteed missions are always pinned and count toward their type's slot count (a
+    generalisation of the always-on PvP pair). A high-population rule can override the split into a
+    PvP-heavy ballot; avoid_recent keeps the last N winners off the random co-op fill."""
     global VOTE_OPTIONS, _prev_ballot_set
     cfg = _votemap_cfg()
-    ballot, _prev_ballot_set = build_ballot(_prev_ballot_set)
-    if cfg["include_pvp"]:
-        for j, (grp, name, label) in enumerate([p for p in PVP_OPTIONS if mission_enabled(p[1])], start=len(ballot) + 1):
-            ballot[str(j)] = (grp, name, MISSION_MAX_TIME, label)
-    if not ballot:                                   # safety: never an empty ballot, even if everything is disabled
-        ballot = _as_ballot(random.sample(ESCALATION_MISSIONS, min(4, len(ESCALATION_MISSIONS))))
-    VOTE_OPTIONS = ballot
+    coop_n = cfg["coop_count"]
+    pvp_n  = cfg["pvp_count"] if cfg["include_pvp"] else 0
+    if cfg["force_pvp_enabled"] and online_count >= cfg["force_pvp_players"]:
+        coop_n = cfg["force_pvp_coop"]
+        pvp_n  = cfg["force_pvp_pvp"] if cfg["include_pvp"] else 0
+
+    # guaranteed pins: keep only those still enabled + valid, deduped, in config order
+    votable = _votable_names()
+    guaranteed = [n for n in cfg["guaranteed"] if mission_enabled(n) and n in votable]
+    g_coop = [n for n in guaranteed if n not in PVP_MISSIONS]
+    g_pvp  = [n for n in guaranteed if n in PVP_MISSIONS]
+
+    avoid = set(_recent_winners[-cfg["avoid_recent"]:]) if cfg["avoid_recent"] else set()
+
+    coop_fill = max(0, coop_n - len(g_coop))
+    coop_names, _prev_ballot_set = build_coop(_prev_ballot_set, coop_fill, cfg, set(g_coop) | avoid)
+    pvp_names = _pick_pvp(max(0, pvp_n - len(g_pvp)), cfg, exclude=set(g_pvp))
+
+    ordered = g_coop + coop_names + g_pvp + pvp_names
+    if not ordered:                                  # safety net: fill from ENABLED co-op missions only (never strand the map on a removed one)
+        coop_pool = [m for m in (ESCALATION_MISSIONS + TERMINAL_CONTROL_MISSIONS) if mission_enabled(m)]
+        if not coop_pool:                            # nothing enabled at all -> leave the ballot empty; server rotation advances
+            VOTE_OPTIONS = {}
+            return VOTE_OPTIONS
+        ordered = random.sample(coop_pool, min(4, len(coop_pool)))
+    VOTE_OPTIONS = {str(i): _ballot_entry(n) for i, n in enumerate(ordered, start=1)}
     return VOTE_OPTIONS
 
 
@@ -1543,10 +2399,16 @@ def apply_winner(rc, votes, first_vote_at, force_switch=False):
             winner_key = min(tied, key=lambda k: first_vote_at.get(k, float("inf")))
             source = "vote (tie -> first voted)"
     else:
+        if not VOTE_OPTIONS:                         # empty ballot (all missions disabled) -> nothing to apply; let server rotation advance
+            rc.say("<color=#FFC83D>No eligible maps to vote on - the server rotation will pick the next mission.</color>")
+            activity("Map vote had no eligible missions; left the next map to the server rotation", "MAP")
+            return
         winner_key = random.choice(list(VOTE_OPTIONS))
         source = "random (no votes)"
     group, name, max_time, label = VOTE_OPTIONS[winner_key]
     rc.set_next_mission(group, name, max_time)
+    _recent_winners.append(name)             # feed avoid_recent (keep a small rolling window)
+    del _recent_winners[:-12]
     # Use the SAME canonical form refresh_current_mission() will settle on (friendly_label of the mission
     # name), NOT _plain(label) -- the ballot label carries a "[PVP]" suffix, so _plain(label) differs from the
     # refreshed value and the changing key would reset the mission-time-warning dedupe set, double-firing the
@@ -1639,7 +2501,11 @@ def load_ranks():
     try:
         with open(RANK_FILE, "r", encoding="utf-8") as f:
             RANK_DATA = json.load(f)
-        print(f"[ranks] loaded {len(RANK_DATA)} record(s) from {RANK_FILE}")
+        if not isinstance(RANK_DATA, dict):          # corrupt/partial write or a wrong-file restore -> a list/None/str
+            print(f"[ranks] {RANK_FILE} is not a JSON object ({type(RANK_DATA).__name__}); ignoring it, keeping the .bak")
+            RANK_DATA = {}                            # every hot-path RANK_DATA.get()/.items() would AttributeError otherwise
+        else:
+            print(f"[ranks] loaded {len(RANK_DATA)} record(s) from {RANK_FILE}")
     except FileNotFoundError:
         RANK_DATA = {}
     except (json.JSONDecodeError, OSError) as e:
@@ -1714,6 +2580,7 @@ def save_ranks():
             except OSError:
                 pass
         print(f"[ranks] save failed: {e}")
+    maybe_publish_aggregate()                    # cross-server share: best-effort throttled publish (display only)
 
 
 _LAST_RANK_SAVE = 0.0
@@ -1779,8 +2646,37 @@ def rank_progress(points):
     return f"[{abbr}] {rname}", color, tail
 
 
-def player_points(steamid):
+def local_points(steamid):
+    """This server's OWN lifetime points for the player (what ranks.json / the ledger hold)."""
     return RANK_DATA.get(str(steamid), {}).get("points", 0)
+
+
+def player_points(steamid):
+    """Points used for RANK DISPLAY: local points PLUS, when cross-server sharing is on, the points the
+    player earned on the host's OTHER servers -> the SAME combined rank/points show on every server.
+    Display only; the award + ledger path uses local_points() so ranks.json and --audit stay per-server."""
+    sid = str(steamid)
+    pts = RANK_DATA.get(sid, {}).get("points", 0)
+    if SHARED_RANKS_ENABLED:
+        try:
+            pts = pts + _other_ranks().get(sid, 0)
+        except Exception:        # noqa: BLE001 - rank display must never raise
+            pass
+    return pts
+
+
+def combined_rankup(steamid, new_local_pts, delta):
+    """#4 annIdx: gate rank-up announcements on the COMBINED (this server + the host's other servers)
+    total when cross-server sharing is ON, so the announced rank matches the combined rank the player
+    actually shows. Returns (crossed, new_idx) where new_idx indexes RANKS for the announcement.
+    With sharing OFF other==0 -> identical to the local old_idx/new_idx gate. Never raises."""
+    try:
+        other = _other_ranks().get(str(steamid), 0) if SHARED_RANKS_ENABLED else 0
+    except Exception:            # noqa: BLE001 - a rank-up gate must never raise into the hot path
+        other = 0
+    old_idx = rank_index_for((new_local_pts - delta) + other)
+    new_idx = rank_index_for(new_local_pts + other)
+    return (new_idx > old_idx), new_idx
 
 
 def award_points(steamid, name, n):
@@ -1790,7 +2686,7 @@ def award_points(steamid, name, n):
     if name:
         rec["name"] = name
     old_idx = rank_index_for(rec.get("points", 0))
-    rec["points"] = round(rec.get("points", 0) + n, 1)   # keep one decimal (real score is fractional)
+    rec["points"] = max(0.0, round(rec.get("points", 0) + n, 1))   # one decimal (real score is fractional); never negative
     return old_idx, rank_index_for(rec["points"]), rec["points"]
 
 
@@ -1832,13 +2728,14 @@ def award_and_announce(rc, all_players, recipients, points, header, reason="", k
         name = p.get("displayName") or sid
         old_idx, new_idx, new_pts = award_points(sid, name, points)
         match_award(sid, name, p.get("faction") or "", points, reason, kind, new_pts)
-        if new_idx > old_idx:
-            rankups.append((name, new_idx))
+        crossed, ann_idx = combined_rankup(sid, new_pts, points)   # #4: announce the COMBINED rank crossing
+        if crossed:
+            rankups.append((name, ann_idx))
     save_ranks()
     announce_rank_roster(rc, all_players, header)
     for name, idx in rankups:
         _, rname, abbr, color = RANKS[idx]
-        rc.say(f"<color={color}>** RANK UP ** {name} is now {rname} ({abbr})!</color>")
+        rc.say(rankup_line(name, rname, abbr, color))
         activity(f"{name} promoted to {rname} ({abbr})!", "RANK")
 
 
@@ -2160,13 +3057,15 @@ def say_welcome(rc, sid, name):
 def underdog_bonus(kid, vid):
     """Extra kill points when the KILLER outranks DOWN: i.e. the killer's server-rank
     TIER is BELOW the victim's. Scaled by how many rank tiers separate them, +10 each.
-    Uses the 11-tier RANKS ladder index (rank_index_for(player_points(...))) for BOTH
-    sides - not raw points, not skill. Returns 0 if the killer is the same or higher
-    rank than the victim, or if either id is missing."""
+    Uses the 11-tier RANKS ladder index of each side's LOCAL points (rank_index_for(local_points(...)))
+    -- NOT the cross-server combined total: this is an in-match, single-server balance incentive, and
+    keeping it on local points means the kill award/ledger stay reproducible from local state alone (no
+    foreign-points coupling, no inflation vector when a high-rank player carries in from another server).
+    Returns 0 if the killer is the same or higher rank than the victim, or if either id is missing."""
     if not kid or not vid:
         return 0
-    killer_idx = rank_index_for(player_points(kid))
-    victim_idx = rank_index_for(player_points(vid))
+    killer_idx = rank_index_for(local_points(kid))
+    victim_idx = rank_index_for(local_points(vid))
     levels = victim_idx - killer_idx        # how many tiers the killer was BELOW the victim
     return UNDERDOG_PER_PLAYER * levels if levels > 0 else 0
 
@@ -2182,15 +3081,17 @@ def _fac_of(sid):
     return ""
 
 
-def _record_killer(vid, kname, ksid, kfac, kp):
+def _record_killer(vid, kname, ksid, kfac, kp, ff=0, weapon=""):
     """Remember who/what downed victim `vid` (from a kill/down event) and back-fill the most
     recent killfeed entry for them that doesn't yet have a killer (the death `life` event and the
     kill/down event can arrive in either order)."""
     now = time.time()
-    _recent_kill[vid] = {"kname": kname, "ksid": ksid, "kfac": kfac, "kp": kp, "ts": now}
+    _recent_kill[vid] = {"kname": kname, "ksid": ksid, "kfac": kfac, "kp": kp,
+                         "ff": ff, "weapon": weapon, "ts": now}
     for k in KILLFEED[:8]:
         if k.get("vsid") == vid and not k.get("kname") and now - k.get("ts", 0) < 8:
             k["kname"], k["ksid"], k["kfac"], k["kp"] = kname, ksid, kfac, kp
+            k["ff"], k["weapon"] = ff, weapon
             break
 
 
@@ -2239,6 +3140,26 @@ def handle_stats_line(rc, obj):
         add_report(rec)
         activity(f"AUTO-{rec['action'].upper()}: {nm} - unit-flood (owned {rec['count']}, {rec['rate']}/s)", "!")
         return
+    if t == "tk":
+        # teamkill enforcement escalation (warn = eject / kick / ban) -> moderation log + the webcc Moderation tab.
+        # Records WHAT caused it: the teammate killed + the offense number.
+        rid = str(obj.get("id") or "")
+        nm = str(obj.get("n") or PLAYER_NAMES.get(rid) or (RANK_DATA.get(rid, {}).get("name") if rid else "") or "?")
+        victim = str(obj.get("victim") or "a teammate")
+        method = str(obj.get("method") or "")        # HOW it happened: "weapon (FS-12)" / "SAM (auto)" / "CRAM (auto)" / ...
+        count = int(obj.get("count") or 0)
+        action = str(obj.get("action") or "warn")
+        if action not in ("warn", "kick", "ban"):
+            action = "warn"
+        ordn = {1: "1st", 2: "2nd", 3: "3rd"}.get(count, f"{count}th")
+        reason = f"team-killed {victim} ({ordn} offense)"
+        rec = {"id": rid, "name": nm, "reason": reason, "method": method, "count": count, "rate": 0,
+               "action": action, "ts": time.time(), "banned": (action == "ban")}
+        add_report(rec)
+        verb = {"warn": "warned + ejected", "kick": "kicked", "ban": "BANNED"}[action]
+        via = f" via {method}" if method else ""
+        activity(f"TEAMKILL - {nm} {verb}: team-killed {victim}{via} ({ordn} offense)", "!")
+        return
     if t == "pos":
         # live map: fast position update for flying players. Stale entries (>~6s) mean the
         # player is no longer flying -> the command centre renders them as dead/ejected.
@@ -2255,6 +3176,12 @@ def handle_stats_line(rc, obj):
         AIR = {"s": obj.get("s", []), "ai": obj.get("ai", 0), "pl": obj.get("pl", 0),
                "teamcap": obj.get("teamcap"), "totcap": obj.get("totcap")}
         AIR_TS = time.time()
+        return
+    if t == "net":
+        # connection-health / RTT-probe telemetry (Connection Stress panel); payload shape is plugin-defined.
+        global NET, NET_TS
+        NET = {k: v for k, v in obj.items() if k != "t"}
+        NET_TS = time.time()
         return
     if t == "ent":
         # live map: per-AI-aircraft + per-ship world positions (each carries a per-unit instance id "i"
@@ -2289,6 +3216,7 @@ def handle_stats_line(rc, obj):
                 "name":  _vname, "vname": _vname, "vsid": sid, "vfac": _fac_of(sid),
                 "kname": (_rk["kname"] if _rk else ""), "ksid": (_rk["ksid"] if _rk else ""),
                 "kfac":  (_rk["kfac"] if _rk else ""),  "kp":   (_rk["kp"] if _rk else 0),
+                "ff": (_rk.get("ff", 0) if _rk else 0), "weapon": (_rk.get("weapon", "") if _rk else ""),
                 "x": (_vpos[0] if _vpos else None), "z": (_vpos[1] if _vpos else None),
                 "ts": _now, "reason": reason})
             del KILLFEED[KILLFEED_MAX:]            # keep newest KILLFEED_MAX (we insert at the front)
@@ -2356,9 +3284,10 @@ def handle_stats_line(rc, obj):
                          f"kill splash: +{KILL_BONUS} base" + (f" +{extra} underdog" if extra else ""),
                          total, match=CUR_MATCH["match_id"] if CUR_MATCH else None)
             _maybe_save_ranks()
-            if new_idx > old_idx:
-                _, rname, abbr, color = RANKS[new_idx]
-                rc.say(f"<color={color}>** RANK UP ** {kn} is now {rname} ({abbr})!</color>")
+            crossed, ann_idx = combined_rankup(kid, total, bonus)   # #4: combined-rank crossing
+            if crossed:
+                _, rname, abbr, color = RANKS[ann_idx]
+                rc.say(rankup_line(kn, rname, abbr, color))
                 activity(f"{kn} promoted to {rname} ({abbr})!", "RANK")
                 save_ranks()
                 _RANK_PUSH_FLAG[0] = True       # coalesced push at end of loop (was inline SSH)
@@ -2373,7 +3302,9 @@ def handle_stats_line(rc, obj):
         kp = 1 if int(obj.get("kp") or 0) else 0
         ksid = str(obj.get("ks") or "")
         kfac = _fac_of(ksid) if (kp and ksid) else ""
-        _record_killer(vid, kn, ksid, kfac, kp)
+        ff = 1 if int(obj.get("ff") or 0) else 0          # plugin-authoritative friendly-fire (teamkill) flag
+        weapon = str(obj.get("w") or "")                  # damaging unit/weapon name (webcc killfeed only)
+        _record_killer(vid, kn, ksid, kfac, kp, ff, weapon)
         return
     if t == "win":
         handle_plugin_win(rc, obj.get("f") or "")
@@ -2398,9 +3329,10 @@ def handle_stats_line(rc, obj):
         ledger_award(sid, name, pts, _cat, f"{_cat}: {obj.get('reason', '')}",
                      total, match=CUR_MATCH["match_id"] if CUR_MATCH else None)
         activity(f"{name}  +{pts}  ({obj.get('reason', '')})", "RANK")
-        if new_idx > old_idx:
-            _, rname, abbr, color = RANKS[new_idx]
-            rc.say(f"<color={color}>** RANK UP ** {name} is now {rname} ({abbr})!</color>")
+        crossed, ann_idx = combined_rankup(sid, total, pts)   # #4: combined-rank crossing
+        if crossed:
+            _, rname, abbr, color = RANKS[ann_idx]
+            rc.say(rankup_line(name, rname, abbr, color))
             activity(f"{name} promoted to {rname} ({abbr})!", "RANK")
             _RANK_PUSH_FLAG[0] = True   # coalesced push at end of loop (was inline SSH)
         return
@@ -2432,6 +3364,8 @@ def handle_stats_line(rc, obj):
         s = float(obj.get("s", 0))
     except (TypeError, ValueError):
         return
+    if not math.isfinite(s):                       # reject 'inf'/'nan' before it poisons ms/points (ranks.json corruption)
+        return
     LIVE_SCORE[sid] = s
     if not USE_PLUGIN_SCORE:
         return
@@ -2446,12 +3380,13 @@ def handle_stats_line(rc, obj):
     prev = rec["ms"]
     if s > prev:                                   # gained score -> credit the increase
         gain = s - prev
-        old_idx, new_idx, _ = award_points(sid, name, gain)
+        award = min(gain, GAIN_CLAMP_MAX)          # clamp what we BANK this tick; the raw gain still drives the spike alert below
+        old_idx, new_idx, _new_pts = award_points(sid, name, award)
         RANK_DATA[sid]["ms"] = s
-        # NuclearSkill: the same gain feeds the running per-life score, banked at next death/eject.
-        RANK_DATA[sid]["curLife"] = round(RANK_DATA[sid].get("curLife", 0.0) + gain, 1)
-        # Audit: accumulate this match's score for ONE ledger line at finalize (snaps are ~1/s).
-        _acc = SCORE_ACCUM.setdefault(sid, [name, 0.0]); _acc[0] = name; _acc[1] = round(_acc[1] + gain, 1)
+        # NuclearSkill: the same (clamped) gain feeds the running per-life score, banked at next death/eject.
+        RANK_DATA[sid]["curLife"] = round(RANK_DATA[sid].get("curLife", 0.0) + award, 1)
+        # Audit: accumulate this match's (clamped) score for ONE ledger line at finalize (snaps are ~1/s).
+        _acc = SCORE_ACCUM.setdefault(sid, [name, 0.0]); _acc[0] = name; _acc[1] = round(_acc[1] + award, 1)
         # Exploit tripwire: a single snap jump this large is abnormal (cf. 2026-06-24). Flag it
         # live + in the ledger (pts:0 -> audit-neutral; the real award is the "score" aggregate).
         if gain > SPIKE_THRESHOLD:
@@ -2459,9 +3394,10 @@ def handle_stats_line(rc, obj):
             ledger_award(sid, name, 0, "score-spike", f"single-tick gain +{gain:g} (>{SPIKE_THRESHOLD:g})",
                          RANK_DATA[sid].get("points", 0), match=CUR_MATCH["match_id"] if CUR_MATCH else None)
         _maybe_save_ranks()
-        if new_idx > old_idx:
-            _, rname, abbr, color = RANKS[new_idx]
-            rc.say(f"<color={color}>** RANK UP ** {name} is now {rname} ({abbr})!</color>")
+        crossed, ann_idx = combined_rankup(sid, _new_pts, award)   # #4: combined-rank crossing
+        if crossed:
+            _, rname, abbr, color = RANKS[ann_idx]
+            rc.say(rankup_line(name, rname, abbr, color))
             activity(f"{name} promoted to {rname} ({abbr})!", "RANK")
             save_ranks()
             _RANK_PUSH_FLAG[0] = True   # coalesced push at end of loop (was inline SSH)
@@ -2506,7 +3442,7 @@ def push_plugin_ranks():
     NukeStats plugin can render [Name - Rank] chat in the rank colour. Best-effort."""
     lines = []
     for sid, rec in RANK_DATA.items():
-        idx = rank_index_for(rec.get("points", 0))
+        idx = rank_index_for(player_points(sid))               # COMBINED rank across the host's servers when sharing is on
         _, rname, abbr, color = RANKS[idx]
         # sid|ABBR|#colour|rankIndex(1..11)|FullName
         #   ABBR     -> kill-feed / radar tag
@@ -2646,6 +3582,47 @@ def check_mission_time_warnings(rc, mtime, mission_name):
         print(f"[timer] {label} remaining")
 
 
+def _match_grant_key(elapsed, now, mission):
+    """A restart-STABLE identity for the current match: mission name + a coarse match-start epoch.
+    The start epoch is (wall_now - elapsed) bucketed to 300s so poll jitter on either reading maps to
+    the same key across a bot restart. Deliberately NOT CUR_MATCH['match_id'] (that's a strftime made
+    at lazy match-create -> a new value every restart, which is exactly what re-granted the bonus)."""
+    start_bucket = int((now - elapsed) // 300)
+    return f"{mission or '(unknown)'}|{start_bucket}"
+
+
+def _load_grant_set(key):
+    """Set of sids already granted the start bonus for this match key (restart-safe). {} / missing -> empty."""
+    try:
+        with open(START_BONUS_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return set(d.get(key, [])) if isinstance(d, dict) else set()
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+
+def _save_grant_set(key, sids):
+    """Persist the granted-sid set under `key`, keeping only the few most recent match keys (bounded file)."""
+    try:
+        try:
+            with open(START_BONUS_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            if not isinstance(d, dict):
+                d = {}
+        except (OSError, json.JSONDecodeError):
+            d = {}
+        d[key] = sorted(sids)
+        if len(d) > 8:                               # keep only the newest match keys (insertion order)
+            for stale in list(d.keys())[:-8]:
+                d.pop(stale, None)
+        tmp = START_BONUS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, START_BONUS_FILE)
+    except OSError as e:
+        print(f"[start-bonus] grant-marker save failed: {e}")
+
+
 def check_match_milestones(rc, mtime):
     """Start-of-match participation bonus + 'stay for the next match' reminders, keyed to the
     mission's elapsed clock (mtime = [elapsed, max, fetched_at]). Per-mission state resets when a
@@ -2691,16 +3668,22 @@ def check_match_milestones(rc, mtime):
     #     so back-to-back server restarts no longer hand out the bonus repeatedly. ---
     if not _ms_start_done and START_BONUS_WINDOW <= elapsed <= START_BONUS_WINDOW + 120:
         _ms_start_done = True
+        # Persisted per-match dedupe: a bot restart mid-match clears _ms_start_done (in-memory) and re-enters
+        # this window, but the on-disk granted-sid set survives, so nobody is awarded the +250 twice. (#1)
+        grant_key = _match_grant_key(elapsed, now, mission)
+        granted = _load_grant_set(grant_key)
         newly = []
         for sid, p in list(ROSTER_BY_SID.items()):
-            if not sid:
+            if not sid or sid in granted:            # already credited for THIS match (even across a restart)
                 continue
             name = p.get("displayName") or PLAYER_NAMES.get(sid) or sid
             _, _, total = award_points(sid, name, START_BONUS_PTS)
             ledger_award(sid, name, START_BONUS_PTS, "start_bonus",
                          "start of match bonus (present at the 1-minute mark)", total,
                          match=CUR_MATCH["match_id"] if CUR_MATCH else None)
+            granted.add(sid)
             newly.append(name)
+        _save_grant_set(grant_key, granted)          # persist BEFORE announce so a crash mid-grant still dedupes
         if newly:
             save_ranks()
             push_plugin_ranks()                   # refresh the in-chat [Name - RANK] tags right away
@@ -2936,6 +3919,19 @@ def process_admin_commands(rc):
                     activity(f"{'Banned' if ban else 'Unbanned'} {bsid} (plugin + game ban list)", "ADMIN")
             except Exception as e:                # noqa: BLE001
                 print(f"[admin] {cmd.get('action')} error: {e}")
+        elif cmd.get("action") == "logban":       # webcc Reports 'Log ban' button: record a ban in the persistent ban log
+            try:
+                n = log_ban(cmd.get("sid", ""), cmd.get("name", ""), cmd.get("reason", ""))
+                if n:
+                    activity(f"Ban logged: {cmd.get('name', '?')} (now {n}x in the ban log)", "ADMIN")
+            except Exception as e:                # noqa: BLE001
+                print(f"[admin] logban error: {e}")
+        elif cmd.get("action") == "rmbanlog":     # webcc Ban log 🗑 button: delete one player's logged-ban history
+            try:
+                if remove_ban_log(cmd.get("sid", "")):
+                    activity(f"Ban-log entry removed for {cmd.get('name', '') or cmd.get('sid', '?')}", "ADMIN")
+            except Exception as e:                # noqa: BLE001
+                print(f"[admin] rmbanlog error: {e}")
         elif cmd.get("action") in ("clear_report", "clear_reports"):   # webcc Reports tab: clear one / all reports
             try:
                 if cmd.get("action") == "clear_reports":
@@ -3008,6 +4004,29 @@ def process_admin_commands(rc):
                     activity(f"System message '{cmd.get('key', '')}' updated", "BOT")
             except Exception as e:                # noqa: BLE001
                 print(f"[admin] sysmsg error: {e}")
+        elif cmd.get("action") == "helpcfg":            # webcc Help editor: show/hide a command in the !help list
+            try:
+                if set_help_gate(cmd.get("cmd", ""), bool(cmd.get("on", True))):
+                    activity(f"!help: '{cmd.get('cmd', '')}' {'shown' if cmd.get('on') else 'hidden'}", "BOT")
+            except Exception as e:                # noqa: BLE001
+                print(f"[admin] helpcfg error: {e}")
+        elif cmd.get("action") == "rankladder":         # webcc Ranks modal: replace the whole rank ladder + rank-up template
+            try:
+                res = rank_ladder_apply(cmd.get("payload", {}) or {})
+                if res.get("ok"):
+                    push_plugin_ranks()                  # refresh the in-chat [Name - RANK] tags + colours immediately
+                    activity(f"Rank ladder updated ({len(RANKS)} ranks)", "BOT")
+                else:
+                    activity(f"Rank ladder NOT updated: {res.get('error', '?')}", "!")
+            except Exception as e:                # noqa: BLE001
+                print(f"[admin] rankladder error: {e}")
+        elif cmd.get("action") == "sharedranks":        # webcc Shared Ranks card: enable/disable + set the shared directory
+            try:
+                set_shared_ranks(bool(cmd.get("enabled")), str(cmd.get("dir", "") or ""))
+                activity(f"Shared ranks {'ON' if SHARED_RANKS_ENABLED else 'off'}"
+                         + (f" -> {SHARED_RANKS_DIR}" if SHARED_RANKS_ENABLED else ""), "BOT")
+            except Exception as e:                # noqa: BLE001
+                print(f"[admin] sharedranks error: {e}")
     return did_changemap
 
 
@@ -3042,9 +4061,10 @@ def admin_grant(rc, cmd):
     save_ranks()
     push_plugin_ranks()                      # refresh the in-chat [Name - RANK] tag immediately
     activity(f"ADMIN granted {pts:+.1f} pts to {name}  ->  now {total:.1f} pts", "RANK")
-    if new_idx > old_idx:
-        _, rname, abbr, color = RANKS[new_idx]
-        rc.say(f"<color={color}>** RANK UP ** {name} is now {rname} ({abbr})!</color>")
+    crossed, ann_idx = combined_rankup(sid, total, pts)   # #4: combined-rank crossing
+    if crossed:
+        _, rname, abbr, color = RANKS[ann_idx]
+        rc.say(rankup_line(name, rname, abbr, color))
         activity(f"{name} promoted to {rname} ({abbr})!", "RANK")
 
 
@@ -3061,8 +4081,8 @@ def admin_team(rc, cmd):
     if verb not in ("move", "team", "join", "spec", "spectate", "unteam", "balance",
                     "setrank", "setfunds", "addfunds"):
         return
-    sid = str(cmd.get("sid", "")).strip().replace("|", "")
-    faction = str(cmd.get("faction", "")).strip().replace("|", "")   # for set*rank/*funds this 3rd field carries the NUMBER
+    sid = str(cmd.get("sid", "")).strip().replace("|", "").replace("\n", "").replace("\r", "")
+    faction = str(cmd.get("faction", "")).strip().replace("|", "").replace("\n", "").replace("\r", "")   # for set*rank/*funds this 3rd field carries the NUMBER; strip framing chars (defense-in-depth, ADMIN-1)
     if verb != "balance" and not sid:
         activity(f"admin {verb}: no SteamID - not applied", "!")
         return
@@ -3127,23 +4147,41 @@ def _save_optin(d):
 
 
 def _global_cfg():
-    """The public-listing opt-in (list + region). Source of truth = what the plugin reports in PLUGIN_CFG
-    (Global.ListServer / Global.Region), persisted to global_optin.json so the directory survives a bot
-    restart or an empty server (when the plugin isn't reporting) -> we can still delist on opt-out."""
-    def _b(k):
-        v = PLUGIN_CFG.get(k)
-        return v is True or str(v).lower() in ("1", "true", "on", "yes")
-    if any(k in PLUGIN_CFG for k in ("Global.ListServer", "Global.Region")):
+    """The public-listing opt-in (list + region). AUTHORITATIVE = global_optin.json — the operator's
+    explicit webcc choice, persisted by set_cfg_dispatch the moment they toggle it. This is the fix for
+    the listing 'keeps turning off': the plugin's Global.ListServer bind defaults to false and only
+    applies when a player is online, so it must NOT be allowed to overwrite the operator's choice. We
+    only SEED global_optin.json from the plugin's reported value on first run (when nothing is persisted)."""
+    p = _load_optin()
+    if not p and any(k in PLUGIN_CFG for k in ("Global.ListServer", "Global.Region")):
+        def _b(k):
+            v = PLUGIN_CFG.get(k)
+            return v is True or str(v).lower() in ("1", "true", "on", "yes")
         region = str(PLUGIN_CFG.get("Global.Region", "") or "").strip()
-        if region not in _GLOBAL_REGIONS:
-            region = "Other"
-        d = {"list": _b("Global.ListServer"), "region": region}
-        if _load_optin() != d:
-            _save_optin(d)                       # remember the latest opt-in for restart / empty-server
-        return d
-    p = _load_optin()                            # plugin hasn't reported yet -> last-known persisted state
+        p = {"list": _b("Global.ListServer"), "region": region if region in _GLOBAL_REGIONS else "Other"}
+        _save_optin(p)
     region = p.get("region", "Other")
-    return {"list": bool(p.get("list")), "region": region if region in _GLOBAL_REGIONS else "Other"}
+    return {"list": bool(p.get("list")), "region": region if region in _GLOBAL_REGIONS else "Other",
+            "gm": str(p.get("gm", "") or "").strip()}
+
+
+def _dashboard_plugin_cfg():
+    """PLUGIN_CFG as the webcc settings menu should SEE it: the live plugin dump, but with the two
+    public-listing keys overlaid from the AUTHORITATIVE global_optin.json. The plugin's Global.ListServer
+    bind defaults to false and only applies with a player online, so on an empty server its DumpCfg
+    reports false -- which made the 'List Server Publicly' + Region toggles 'keep turning off' in the UI
+    even though the operator's choice was persisted. Showing the persisted truth here stops the revert."""
+    if not PLUGIN_CFG:
+        return None
+    cfg = dict(PLUGIN_CFG)
+    try:
+        gc = _global_cfg()
+        cfg["Global.ListServer"]    = bool(gc["list"])
+        cfg["Global.Region"]        = gc["region"]
+        cfg["Global.Gamemonitoring"] = gc.get("gm", "")
+    except Exception:                                    # noqa: BLE001
+        pass
+    return cfg
 
 
 def _server_id():
@@ -3189,6 +4227,78 @@ def _plugin_version():
             return str(json.load(f).get("version", "") or "")
     except (OSError, ValueError):
         return ""
+
+
+# ── gamemonitoring.net live-banner id ────────────────────────────────────────
+# The public directory entry can carry this server's gamemonitoring.net listing id so the GitHub Pages /
+# README renders its LIVE banner. No API key: match our node ip:port (the GAME port, not the query port)
+# against Nuclear Option's public list, or use a manual id/URL the operator set in global_optin.json ("gm").
+# We publish ONLY the resolved id -- never the ip/host/port itself (same privacy rule as the rest of the entry).
+GM_GAME_ID = 2168680                  # Nuclear Option on gamemonitoring.net (= Steam app id)
+_GM_CACHE = {"id": None, "at": 0.0}   # resolved id + when (re-resolve at most daily; last good id persists in global_optin "gm_id")
+
+
+def resolve_gamemonitoring_id(my_ip, my_game_port, manual=None, timeout=15):
+    """This server's gamemonitoring.net id, or None. 1) manual override = the trailing digits of a pasted
+    URL/id; 2) auto = match our ip:port against the public, key-less Nuclear Option list. Reads a public
+    endpoint only; never raises."""
+    if manual:
+        m = re.search(r"(\d{4,})", str(manual))
+        if m:
+            return m.group(1)
+    if not (my_ip and my_game_port):
+        return None
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.gamemonitoring.net/servers?game=%d" % GM_GAME_ID,
+            headers={"User-Agent": "nuke-toolkit", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            items = (json.load(r).get("response") or {}).get("items") or []
+    except Exception:                          # noqa: BLE001
+        return None
+    want = "%s:%s" % (my_ip, my_game_port)     # game/player port, NOT the query port
+    for it in items:
+        if it.get("connect") == want or (str(it.get("ip")) == str(my_ip)
+                                         and str(it.get("port")) == str(my_game_port)):
+            return str(it["id"]) if it.get("id") is not None else None
+    return None
+
+
+def _gamemonitoring_id():
+    """Cached gamemonitoring id for the public-directory entry. A manual override (global_optin 'gm' = a pasted
+    URL/id) wins; else best-effort auto-match using our node host + the live game Port.Value. Re-resolved at
+    most daily; the last good id persists in global_optin ('gm_id') so a restart / empty server keeps the
+    banner. Returns '' when unknown (the directory then simply omits the banner)."""
+    opt = _load_optin()
+    manual = str(opt.get("gm", "") or "").strip()
+    if manual:
+        rid = resolve_gamemonitoring_id(None, None, manual=manual)
+        if rid:
+            return rid
+    now = time.time()
+    if _GM_CACHE["id"] and (now - _GM_CACHE["at"]) < 86400:
+        return _GM_CACHE["id"]
+    rid = ""
+    try:
+        ip = None
+        if SFTP_HOST:
+            import socket as _sock
+            try:
+                ip = _sock.gethostbyname(SFTP_HOST)
+            except Exception:                  # noqa: BLE001 - hostname unresolved -> try the raw value
+                ip = SFTP_HOST
+        port = (_srvcfg_cache.get("values") or {}).get("Port.Value")
+        rid = resolve_gamemonitoring_id(ip, port) or ""
+    except Exception:                          # noqa: BLE001
+        rid = ""
+    if rid:
+        _GM_CACHE["id"], _GM_CACHE["at"] = rid, now
+        if opt.get("gm_id") != rid:
+            opt["gm_id"] = rid
+            _save_optin(opt)
+        return rid
+    return str(opt.get("gm_id") or "")         # keep the last known id if a one-off lookup failed
 
 
 def _gh_api(method, path, body=None):
@@ -3262,6 +4372,9 @@ def global_dir_tick():
         "plugin_version":  _plugin_version(),
         "updated":         _utcnow(),
     }
+    gmid = _gamemonitoring_id()                # gamemonitoring.net listing id (manual override or auto ip:port match)
+    if gmid:
+        directory["gamemonitoring_id"] = gmid  # GitHub Pages / README renders this server's LIVE banner from it
     sig = json.dumps({k: v for k, v in directory.items() if k != "updated"}, sort_keys=True)
     now = time.time()
     if sig == _last_dir_sig[0] and (now - _last_dir_sig[1]) < GLOBAL_DIR_KEEPALIVE:
@@ -3335,7 +4448,17 @@ def set_cfg_dispatch(rc, key, value, owner):
         if owner == "plugin":
             safek = key.replace("|", "").replace("\n", " ").replace("\r", " ")
             safev = val.replace("|", "").replace("\n", " ").replace("\r", " ")
-            _drop_plugin_cmd("setcfg|" + safek + "|" + safev)
+            if key != "Global.Gamemonitoring":                # bot-side only (lives in global_optin, no plugin bind) -> don't setcfg it
+                _drop_plugin_cmd("setcfg|" + safek + "|" + safev)
+            if key in ("Global.ListServer", "Global.Region", "Global.Gamemonitoring"):   # public-listing opt-in: persist the
+                p = _load_optin()                                 # operator's explicit choice to global_optin.json IMMEDIATELY
+                if key == "Global.ListServer":                    # (bot-side, no online>=1 needed) so a plugin reset / empty
+                    p["list"] = safev.lower() in ("1", "true", "on", "yes")   # server default can never silently delist it
+                elif key == "Global.Region":
+                    p["region"] = safev if safev in _GLOBAL_REGIONS else "Other"
+                else:                                             # Global.Gamemonitoring: pasted URL/id (digits extracted at resolve time)
+                    p["gm"] = str(safev or "").strip()
+                _save_optin(p)
             activity(f"ADMIN set {key} = {val}", "CFG")
             return {"ok": True, "needs_restart": False}
         if owner == "bot":
@@ -3434,6 +4557,18 @@ def whisper(rc, sid, *lines):
     activity(f"replied to {nm}: {summary}{extra}", "CHAT")   # [BOT] line - the reply logs ONCE, here
 
 
+def broadcast(rc, lines, label):
+    """Post several lines to ALL-CHAT as one logical message, logging a SINGLE compact activity
+    summary ('<label> - sent +N lines to server') instead of one [BOT] line per line (keeps the
+    webcc activity feed readable for big posts like the leaderboard / !help)."""
+    parts = [str(l).replace("|", "/") for l in lines if l is not None]
+    if not parts:
+        return
+    for l in parts:
+        rc.send("send-chat-message", l)   # send directly (not rc.say) so each line doesn't log
+    activity(f"{label} - sent +{len(parts)} lines to server", "BOT")
+
+
 def tell_player(sid, *lines):
     """Send a PRIVATE (client-side) reply to ONE player via the plugin's TellPlayer (the 'tell' verb) --
     the same mechanism !spec / team-moves use, so only that player sees it. NO all-chat fallback: the whole
@@ -3454,27 +4589,28 @@ def tell_player(sid, *lines):
 
 
 def help_lines():
-    return [
-        "<color=#FFFF00>=== SERVER COMMANDS ===</color>",
-        "<color=#55FF55>!votemap</color> - start a vote to change the map",
-        "<color=#55FF55>!rank</color> - your rank, points, and points to next",
-        "<color=#55FF55>!skill</color> - your skill rating (points per life) + next pilot up",
-        "<color=#55FF55>!points</color> - points you've earned this life + last life",
-        "<color=#55FF55>!leaderboard</color> - top pilots by points and by skill",
-        "<color=#55FF55>!spec</color> - leave your team and go to spectator",
-        "<color=#55FF55>!balance</color> - how PvP team balancing works",
-        "<color=#55FF55>!squadup <player></color> - team up with friends (up to 4) for PvP: they reply !y, and auto-balance keeps you on the same side (persists across matches; !squadup leave to exit, !squadup to see your squad)",
-        "<color=#55FF55>!forfeit</color> - (PvP) call/second a vote for your team to surrender the match; needs a team majority (also !ff / !surrender)",
-        "<color=#55FF55>!notk</color> - the no-team-killing policy (warnings -> kick -> ban)",
-        "<color=#55FF55>!help</color> - show this list of commands",
-    ]
+    # Public all-chat reply, built dynamically from _HELP_REGISTRY: each command's text is editable (webcc
+    # Help editor) and a command is OMITTED when its gate/feature is OFF (e.g. !votemap drops out when the
+    # votemap kill-switch is off). 2 commands/line separated by " || ", each "<cmd> - <what it does>";
+    # group order stats(green)->teams(cyan)->match(amber)->info(grey).
+    hcfg = _help_cfg()
+    vm_enabled = _votemap_cfg()["enabled"]
+    tokens = []
+    for g in _HELP_GROUP_ORDER:
+        for e in _HELP_REGISTRY:
+            if e[1] == g and _help_gate_open(e, hcfg, vm_enabled):
+                tokens.append(sysmsg_text("help_" + e[0], e[3]))
+    lines = [sysmsg_text("help_header", _HELP_TEXT_DEFAULTS["help_header"])]
+    for i in range(0, len(tokens), 2):
+        lines.append(" || ".join(tokens[i:i + 2]))
+    return lines
 
 
 def balance_lines():
     return [
         "<color=#FFD200>=== TEAM BALANCING (PvP) ===</color>",
         "Teams are kept even. Join the FULLER side and you'll get a warning, then be moved to spectator.",
-        "To switch sides: type <color=#55FF55>!spec</color>, reopen the map, then Join Faction and pick the team with FEWER players.",
+        "To switch sides yourself: type <color=#36FFD0>!swapteam</color> to move to the smaller team (you keep your points). It only works if the other team has fewer players.",
         "Mid-match the bot may move the newest pilot off the bigger side (you get a 10s warning first).",
     ]
 
@@ -3483,7 +4619,7 @@ def spectator_tip_lines(pvp=False):
     # PvE: no spectator tip at all. PvP: only the longer team-balance message.
     if not pvp:
         return []
-    return ["Accidentally on the fuller side? <color=#55FF55>!spec</color>, reopen the map, Join Faction and pick the team with FEWER players."]
+    return ["On the bigger team? Type <color=#36FFD0>!swapteam</color> to switch to the smaller side instantly - you keep your points and progress."]
 
 
 def leaderboard_lines(steamid=None):
@@ -3589,7 +4725,7 @@ def main():
         nonlocal votes, first_vote_at, vote_ends_at, vote_context, state
         votes = {}
         first_vote_at = {}
-        open_vote()              # build a fresh 4-map ballot into VOTE_OPTIONS
+        open_vote(len(known_online))   # build a fresh ballot (force_pvp uses the live player count)
         announce_options(rc)
         vote_ends_at = time.time() + VOTE_DURATION
         vote_context = context
@@ -3683,11 +4819,15 @@ def main():
                         # we caused ourselves right after a !votemap switch, and one that arrives
                         # while a map vote is already running.
                         if state != "VOTING" and now >= suppress_mission_end_until:
-                            activity("Mission ended - showing ranks, opening the map vote", "MAP")
                             announce_rank_roster(rc, roster,
                                                  "<color=#FFD200>== End of mission - current ranks ==</color>")
-                            open_map_vote("mission_end")
-                            print("[bot] mission complete detected -> roster + vote opened")
+                            if _votemap_cfg()["enabled"]:
+                                activity("Mission ended - showing ranks, opening the map vote", "MAP")
+                                open_map_vote("mission_end")
+                                print("[bot] mission complete detected -> roster + vote opened")
+                            else:
+                                activity("Mission ended - map voting is OFF; the server rotation picks the next map", "MAP")
+                                print("[bot] mission complete -> votemap disabled; server rotation advances")
                         else:
                             why = ("a map vote is already in progress" if state == "VOTING"
                                    else "just switched via !votemap")
@@ -3790,7 +4930,7 @@ def main():
                 # !spec -- the bot-relayed plugin 'tell' verb logs "delivering" but doesn't render, while
                 # !spec's TellPlayer does; pending a plugin redeploy). For now it goes to chat so it WORKS.
                 if low == "!help":
-                    whisper(rc, steamid, *help_lines())
+                    broadcast(rc, help_lines(), "!help")
                     continue
 
                 # after a normal chat message, post just the player's rank tag
@@ -3801,6 +4941,9 @@ def main():
 
                 # a player calls a mid-mission map vote
                 if state == "IDLE" and now >= cooldown_until and low == "!votemap":
+                    if not _votemap_cfg()["enabled"]:
+                        rc.say("<color=#FF5555>Map voting is currently disabled by the server.</color>")
+                        continue
                     players = get_players(rc)
                     n = max(len(players), 1)
                     caller = next((p.get("displayName") for p in players
@@ -3909,9 +5052,7 @@ def main():
         if (sysmsg_on("leaderboard") and now - last_leaderboard_at >= sysmsg_interval("leaderboard", LEADERBOARD_INTERVAL)
                 and known_online and state == "IDLE"):
             last_leaderboard_at = now
-            for ln in leaderboard_lines():
-                rc.say(ln)
-            activity("Posted the 30-min leaderboard", "INFO")
+            broadcast(rc, leaderboard_lines(), "Leaderboard")
 
         # every 12 min while players are on: how to spectate / switch to the smaller team.
         # The team-switch line only shows in a PvP match (both factions have players).
@@ -5486,6 +6627,16 @@ def upload_bepinex():
         ssh.close()
 
 
+def _read_tick_rate():
+    """Clamp the configured engine tick rate to a safe 30-120 Hz (default 60); never raises.
+    Read at wrapper-build time so --setup-server / --rewrite-wrapper always emit the live value."""
+    try:
+        v = int(TICK_RATE)
+    except (TypeError, ValueError):
+        v = 60
+    return max(30, min(120, v))
+
+
 def setup_server():
     """One-off admin helper (run via:  run.bat --setup-server).
 
@@ -5502,6 +6653,7 @@ def setup_server():
     LAUNCH = "NuclearOptionServer.x86_64"   # what the panel runs; becomes the wrapper
     REAL   = "NuclearOptionServer"          # real ELF, ext dropped -> same _Data folder
     DATA   = "NuclearOptionServer_Data"
+    tick   = _read_tick_rate()              # engine frame/tick rate (Hz), 30-120, default 60 (was hardcoded 30 -> live regression)
     wrapper = (
         "#!/bin/sh\n"
         "# Launch wrapper (map-vote bot). Exposes the localhost-only remote-command\n"
@@ -5533,7 +6685,7 @@ def setup_server():
         "fi\n"
         "tail -n +1 -F ./logs/console.log 2>/dev/null &\n"
         "exec ./NuclearOptionServer"
-        ' -logFile ./logs/console.log -limitframerate 30 -ServerRemoteCommands 5504 "$@"\n'
+        f' -logFile ./logs/console.log -limitframerate {tick} -ServerRemoteCommands 5504 "$@"\n'
     )
 
     if not (SFTP_HOST and SFTP_USER and SFTP_PASS):
@@ -6056,7 +7208,7 @@ def match_selftest():
 
     def _award(sid, nm, fac, pts, reason, kind):
         award_points(sid, nm, pts)
-        match_award(sid, nm, fac, pts, reason, kind, player_points(sid))
+        match_award(sid, nm, fac, pts, reason, kind, local_points(sid))   # ledger balance snapshot = LOCAL (per-server audit)
 
     print("[matchtest] MATCH 1: Tomo + Shirley capture & win, Jerms only present")
     CURRENT_MISSION = "Escalation BDF - Dawn"

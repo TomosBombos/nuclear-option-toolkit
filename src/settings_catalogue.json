@@ -107,6 +107,20 @@
    "gameplay": false
   },
   {
+   "key": "TICK_RATE",
+   "friendlyName": "Server Tick Rate (Hz)",
+   "group": "AI & Performance",
+   "owner": "bot",
+   "type": "int",
+   "default": "60",
+   "min": "30",
+   "max": "120",
+   "live": "restart",
+   "commonlyChanged": true,
+   "adminDescription": "How many times per second the server engine updates - higher = snappier, more accurate AI & missile reactions (not physics), at more CPU cost. Default 60. TO APPLY: save it, then run  run.bat --rewrite-wrapper  and restart the SERVER (drops players). A plain restart keeps the old rate until the wrapper is rewritten.",
+   "gameplay": true
+  },
+  {
    "key": "Balance.Enforce",
    "friendlyName": "Team Balance Enabled",
    "group": "Team Balance",
@@ -420,7 +434,7 @@
    "group": "PvE",
    "owner": "plugin",
    "type": "toggle",
-   "default": "false",
+   "default": "true",
    "live": "live",
    "commonlyChanged": true,
    "adminDescription": "PvE co-op: when the mission timer runs out and humans haven't won, declare them defeated instead of silently rotating.",
@@ -733,21 +747,9 @@
    "adminDescription": "Fire the timeout result (PvE defeat / PvP score result) this many seconds BEFORE the mission's MaxTime, so the match ends early enough for the map vote to run before the game auto-rotates. 120 = 2 min early; 0 = exactly at MaxTime."
   },
   {
-   "key": "Global.Enabled",
-   "friendlyName": "Global Leaderboard",
-   "group": "Global Leaderboard",
-   "owner": "plugin",
-   "type": "toggle",
-   "default": "false",
-   "live": "live",
-   "commonlyChanged": true,
-   "gameplay": false,
-   "adminDescription": "Opt in to the cross-server GLOBAL LEADERBOARD: the bot publishes this server's rankings to the shared GitHub repo every ~4h, and gameplay settings are LOCKED so all participating servers play by the same rules. Off = local leaderboard only, everything editable. Set your Region too."
-  },
-  {
    "key": "Global.Region",
    "friendlyName": "Server Region",
-   "group": "Global Leaderboard",
+   "group": "Public Listing",
    "owner": "plugin",
    "type": "enum",
    "options": [
@@ -764,19 +766,31 @@
    "live": "live",
    "commonlyChanged": true,
    "gameplay": false,
-   "adminDescription": "Your server's region for the global leaderboard + the public server directory. Required when either is on. No IP is ever published - Nuclear Option has no direct connect, so players find your server by name + region in-game."
+   "adminDescription": "Your server's region for the public server directory. Required when List Server Publicly is on. No IP is ever published - Nuclear Option has no direct connect, so players find your server by name + region in-game."
   },
   {
    "key": "Global.ListServer",
    "friendlyName": "List Server Publicly",
-   "group": "Global Leaderboard",
+   "group": "Public Listing",
    "owner": "plugin",
    "type": "toggle",
    "default": "false",
    "live": "live",
    "commonlyChanged": true,
    "gameplay": false,
-   "adminDescription": "Opt in to the public SERVER DIRECTORY on GitHub: list this server by name + region (never the IP) so players can discover it and look it up by name in-game. Does not require the leaderboard."
+   "adminDescription": "Opt in to the public SERVER DIRECTORY on GitHub: list this server by name + region (never the IP) so players can discover it and look it up by name in-game. Set your Region too."
+  },
+  {
+   "key": "Global.Gamemonitoring",
+   "friendlyName": "Gamemonitoring banner (URL/ID)",
+   "group": "Public Listing",
+   "owner": "plugin",
+   "type": "str",
+   "default": "",
+   "live": "live",
+   "commonlyChanged": false,
+   "gameplay": false,
+   "adminDescription": "Optional: paste your gamemonitoring.net server page URL (or just its numeric id) to show this server's LIVE status banner in the public directory. Leave blank to auto-match by your server's address. Only the numeric id is ever published, never your IP. Your server must be added to gamemonitoring.net once first."
   },
   {
    "key": "Command.Policy",
@@ -795,7 +809,7 @@
    "live": "live",
    "commonlyChanged": true,
    "gameplay": false,
-   "adminDescription": "Which units players may move via CmdSetDestination. HeliDroppedOnly (default, recommended) = ONLY player-deployed ground vehicles (Hexhound SAM/GMG, AA, APC, LAC SAM/AT, AT trucks, radar truck, Jackknife) -- blocks mission/AI ground units, ships, missiles. All / RateLimitOnly = any commandable unit (more lenient -- can allow command-flooding). AllowlistTypes = ground vehicles by jsonKey (Command.AllowedJsonKeys). Disabled = no commanding. The per-player rate limit + anti-grief auto-kick always apply on top. Changing this does NOT disqualify you from the global leaderboard. Live-tunable.",
+   "adminDescription": "Which units players may move via CmdSetDestination. HeliDroppedOnly (default, recommended) = ONLY player-deployed ground vehicles (Hexhound SAM/GMG, AA, APC, LAC SAM/AT, AT trucks, radar truck, Jackknife) -- blocks mission/AI ground units, ships, missiles. All / RateLimitOnly = any commandable unit (more lenient -- can allow command-flooding). AllowlistTypes = ground vehicles by jsonKey (Command.AllowedJsonKeys). Disabled = no commanding. The per-player rate limit + anti-grief auto-kick always apply on top. Live-tunable.",
    "lenience_warn": [
     "All",
     "RateLimitOnly",
