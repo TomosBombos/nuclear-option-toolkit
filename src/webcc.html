@@ -31,6 +31,7 @@ try{if(localStorage.getItem('nocc_theme')==='light')document.documentElement.set
   }
   *{box-sizing:border-box}
   ::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:var(--bd);border-radius:5px}
+  .bd,#out,#activity,#con,.lblist,#mpList,#setList,#setDetail,#cmList,.mapov-b,.modal,#findRes{overscroll-behavior:contain}   /* stop wheel scroll-chaining out of nested lists */
   ::-webkit-scrollbar-track{background:transparent}
   html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);
     font:14px/1.5 ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif;
@@ -151,7 +152,7 @@ try{if(localStorage.getItem('nocc_theme')==='light')document.documentElement.set
   .feed .ln:hover{background:var(--hover)}
   #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%) translateY(18px);background:#1b2737;
     border:1px solid #3a4a5e;color:#cfe0f5;padding:8px 16px;border-radius:9px;font-size:12px;
-    opacity:0;pointer-events:none;transition:.18s;z-index:99;max-width:70vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    opacity:0;pointer-events:none;transition:.18s;z-index:110;max-width:70vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
   .ts{color:var(--dim);margin-right:6px}
   .chip{display:inline-block;min-width:46px;text-align:center;border-radius:4px;padding:0 5px;margin-right:7px;
@@ -185,7 +186,7 @@ try{if(localStorage.getItem('nocc_theme')==='light')document.documentElement.set
   #ac .it .n{color:var(--txt);font-family:ui-monospace,monospace}#ac .it .a{color:var(--dim);font-size:11px}
   #ac .it .d{margin-left:auto;color:var(--dim);font-size:11px}
   /* modal / overlay */
-  .ov{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:50}
+  .ov{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:100}
   .ov.on{display:flex}
   .modal{background:var(--modal);border:1px solid var(--bd);border-radius:14px;width:min(560px,92vw);
     max-height:86vh;overflow:auto;box-shadow:0 20px 60px #000a}
@@ -269,6 +270,7 @@ try{if(localStorage.getItem('nocc_theme')==='light')document.documentElement.set
   .cmdbar input:focus-visible{outline:2px solid var(--ac);outline-offset:1px}
   /* ── responsive: stack the desktop 3-column grid on narrow / mobile widths ── */
   #mapwrap{min-height:140px}                       /* never collapse the live map to a black strip */
+  @media (max-width:1150px){ .graphs{display:none} .grow{flex:1 1 100%;order:5} }   /* tablet/narrow: hide graphs + drop search to its own row so the power buttons don't wrap raggedly */
   @media (max-width:900px){
     html,body{height:auto}
     .app{height:auto;min-height:100vh}
@@ -319,6 +321,7 @@ try{if(localStorage.getItem('nocc_theme')==='light')document.documentElement.set
   html[data-theme="light"] #staleBar{background:#c0392b;color:#fff}
   .app.stale .main .card{opacity:.55;transition:opacity .2s}
   body:has(#staleBar.on) .app{padding-top:30px}
+  body:has(.ov.on){overflow:hidden}   /* lock background scroll while a modal is open */
 </style>
 </head>
 <body>
@@ -608,12 +611,13 @@ try{if(localStorage.getItem('nocc_theme')==='light')document.documentElement.set
 </div>
 <!-- leaderboard: this server's all-time ranks -->
 <div class="ov" id="lbOv" onmousedown="_ovmd(event)" onclick="_ovmu(event)">
-  <div class="modal" style="width:min(620px,95vw)"><div class="mh"><b>🏆 Leaderboard</b>
-    <span style="margin-left:12px;font-size:11px" class="dim">this server</span>
-    <span class="sp"></span><button class="sm" onclick="renderLeaderboard()" title="refresh">↻ refresh</button><button class="sm" onclick="closeOv()">close</button></div>
+  <div class="modal" style="width:min(940px,96vw)"><div class="mh"><b>🏆 Leaderboard</b>
+    <span class="sp"></span><button class="sm" onclick="renderLeaderboard();renderSharedBoard()" title="refresh">↻ refresh</button><button class="sm" onclick="closeOv()">close</button></div>
     <div class="mb">
-      <div class="lbcol"><h4>🏅 This server <span class="dim" id="lbLocalSub" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h4><div class="lblist" id="lbLocal"><div class="lbempty">loading…</div></div></div>
-      <div class="muted" style="font-size:11px;margin-top:10px">This server's all-time ranks by points.</div>
+      <div class="lbgrid">
+        <div class="lbcol"><h4>🏅 This server <span class="dim" id="lbLocalSub" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h4><div class="lblist" id="lbLocal"><div class="lbempty">loading…</div></div></div>
+        <div class="lbcol"><h4>🌐 Shared · all servers <span class="dim" id="lbSharedSub" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h4><div class="lblist" id="lbSharedBoard"><div class="lbempty">loading…</div></div></div>
+      </div>
       <div id="lbShared" style="border-top:1px solid var(--bd);margin-top:14px;padding-top:13px"></div>
     </div></div>
 </div>
@@ -857,7 +861,9 @@ function drawMap(ps){
     for(const sid in posHistory){ if(!ps.find(q=>q.sid===sid)&&posHistory[sid].curr.ts<cutoff) delete posHistory[sid]; }
     lastPlayers=ps;
   }
-  render();
+  // Only paint here in the states the 60fps rafLoop is NOT already covering (tab hidden, a modal
+  // covers the map, or no blips to animate); otherwise the next animation frame paints fresh anchors.
+  if(document.hidden||document.querySelector('.ov.on')||!((lastPlayers&&lastPlayers.length)||Object.keys(entHistory).length))render();
 }
 // Fold the AI-aircraft + ship feed into entHistory, keyed by the plugin's per-unit instance id, so
 // each unit glide-interpolates exactly like a player blip (same anchor/skip-unchanged/gap logic).
@@ -876,9 +882,9 @@ function recordEntities(ent){
   for(const k in entHistory){ if(!live.has(k)&&entHistory[k].curr.ts<cutoff) delete entHistory[k]; }
 }
 // ── air-traffic panel: AI + player aircraft per side (perf limiter telemetry) ──
+let airSig='';
 function renderAir(air){const el=$('#airpanel');
-  if(!air||!Array.isArray(air.s)||!air.s.length){el.style.display='none';return;}
-  el.style.display='';
+  if(!air||!Array.isArray(air.s)||!air.s.length){if(airSig!=='__none__'){airSig='__none__';el.style.display='none';}return;}
   // Sort sides by faction name so the chips keep a FIXED order. The plugin emits them in
   // Dictionary order, which flips between ticks and makes the side chips jump around.
   const sides=[...air.s].sort((a,b)=>String(a.n||'~').localeCompare(String(b.n||'~')));
@@ -887,6 +893,9 @@ function renderAir(air){const el=$('#airpanel');
     return `<span class="airchip"><i style="background:${col}"></i>${esc(s.n||'?')} `
       +`<b style="color:${over?'#ff6a6a':'#e6edf5'}">${val}${cap?`<span class="cap">/${cap}</span>`:''}</b></span>`;};
   const totOver=totcap&&total>=totcap;
+  const sig=JSON.stringify({s:air.s,ai:air.ai,pl:air.pl,tc:totcap,tp:teamcap});   // guard: only rebuild when the air data changed (kills per-tick DOM churn)
+  if(sig===airSig){el.style.display='';return;} airSig=sig;
+  el.style.display='';
   el.innerHTML=`<div class="airhd"><span>Air traffic</span>`
     +`<span class="airtotal" style="color:${totOver?'#ff6a6a':'#9fb0c4'}">${total}${totcap?` / ${totcap}`:''} flying</span></div>`
     +`<div class="airrow"><span class="airk">AI</span>${sides.map(s=>chip(s,s.ai||0,teamcap)).join('')}</div>`
@@ -926,17 +935,25 @@ function renderNet(net){
     if(document.querySelector('.ov.on'))return;                 // a modal covers the map -> let the page scroll
     const r=cv.getBoundingClientRect();if(r.width<2||r.height<2)return;   // map hidden/collapsed
     const mx=e.clientX-r.left,my=e.clientY-r.top;
-    if(mx<GUT_L||my<GUT_T||mx>r.width||my>r.height)return;       // over the gutters / outside the drawn map -> normal page scroll
+    if(mx<0||my<0||mx>r.width||my>r.height)return;               // off the canvas -> normal page scroll
+    // On the narrow/stacked layout the map spans the full width; a plain wheel there should scroll the
+    // PAGE (hold Ctrl, or use fullscreen, to zoom). Desktop (>900px) keeps direct wheel-zoom.
+    if(!(e.ctrlKey||_isCssFull()||_isNativeFull()||window.matchMedia('(min-width:901px)').matches))return;
     e.preventDefault();
-    zoomAt(mx,my,e.deltaY<0?1.18:1/1.18);},{passive:false});
+    const zx=Math.min(Math.max(mx,GUT_L),r.width),zy=Math.min(Math.max(my,GUT_T),r.height);   // clamp a gutter graze into the drawn area so it still zooms (no dead zone)
+    zoomAt(zx,zy,e.deltaY<0?1.18:1/1.18);},{passive:false});
   cv.addEventListener('mousedown',e=>{if(!atlas)return;drag={x:e.clientX,y:e.clientY,px:view.panX,py:view.panY};cv.style.cursor='grabbing';});
-  window.addEventListener('mousemove',e=>{const r=cv.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
+  window.addEventListener('mousemove',e=>{
     if(drag){view.panX=drag.px+(e.clientX-drag.x);view.panY=drag.py+(e.clientY-drag.y);clampView();render();return;}
-    if(atlas&&mapImg&&mx>=GUT_L&&my>=GUT_T&&mx<r.width&&my<r.height){const wx=c2wx(mx),wz=c2wy(my);
+    const cr=$('#curref');
+    if(document.querySelector('.ov.on')||!(atlas&&mapImg)){if(cr&&cr.textContent!=='')cr.textContent='';return;}
+    const r=cv.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;   // one rect read; only when the map is visible
+    let nv='';
+    if(mx>=GUT_L&&my>=GUT_T&&mx<r.width&&my<r.height){const wx=c2wx(mx),wz=c2wy(my);
       const inb=(wx>=atlas.x0&&wx<=atlas.x1&&wz<=atlas.z0&&wz>=atlas.z1);
       const fine=(atlas.cell/SUB)*view.scale>=MINOR_LINES_PX;   // zoomed in enough -> full minor address
-      $('#curref').textContent=!inb?'':(fine?worldToGridLabel(atlas,wx,wz):grid_ref(atlas,wx,wz));}
-    else $('#curref').textContent='';});
+      nv=!inb?'':(fine?worldToGridLabel(atlas,wx,wz):grid_ref(atlas,wx,wz));}
+    if(cr&&cr.textContent!==nv)cr.textContent=nv;});                              // equality-guarded write (no per-move DOM churn)
   window.addEventListener('mouseup',()=>{if(drag){drag=null;cv.style.cursor='grab';}});
   cv.addEventListener('dblclick',e=>{const r=cv.getBoundingClientRect();zoomAt(e.clientX-r.left,e.clientY-r.top,1.6);});
   const z=id=>document.getElementById(id);
@@ -975,7 +992,7 @@ let toastT;function showToast(m){const e=$('#toast');e.textContent=m;e.classList
 // smart auto-scroll: skip rebuild when unchanged; pin to bottom only if already near it
 let actSig='',conSig='';
 function nearBottom(c){return c.scrollHeight-c.scrollTop-c.clientHeight<44;}
-function pin(c,was,prev){if(was)c.scrollTop=c.scrollHeight;else c.scrollTop=prev;}
+function pin(c,was,fromBottom){if(was)c.scrollTop=c.scrollHeight;else c.scrollTop=Math.max(0,c.scrollHeight-fromBottom);}
 // ── activity-feed category FILTER (per-operator view preference, persisted in localStorage,
 //    matching the nocc_theme pattern). Purely client-side: filters the rendered feed only.
 const ACT_CATS=[['chat','Chat'],['bot','Bot'],['join','Join/Leave'],['kills','Kills/Match'],['rank','Ranks & map'],['mod','Moderation'],['system','System']];
@@ -1001,7 +1018,7 @@ function renderActivity(lines){
   const raw=lines;lines=raw.filter(ln=>actFilter[actCat(ln)]!==false && !/\[KILL\]/.test(ln));   // per-operator category filter + always drop KILL (it lives in the killfeed now) so it stays out of the dedup signature too
   if(!lines.length){if(actSig!=='__filtered__'){actSig='__filtered__';$('#activity').innerHTML='<div class="ln dim" style="cursor:default">No activity in the selected categories.</div>';}return;}
   const sig=lines.join('');if(sig===actSig)return;actSig=sig;
-  const el=$('#activity'),c=el.parentElement,was=nearBottom(c),prev=c.scrollTop;el.innerHTML='';
+  const el=$('#activity'),c=el.parentElement,was=nearBottom(c),fromBottom=c.scrollHeight-c.scrollTop;el.innerHTML='';
   for(const ln of lines){const m=ln.match(/^(\d\d:\d\d:\d\d [AP]M)\s\s(.*)$/);let ts='',body=ln;if(m){ts=m[1];body=m[2];}
     const tm=body.match(/\[([A-Za-z!]+)\]/);const tag=tm?tm[1]:null;const col=tagCol(tag);
     if(tag==='KILL')continue;   // (2) kill 'splash' lines now live in the killfeed — drop them from the activity feed
@@ -1012,15 +1029,15 @@ function renderActivity(lines){
       html+=`<span class="chip" style="color:${col};background:${chipBg(col)}">${esc(tag)}</span><span style="color:${col}">${esc(rest)}</span>`;}
     else html+=`<span style="color:${col}">${esc(body)}</span>`;
     d.innerHTML=html;el.appendChild(d);}
-  pin(c,was,prev);}
+  pin(c,was,fromBottom);}
 function renderConsole(items){
   if(!items.length){if(conSig!=='__empty__'){conSig='__empty__';$('#con').innerHTML='<div class="ln dim" style="cursor:default">No console output.</div>';}return;}const sig=items.map(it=>it.k+it.t).join('');if(sig===conSig)return;conSig=sig;
-  const el=$('#con'),c=el.parentElement,was=nearBottom(c),prev=c.scrollTop;el.innerHTML='';
+  const el=$('#con'),c=el.parentElement,was=nearBottom(c),fromBottom=c.scrollHeight-c.scrollTop;el.innerHTML='';
   for(const it of items){const d=document.createElement('div');d.className='ln '+(it.k||'show');d.textContent=it.t;
     if(it.k==='sum'){d.style.cursor='default';}
     else{d.title='click for options';d.onclick=(e)=>{if(hasSelection())return;showLineMenu(e,it.t);};}
     el.appendChild(d);}
-  pin(c,was,prev);}
+  pin(c,was,fromBottom);}
 
 // console line context menu: Copy / "Filter messages like this"
 let lnMenuEl=null;
@@ -1054,7 +1071,10 @@ async function openFilters(){
   }
 }
 
-function renderPlayers(ps){players=ps;const _ph=$('#phcount');if(_ph)_ph.textContent='· '+ps.length;const tb=$('#ptbl tbody');tb.innerHTML='';
+function renderPlayers(ps){players=ps;const _ph=$('#phcount');if(_ph)_ph.textContent='· '+ps.length;
+  const _sig=JSON.stringify(ps.map(p=>[p.name,p.faction,p.rank_abbr,(p.points||0)|0,p.aircraft,p.ingame_rank,(p.match_points||0)|0,p.skill,(p.x||0)|0,(p.z||0)|0]));
+  if(_sig===renderPlayers._sig)return; renderPlayers._sig=_sig;   // guard: skip the tbody teardown (which drops row focus/hover) when nothing changed
+  const tb=$('#ptbl tbody');tb.innerHTML='';
   if(!ps.length){tb.innerHTML='<tr><td colspan="9" class="dim" style="text-align:center;padding:14px">No players online.</td></tr>';return;}
   ps.forEach(p=>{const tr=document.createElement('tr');tr.onclick=()=>playerPopup(p);tr.tabIndex=0;tr.setAttribute('role','button');tr.dataset.kbd='1';tr.setAttribute('aria-label','Player '+(p.name||''));
     const coords=(p.x!=null&&p.z!=null&&atlas)?(worldToGridLabel(atlas,p.x,p.z)||grid_ref(atlas,p.x,p.z)||'—'):'—';
@@ -1159,7 +1179,7 @@ async function tick(){try{
   $('#timer').textContent=st.time_current?fmtTime(st.time_max-st.time_current-_extra):'—';
   $('#pcount').textContent=st.online_count||0;
   await ensureMap(st.map_key);entities=st.entities||null;lastPlayers=st.players||[];
-  if(Date.now()>=_settleAt){missionPool=st.mission_pool||missionPool;missionAudit=st.mission_audit||missionAudit;votemapCfg=st.votemap||votemapCfg;if($('#mpOv').classList.contains('on'))renderMissionPool();}
+  if(Date.now()>=_settleAt){missionPool=st.mission_pool||missionPool;missionAudit=st.mission_audit||missionAudit;votemapCfg=st.votemap||votemapCfg;const _mpl=$('#mpList');if($('#mpOv').classList.contains('on')&&_mpl&&!(_mpl.contains(document.activeElement)||_mpl.matches(':hover')))renderMissionPool();}   // don't tear down the panel (open <select>, scroll pos, hover) mid-interaction — only the 1s tick was doing this
   if(st.server_messages){serverMessages=st.server_messages;if($('#msgOv').classList.contains('on')&&msgEditId===null)renderMessages();}
   if(st.rank_ladder){rankLadderLive=st.rank_ladder;if($('#rankOv').classList.contains('on')&&!rankDirty&&!$('#rankBody').contains(document.activeElement))renderRankLadder(true);}
   if(st.shared_ranks){sharedRanksLive=st.shared_ranks;if($('#lbOv').classList.contains('on')&&!$('#lbShared').contains(document.activeElement))renderSharedRanks();}
@@ -1170,9 +1190,11 @@ async function tick(){try{
   if(st.sys_messages&&Date.now()>=_settleAt){sysMessages=st.sys_messages;if($('#msgOv').classList.contains('on'))renderSysMessages();}
   if(st.help_config&&Date.now()>=_settleAt){helpCfg=st.help_config;if($('#msgOv').classList.contains('on'))renderHelpEditor();}
   if(st.server_config){serverConfig=st.server_config;if($('#srvOv').classList.contains('on'))renderServerCfg();}
-  drawMap(lastPlayers);recordEntities(entities);renderPlayers(lastPlayers);renderAir(st.air);renderNet(st.net);
-  lastKillfeed=st.killfeed||[];renderKillfeed(st.killfeed);renderFsPlayers(lastPlayers);
-  lastActivity=st.activity||[];renderActivity(lastActivity);renderConsole(st.console||[]);renderDeploy(st.deploy);
+  const _safe=(f)=>{try{f();}catch(_e){console.error('tick render',_e);}};   // one panel throwing must not skip the rest of the tick or mislabel the server 'backend?'
+  lastKillfeed=st.killfeed||[];lastActivity=st.activity||[];
+  _safe(()=>drawMap(lastPlayers));_safe(()=>recordEntities(entities));_safe(()=>renderPlayers(lastPlayers));_safe(()=>renderAir(st.air));_safe(()=>renderNet(st.net));
+  _safe(()=>renderKillfeed(st.killfeed));_safe(()=>renderFsPlayers(lastPlayers));
+  _safe(()=>renderActivity(lastActivity));_safe(()=>renderConsole(st.console||[]));_safe(()=>renderDeploy(st.deploy));
   if(!window.__actFilterBuilt){window.__actFilterBuilt=1;try{buildActFilterBar();}catch(e){}}   // build the filter chips once
 }catch(e){$('#srv').innerHTML='<span class="dot" style="background:#FF5C5C"></span>backend?';}}
 
@@ -1212,7 +1234,7 @@ async function tickRes(){try{const r=await jget('/api/resources');
     cpuHist.push(r.cpu||0);memHist.push(r.mem_mb||0);if(cpuHist.length>120){cpuHist.shift();memHist.shift();}
     spark('cpug',cpuHist,Math.max(100,...cpuHist),'#5BA3FF');spark('memg',memHist,Math.max(2048,...memHist),'#57e08a');}
   else{$('#cpuv').textContent=r.configured?'err':'no panel';}
-  document.querySelectorAll('button[onclick^="power("]').forEach(b=>{b.disabled=!r.configured;b.title=r.configured?'':'Pterodactyl not configured — add apiKey.txt + panel.txt';});
+  document.querySelectorAll('button[onclick^="power("]').forEach(b=>{if(!_powerBusy)b.disabled=!r.configured;b.title=r.configured?'':'Pterodactyl not configured — add apiKey.txt + panel.txt';});
 }catch(e){}}
 
 // ── command input + autocomplete ──────────────────────────────────────────────
@@ -1242,7 +1264,7 @@ $('#cmd').addEventListener('keydown',e=>{const box=$('#ac'),open=box.style.displ
   else if(e.key==='ArrowUp'&&open){e.preventDefault();acSel=Math.max(0,acSel-1);hl();}
   else if(e.key==='Tab'){e.preventDefault();applyAC(acSel<0?0:acSel);}
   else if(e.key==='Enter'){if(open&&acSel>=0){applyAC(acSel);}else{box.style.display='none';runInput();}}
-  else if(e.key==='Escape'){if(open)box.style.display='none';else $('#cmd').value='';}});
+  else if(e.key==='Escape'){e.stopPropagation();if(open)box.style.display='none';else $('#cmd').value='';}});
 function hl(){[...$('#ac').children].forEach((c,i)=>{const on=i===acSel;c.classList.toggle('sel',on);c.setAttribute('aria-selected',on?'true':'false');});const cmd=$('#cmd');if(acSel>=0)cmd.setAttribute('aria-activedescendant','acopt'+acSel);else cmd.removeAttribute('aria-activedescendant');}
 
 function out(html,cls){const o=$('#out');const d=document.createElement('div');d.className='bl '+(cls||'');d.innerHTML=html;
@@ -1283,7 +1305,7 @@ function _ovmd(e){_ovDownBd=(e.target===e.currentTarget);}                      
 function _ovmu(e){if(e.target===e.currentTarget&&_ovDownBd)closeOv();_ovDownBd=false;}  // close only if press AND release were both on the backdrop (a real outside click, not a drag that ended there)
 function closeOv(){document.querySelectorAll('.ov').forEach(o=>o.classList.remove('on'));}
 // ── leaderboard: this server (local all-time ranks) ───────────
-function openLeaderboard(){ $('#lbOv').classList.add('on'); renderLeaderboard(); renderSharedRanks(); }
+function openLeaderboard(){ $('#lbOv').classList.add('on'); renderLeaderboard(); renderSharedBoard(); renderSharedRanks(); }
 function lbRow(rk,name,pts,tag,color){
   const c=color||'var(--dim)';
   return `<div class="lbr"><span class="rk">${rk}</span><span class="nm">${esc(name||'?')}</span>`+
@@ -1302,6 +1324,18 @@ async function renderLeaderboard(){
                             : '<div class="lbempty">No ranked players yet.</div>';
   }catch(e){ if(L)L.innerHTML='<div class="lbempty">Couldn\'t load local ranks.</div>'; }
 }
+// ── shared (cross-server) combined board — ALL players, its own column ───────────
+async function renderSharedBoard(){
+  const L=$('#lbSharedBoard'); if(!L)return;
+  L.innerHTML='<div class="lbempty">loading…</div>';
+  try{
+    const r=await jget('/api/sharedleaderboard');
+    if(!r||!r.enabled){ const sub=$('#lbSharedSub'); if(sub)sub.textContent=''; L.innerHTML='<div class="lbempty">Cross-server sharing is off.<br><span class="dim">Enable it below to combine ranks across your servers.</span></div>'; return; }
+    const rows=r.rows||[]; const sub=$('#lbSharedSub'); if(sub)sub.textContent=rows.length?(rows.length+' pilots · '+(r.peers||0)+' servers'):'';
+    L.innerHTML=rows.length ? rows.map((p,i)=>lbRow(i+1,p.name,p.pts,p.abbr,p.color)).join('')
+                            : '<div class="lbempty">No shared ranks yet.</div>';
+  }catch(e){ L.innerHTML='<div class="lbempty">Couldn\'t load shared ranks.</div>'; }
+}
 // ── cross-server shared ranks card (in the Leaderboard modal) ───────────────────
 let sharedRanksLive=null;
 function renderSharedRanks(){
@@ -1319,11 +1353,8 @@ function renderSharedRanks(){
     +'<button class="sm" onclick="sharedValidate()">Validate</button>'
     +'<button class="go" onclick="sharedSave()">Save</button></div>'
     +'<div id="srMsg" class="dim" style="font-size:11px;margin-bottom:8px">'+(on?('<span class="ok">Sharing ON</span> — this server publishes as <b>ranks_'+esc(s.server_id||'?')+'.json</b> and combines <b>'+(s.peer_files||0)+'</b> server file(s) in this folder'):'Sharing off — points stay local to this server only')+'</div>';
-  if(on && s.board && s.board.length){
-    h+='<div class="dim" style="font-size:11px;margin-bottom:4px">Combined standings (points summed across every linked server):</div>'
-      +'<div class="lblist">'+s.board.map(function(p,i){ return lbRow(i+1,p.name,p.points,null,null); }).join('')+'</div>';
-  } else if(on){
-    h+='<div class="dim" style="font-size:11.5px">Only this server is sharing here so far — once another of your servers points at this <i>same</i> folder, its players’ points merge in and the combined standings appear.</div>';
+  if(on && !(s.board && s.board.length)){
+    h+='<div class="dim" style="font-size:11.5px">Only this server is sharing here so far — once another of your servers points at this <i>same</i> folder, its players’ points merge in and the combined standings appear in the <b>Shared</b> column above.</div>';
   }
   C.innerHTML=h;
 }
@@ -1851,17 +1882,17 @@ function _missionCatRows(filterFn){
 }
 function _missionDefaultTab(){
   if(!missionPool||!missionPool.length) return '<div class="dim" style="padding:14px 4px">No mission-pool data yet — this fills in once the bot has loaded the pool.</div>';
-  const rows=_missionCatRows(c=>c==='PvP');
-  return '<div class="muted" style="font-size:11px;margin:9px 2px 5px">Built-in game modes that ship with Nuclear Option (Escalation, Terminal Control, Altercation, Confrontation, Domination, Breakout). Toggle which can appear in the map vote.</div>'
+  const rows=_missionCatRows(function(c){return true;});   // ALL built-in game content: PvP modes + the Co-op scenarios that ship with the game
+  return '<div class="muted" style="font-size:11px;margin:9px 2px 5px">Every built-in mission that ships with Nuclear Option — the PvP modes (Escalation, Terminal Control, Altercation, Confrontation, Domination, Breakout) and the Co-op scenarios (Escalation &amp; Terminal Control Co-op). Toggle which can appear in the map vote.</div>'
     +(rows||'<div class="dim" style="font-size:11.5px;padding:10px 6px">No built-in missions in the pool.</div>');
 }
 function _missionUserTab(){
   const loaded=missionAudit&&missionAudit.loaded;
   const userM=loaded?((missionAudit.unofficial||[]).filter(m=>(m.group||'User')==='User')):[];
-  let h='<div class="muted" style="font-size:11px;margin:9px 2px 5px">Your custom missions — the co-op rotation you built, plus any you upload.</div>';
-  h+=_missionCatRows(c=>c!=='PvP');                      // your co-op missions (Escalation / Terminal Control Co-op)
+  let h='<div class="muted" style="font-size:11px;margin:9px 2px 5px">Custom missions you\'ve uploaded to this server. The built-in PvP + Co-op missions now live in the 🏛 Built-in tab.</div>';
   if(!loaded) h+=_missionScanHint();
   else if(userM.length) h+=_unofRows(userM);
+  else h+='<div class="dim" style="font-size:11.5px;padding:10px 6px">No custom missions uploaded yet.</div>';
   return h+_uploadControlHtml();
 }
 function _missionWorkshopTab(){
@@ -1876,22 +1907,27 @@ function _missionWorkshopTab(){
 function setMissionTab(t){ missionTab=t; renderMissionPool(); }
 function _missionTabBar(){
   const pool=missionPool||[];
-  const def=pool.filter(m=>m.cat==='PvP').length;
+  const def=pool.length;                                 // Built-in = the whole official pool (PvP modes + Co-op)
   const unof=(missionAudit&&missionAudit.unofficial)||[];
-  const nU=pool.filter(m=>m.cat!=='PvP').length + unof.filter(m=>(m.group||'User')==='User').length;
+  const nU=unof.filter(m=>(m.group||'User')==='User').length;   // User = only genuinely uploaded/custom missions
   const nW=unof.filter(m=>(m.group||'User')==='Workshop').length;
   const tab=function(id,label,n){ const on=missionTab===id;
     return '<button onclick="setMissionTab(\''+id+'\')" style="border:1px solid '+(on?'var(--ac)':'var(--bd)')+';background:'+(on?'var(--inset)':'transparent')+';color:'+(on?'var(--ac)':'inherit')+';border-radius:8px 8px 0 0;cursor:pointer;padding:7px 13px;font-weight:700;font-size:12px;margin-bottom:-1px;'+(on?'border-bottom-color:var(--inset)':'')+'">'+label+' <span class="dim" style="font-weight:400;font-size:10px">'+n+'</span></button>';
   };
   return '<div style="display:flex;gap:4px;margin:10px 0 0;border-bottom:1px solid var(--bd)">'+tab('default','🏛 Built-in',def)+tab('user','📁 User',nU)+tab('workshop','🧩 Workshop',nW)+'</div>';
 }
+let _mpSigPrev='';
 function renderMissionPool(){
   const L=$('#mpList'); if(!L)return;
-  let html=_missionAuditBanner()+_votemapHtml()+_missionTabBar()+'<div style="padding-top:6px">';
+  const ae=document.activeElement;                                   // don't tear down a focused text/upload field mid-edit
+  if(L.contains(ae)&&(ae.tagName==='INPUT'||ae.tagName==='TEXTAREA'))return;
+  let html=_votemapHtml()+_missionTabBar()+'<div style="padding-top:6px">';   // stock-mission-pool header/check removed (deprecated)
   if(missionTab==='user') html+=_missionUserTab();
   else if(missionTab==='workshop') html+=_missionWorkshopTab();
   else html+=_missionDefaultTab();
-  L.innerHTML=html+'</div>';
+  html=html+'</div>';
+  if(html===_mpSigPrev)return;                                       // guard: skip the rebuild (and the scroll reset) when nothing changed
+  _mpSigPrev=html; L.innerHTML=html;
 }
 async function toggleMission(idx,on){
   const m=missionPool[idx]; if(!m)return;
@@ -2165,7 +2201,7 @@ function applyTheme(t){
   const b=document.getElementById('themeBtn'); if(b) b.textContent=(t==='light')?'☀':'🌙';
   try{ if(typeof render==='function'&&atlas&&mapImg) render(); }catch(e){}   // re-tint map blips (vars changed)
   try{ paintLegend(); }catch(e){}
-  actSig=''; kfSig=''; fpSig='';            // force the colour-baked feeds to rebuild with the theme palette next tick
+  actSig=''; kfSig=''; fpSig=''; airSig='';            // force the colour-baked feeds to rebuild with the theme palette next tick
   try{ renderActivity(lastActivity); renderKillfeed(lastKillfeed); }catch(e){}   // recolour immediately too
 }
 function toggleTheme(){
@@ -2431,14 +2467,15 @@ function paBan(sid,name){if(!confirm('BAN '+name+'? (writes to ban list)'))retur
 function paCopy(sid,name){copyText(sid).then(function(ok){showToast(ok?('copied SteamID '+sid):('could not copy — select + Ctrl+C: '+sid));});closeOv();}
 
 function toggleRaw(){rawConsole=!rawConsole;$('#rawbtn').textContent=rawConsole?'raw':'filtered';tick();}
+let _powerBusy=false;
 async function power(sig){if(!confirm(sig.toUpperCase()+' the server?'))return;
   const btns=[...document.querySelectorAll('.pwr button.go,.pwr button.warn,.pwr button.bad')];
-  btns.forEach(b=>b.disabled=true);
+  _powerBusy=true; btns.forEach(b=>b.disabled=true);
   out('<span class="info">sending '+sig+'…</span>');
   try{ const r=await jpost('/api/power',{signal:sig});
     out((r.ok?'<span class="ok">✓ ':'<span class="er">✗ ')+esc(r.message)+'</span>'); }
   catch(e){ out('<span class="er">✗ power request failed</span>'); }
-  finally{ btns.forEach(b=>b.disabled=false); }}
+  finally{ _powerBusy=false; btns.forEach(b=>b.disabled=false); }}
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeSettingsMenu();closeOv();}});
 
 (async()=>{const c=await jget('/api/commands');catalog=c.commands;missions=c.missions;})();
@@ -2450,7 +2487,7 @@ tick();setInterval(tick,1000);tickRes();setInterval(tickRes,5000);paintLegend();
 // 60fps render loop: glide the interpolated blips between the 1s poll anchors. Only runs when
 // there are blips to animate and the tab is visible, so an idle/background dashboard stays cheap.
 (function rafLoop(){
-  if(atlas&&mapImg&&!document.hidden&&((lastPlayers&&lastPlayers.length)||Object.keys(entHistory).length)){
+  if(atlas&&mapImg&&!document.hidden&&!document.querySelector('.ov.on')&&((lastPlayers&&lastPlayers.length)||Object.keys(entHistory).length)){
     mapRenderTime=Date.now()/1000; render(); }
   requestAnimationFrame(rafLoop);
 })();
@@ -2475,6 +2512,8 @@ document.addEventListener('fullscreenchange',()=>{                       // nati
 document.addEventListener('keydown',e=>{
   const t=(e.target&&e.target.tagName||'').toLowerCase();
   if(t==='input'||t==='textarea'||(e.target&&e.target.isContentEditable))return;   // don't hijack typing
+  if(document.querySelector('.ov.on'))return;                                       // a modal is open -> 'f' shouldn't slam the map behind it
+  if(e.target&&e.target.closest&&e.target.closest('button,[data-kbd],[role=button],a,select'))return;   // focus on a control -> don't hijack the map
   if(e.key==='f'||e.key==='F'){e.preventDefault();toggleMapFull();}
   else if(e.key==='Escape'&&_isCssFull()){_mapCard().classList.remove('mapfull');updateFsBtn();refreshMapSize();}});
 let rsT;window.addEventListener('resize',()=>{clearTimeout(rsT);rsT=setTimeout(onMapResize,120);});

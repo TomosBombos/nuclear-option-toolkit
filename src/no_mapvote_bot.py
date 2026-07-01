@@ -1537,15 +1537,27 @@ def shared_ranks_state():
 
 
 def set_shared_ranks(enabled, dir_):
-    global SHARED_RANKS_ENABLED, SHARED_RANKS_DIR, _SHARED_PUB_AT, _SHARED_BOARD_CACHE
+    global SHARED_RANKS_ENABLED, SHARED_RANKS_DIR, _SHARED_PUB_AT, _SHARED_BOARD_CACHE, _OTHER_RANKS_CACHE
+    global _SHARED_PUB_PENDING
     SHARED_RANKS_ENABLED = bool(enabled)
     SHARED_RANKS_DIR = str(dir_ or "").strip()
     save_shared_ranks_cfg(SHARED_RANKS_ENABLED, SHARED_RANKS_DIR)
     _SHARED_BOARD_CACHE = ([], 0.0)
     if SHARED_RANKS_ENABLED:
         _SHARED_PUB_AT = 0.0
-        global _SHARED_PUB_PENDING
-        _SHARED_PUB_PENDING = True               # #2: flag the daemon to publish (off the main loop), not inline
+        _SHARED_PUB_PENDING = True               # #2: flag the daemon to publish OUR file (off the main loop)
+        # Warm the peer cache NOW (synchronously -- this runs on the admin-command handler, not the hot
+        # loop) so the immediate rank re-push below bakes the COMBINED rank into every player's name tag,
+        # not the local-only rank. Without this, a player joining right after you toggle sharing on gets
+        # their LOCAL rank baked (the plugin bakes the name ONCE at connect) until the daemon warms the
+        # cache ~2s later -- the "cross-server rank didn't show" symptom.
+        try:
+            _OTHER_RANKS_CACHE = (_compute_other_ranks(), time.time())
+        except Exception:                        # noqa: BLE001 - enabling must never raise
+            pass
+    else:
+        _OTHER_RANKS_CACHE = ({}, 0.0)           # sharing off -> ranks revert to local immediately
+    _RANK_PUSH_FLAG[0] = True                     # re-push plugin_ranks.txt (combined ranks + peer lines) on the very next loop
     return {"ok": True}
 
 
@@ -3435,6 +3447,15 @@ def handle_plugin_win(rc, faction):
 # rank-up (a kill burst could otherwise fire several ~15s-timeout connects mid-poll,
 # stalling chat/vote parsing). A list so the hot paths mutate it without a global decl.
 _RANK_PUSH_FLAG = [False]
+# default-on / boot: if sharing is already enabled at startup, warm the peer cache + flag a combined rank
+# push NOW (this runs AFTER _RANK_PUSH_FLAG is defined, unlike the load_shared_ranks_cfg site above), so the
+# FIRST connect after boot already gets its combined name tag instead of waiting ~2s for the daemon warm.
+if SHARED_RANKS_ENABLED:
+    try:
+        _OTHER_RANKS_CACHE = (_compute_other_ranks(), time.time())
+        _RANK_PUSH_FLAG[0] = True
+    except Exception:                             # noqa: BLE001 - boot must never fail on the share
+        pass
 
 
 def push_plugin_ranks():
@@ -4651,12 +4672,23 @@ def leaderboard_lines(steamid=None):
     player's own position + who's right above them (mirrors the !skill 'next up' format), then the
     Top-5 by points + Top-5 by skill. Without steamid (the 30-min auto-post) it's just the top lists."""
     out = []
-    pts_board = [(s, r) for s, r in RANK_DATA.items() if r.get("points", 0) > 0]
+    # With cross-server sharing ON, rank the COMBINED board (this server + the host's other servers)
+    # so the in-game leaderboard AGREES with !rank and the baked name tag, and peer-only players show.
+    # Consistent with the webcc leaderboard (both read the same aggregate). Skill stays per-server.
+    src = RANK_DATA
+    if SHARED_RANKS_ENABLED:
+        try:
+            agg = read_aggregate_ranks()               # {sid: {name, points, wins, losses}} summed across servers
+            if agg:
+                src = agg
+        except Exception:                              # noqa: BLE001 - a leaderboard must never raise
+            src = RANK_DATA
+    pts_board = [(s, r) for s, r in src.items() if r.get("points", 0) > 0]
     pts_board.sort(key=lambda kv: kv[1].get("points", 0), reverse=True)
     table = skill_table()
 
     if steamid is not None:                            # personalized header for the asker
-        rec = RANK_DATA.get(steamid)
+        rec = src.get(steamid)
         mypts = rec.get("points", 0) if rec else 0
         idx = next((i for i, (s, _) in enumerate(pts_board) if s == steamid), None)
         if idx is None or mypts <= 0:

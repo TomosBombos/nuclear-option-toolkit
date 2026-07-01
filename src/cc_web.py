@@ -37,6 +37,10 @@ PENDING_META = os.path.join(HERE, "pending_plugin.json")    # sidecar: {version,
 DEPLOYED_SHA = os.path.join(HERE, "deployed_plugin.sha256") # sha of the plugin currently deployed/live
 DEPLOYED_META = os.path.join(HERE, "deployed_plugin.json")  # {version, sha, deployed_at} written by the deploy job
 PORT = int(((getattr(bot, "_TK_CFG", {}) or {}).get("web", {}) or {}).get("port") or os.environ.get("PORT") or os.environ.get("NOCC_PORT") or 8770)  # config web.port -> env -> 8770
+# Bind interface: default 0.0.0.0 so the dashboard is reachable from other devices on the LAN
+# (phone/laptop), matching the LAN-over-HTTP use the clipboard fallback was built for. Lock it back
+# to loopback with web.host="127.0.0.1" (config) or NOCC_HOST=127.0.0.1 (env) if you want host-only.
+HOST = (((getattr(bot, "_TK_CFG", {}) or {}).get("web", {}) or {}).get("host")) or os.environ.get("NOCC_HOST") or "0.0.0.0"
 SETTINGS_CATALOGUE = os.path.join(HERE, "settings_catalogue.json")  # static metadata for the settings menu
 BOT_OVERRIDES = os.path.join(HERE, "bot_overrides.json")            # bot-owned setting overrides (current values)
 _last_dump_nudge = 0.0                                              # throttle the "ask the plugin to dump" nudge
@@ -346,13 +350,31 @@ def _rank_tier(pts):
 
 def _leaderboard():
     d = _read_ranks()
-    pts = sorted(((s, r) for s, r in d.items() if r.get("points", 0) > 0),
-                 key=lambda kv: -kv[1].get("points", 0))[:8]
-    pboard = []
-    for sid, r in pts:
-        ab, co = _rank_tier(r.get("points", 0))
-        pboard.append({"name": r.get("name", sid), "pts": round(r.get("points", 0), 1),
-                       "abbr": ab, "color": co})
+    # Points board: when cross-server sharing is ON, use the COMBINED board the bot writes into the
+    # dashboard (authoritative across the host's servers) so a server with few LOCAL players still
+    # shows everyone's carried-over ranks -- fixes the "leaderboard had no ranks" case on a fresh
+    # server. Falls back to local ranks.json when sharing is off or the board isn't ready. Skill
+    # stays per-server (skill = local sorties).
+    pboard = None
+    try:
+        with open(DASHBOARD, encoding="utf-8") as f:
+            sr = (json.load(f) or {}).get("shared_ranks", {}) or {}
+        if sr.get("enabled") and sr.get("board"):
+            pboard = []
+            for r in sr["board"][:8]:
+                pv = r.get("points", 0) or 0
+                ab, co = _rank_tier(pv)
+                pboard.append({"name": r.get("name", ""), "pts": round(pv, 1), "abbr": ab, "color": co})
+    except Exception:                                    # noqa: BLE001
+        pboard = None
+    if pboard is None:
+        pts = sorted(((s, r) for s, r in d.items() if r.get("points", 0) > 0),
+                     key=lambda kv: -kv[1].get("points", 0))[:8]
+        pboard = []
+        for sid, r in pts:
+            ab, co = _rank_tier(r.get("points", 0))
+            pboard.append({"name": r.get("name", sid), "pts": round(r.get("points", 0), 1),
+                           "abbr": ab, "color": co})
     ml = getattr(bot, "SKILL_MIN_LIVES", 5)
     sk = [(r.get("name", s), r.get("skillPoints", 0.0) / max(1, r.get("lives", 1)), r.get("lives", 0))
           for s, r in d.items() if r.get("lives", 0) >= ml]
@@ -1125,6 +1147,59 @@ def api_mapimg():
     return ("", 404)
 
 
+@app.route("/api/sharedleaderboard")
+def api_sharedleaderboard():
+    """Full COMBINED cross-server board (ALL players) for the webcc Leaderboard 'Shared' column.
+    Reads the shared dir from the dashboard (authoritative — cc_web's in-process bot copy can be stale
+    because sharing may have been toggled AFTER cc_web started) and aggregates every rankshare_*.json.
+    Read-only; tolerant of a peer file mid-write."""
+    import glob
+    out = {"enabled": False, "rows": [], "peers": 0, "server_id": None}
+    try:
+        with open(DASHBOARD, encoding="utf-8") as f:
+            sr = (json.load(f) or {}).get("shared_ranks", {}) or {}
+    except Exception:                                    # noqa: BLE001
+        sr = {}
+    out["enabled"] = bool(sr.get("enabled"))
+    out["server_id"] = sr.get("server_id")
+    sdir = sr.get("dir") or ""
+    if not (out["enabled"] and sdir and os.path.isdir(sdir)):
+        return jsonify(out)
+    agg = {}
+    try:
+        files = glob.glob(os.path.join(sdir, "rankshare_*.json"))
+        out["peers"] = len(files)
+        for path in files:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    d = json.load(f)
+            except Exception:                            # noqa: BLE001 - tolerate a file mid-write
+                continue
+            ranks = d.get("ranks", {}) if isinstance(d, dict) else {}
+            for psid, rec in (ranks.items() if isinstance(ranks, dict) else []):
+                if not isinstance(rec, dict):
+                    continue
+                a = agg.setdefault(psid, {"name": "", "points": 0.0, "wins": 0, "losses": 0})
+                try:
+                    a["points"] += float(rec.get("points", 0) or 0)
+                    a["wins"] += int(rec.get("wins", 0) or 0)
+                    a["losses"] += int(rec.get("losses", 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+                if rec.get("name"):
+                    a["name"] = rec["name"]
+    except OSError:
+        pass
+    rows = sorted(agg.items(), key=lambda kv: -kv[1]["points"])
+    board = []
+    for psid, v in rows:                                 # ALL players across every server (the owner wants the full shared board)
+        ab, co = _rank_tier(v["points"])
+        board.append({"name": v["name"] or psid, "pts": round(v["points"], 1),
+                      "abbr": ab, "color": co, "w": v["wins"], "l": v["losses"]})
+    out["rows"] = board
+    return jsonify(out)
+
+
 @app.route("/api/cmd", methods=["POST"])
 def api_cmd():
     b = request.get_json(force=True, silent=True) or {}
@@ -1307,7 +1382,9 @@ def api_schedule_del():
 
 
 if __name__ == "__main__":
-    print(f"[webcc] Nuke Option web command centre -> http://127.0.0.1:{PORT}")
+    _shown = "127.0.0.1" if HOST in ("127.0.0.1", "localhost") else "<this-machine-LAN-IP>"
+    print(f"[webcc] Nuke Option web command centre -> http://127.0.0.1:{PORT}"
+          + (f"  (LAN: http://{_shown}:{PORT})" if HOST == "0.0.0.0" else ""))
     _pt_load()
     print(f"[webcc] pterodactyl: {'ready (' + (_pt.get('server') or '') + ')' if _pt.get('server') else 'NOT configured - ' + str(_pt.get('err'))}")
-    app.run(host="127.0.0.1", port=PORT, threaded=True)
+    app.run(host=HOST, port=PORT, threaded=True)
