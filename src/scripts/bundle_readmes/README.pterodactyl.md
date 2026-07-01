@@ -67,7 +67,7 @@ After the first time, just double-click **`START EVERYTHING.bat`** in this folde
   (the default). The wrapper handles BepInEx — you do not edit the Startup. Check the panel
   console and `logs/relay.log` in the container.
 - **The bot can't send commands.** The relay port must be a real, reachable Pterodactyl
-  **allocation** (Panel → Network), and the “Server address” in the Connection step must be your
+  **allocation** (Panel → Network), and the "Server address" in the Connection step must be your
   server's public host. The bot connects to `host:relay-port`.
 - **Settings don't seem to apply.** Live plugin settings only take effect while **at least one
   player is online** — that's a game limitation, not a bug.

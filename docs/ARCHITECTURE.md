@@ -5,7 +5,7 @@ first, then the full technical reference in [Part II](#part-ii--technical-refere
 hooks, algorithms, and data contracts). For what each feature *does* rather than how it's
 wired, see **[FEATURES.md](FEATURES.md)**; for the command list, **[COMMANDS.md](COMMANDS.md)**.
 
-> **Plugin version:** `anz.nukestats` `0.9.14` (the `[BepInPlugin]` attribute is authoritative).
+> **Plugin version:** `anz.nukestats` `0.9.22` (the `[BepInPlugin]` attribute is authoritative).
 
 ---
 
@@ -28,7 +28,7 @@ The toolkit is built from **three independent processes** that never call each o
         │   ▲ Harmony patches + [Server] API calls                       │
         │   │                                                            │
         │  ┌┴───────────────────────────┐                                │
-        │  │  NukeStats plugin v0.9.14   │  Debug.Log("[NOSTATS] {...}")  │
+        │  │  NukeStats plugin v0.9.22   │  Debug.Log("[NOSTATS] {...}")  │
         │  │  (BepInEx)                  ├───────────────┐                │
         │  └─────────────▲──────────────┘               │                │
         │   reads:        │ reads/deletes:               ▼                │
@@ -89,7 +89,7 @@ The toolkit is built from **three independent processes** that never call each o
 
 ## 2. Component: NukeStats BepInEx plugin (`NukeStatsPlugin.cs`)
 
-The plugin is a single `BaseUnityPlugin` (`[BepInPlugin("anz.nukestats", "NukeStats", "0.9.14")]`). Every behaviour is a HarmonyLib patch or a `[Server]`-API call. All tunables live in `BepInEx/config/anz.nukestats.cfg`.
+The plugin is a single `BaseUnityPlugin` (`[BepInPlugin("anz.nukestats", "NukeStats", "0.9.22")]`). Every behaviour is a HarmonyLib patch or a `[Server]`-API call. All tunables live in `BepInEx/config/anz.nukestats.cfg`.
 
 ### 2.1 Bootstrap & scheduling
 

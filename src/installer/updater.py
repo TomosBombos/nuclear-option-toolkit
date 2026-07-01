@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Nuke Option Server Toolkit — opt-in GitHub updater (plugin + bot, stable/nightly).
+"""Nuke Option Server Toolkit — opt-in GitHub updater (plugin/bot/web CC/installer, stable/nightly).
 
 The install itself is fully local/offline. THIS tool is the separate, by-choice way a
-server owner connects to GitHub to pull fixes when they're released. It never
-auto-applies: `check` only reports; `update` downloads + VERIFIES + stages the new
-component for the next deploy; the owner decides when to apply.
+server owner connects to GitHub to pull fixes when they're released.
 
-    python updater.py check                         # what's available on your channel?
-    python updater.py update                         # plugin: download+verify+STAGE (no deploy)
-    python updater.py update --component bot          # bot:   download+verify+STAGE
-    python updater.py update --component all          # both
-    python updater.py update --deploy                 # plugin: ...and run the guarded deploy
-    python updater.py update --component bot --apply   # bot: ...and replace no_mapvote_bot.py (backs up first)
+    python updater.py check                          # what's available on your channel?
+    python updater.py update                          # download + verify + INSTALL everything newer
+    python updater.py update --component bot           # just one component
+    python updater.py update --channel nightly          # one-off channel override
+    python updater.py update --stage-only               # download + verify only, install later
+    python updater.py update --deploy                    # also run the guarded PLUGIN deploy
+                                                         # (the plugin restarts the match, so it
+                                                         #  always needs the explicit --deploy)
+
+`update` installs by default: every replaced file is backed up first (*.bak-<version>),
+the run ends with a plain UPDATE SUMMARY of exactly what changed, and every run is
+recorded in <data-dir>/update.log. Bot/web-CC changes need a process restart to load.
 
 Channels (config update.channel, or --channel): `stable` = latest full release;
 `nightly` = latest release INCLUDING pre-releases. Opt in once; it sticks.
@@ -42,9 +46,37 @@ for _s in (sys.stdout, sys.stderr):                   # never crash printing on 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-USER_DIR = os.environ.get("NOST_DATA_DIR") or os.path.join(os.path.expanduser("~"), ".nuke-option-toolkit")
+
+
+def _default_user_dir():
+    """Config dir resolution, folder-safe: env pin > this folder's .nost-data > legacy shared dir.
+    The legacy-last order matters: falling back to the SHARED ~/.nuke-option-toolkit config from a
+    per-folder install silently used the wrong channel ('I ran the update and nothing happened')."""
+    env = os.environ.get("NOST_DATA_DIR")
+    if env:
+        return env
+    local = os.path.join(ROOT, ".nost-data")            # per-folder install (installer v2)
+    if os.path.isdir(local):
+        return local
+    return os.path.join(os.path.expanduser("~"), ".nuke-option-toolkit")
+
+
+USER_DIR = _default_user_dir()
 CONFIG = os.path.join(USER_DIR, "config.json")
+UPDATE_LOG = os.path.join(USER_DIR, "update.log")
 PUBKEY = os.path.join(HERE, "trusted.pub")          # bundled minisign public key (ships with the toolkit)
+
+
+def _audit(line):
+    """Append one line to update.log — EVERY run leaves a trace, so 'what did the update actually
+    do' is always answerable from the log instead of guessed from file timestamps."""
+    try:
+        import datetime
+        os.makedirs(USER_DIR, exist_ok=True)
+        with open(UPDATE_LOG, "a", encoding="utf-8") as f:
+            f.write("%s  %s\n" % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), line))
+    except OSError:
+        pass
 
 # A release ships a matched set; both components carry the release tag as their version.
 COMPONENTS = {
@@ -69,6 +101,13 @@ COMPONENTS = {
         "meta": os.path.join(ROOT, "pending_webcc.json"),
         "deployed": os.path.join(ROOT, "deployed_webcc.json"),
         "apply": "extract",         # applied by backing up + extracting the files into ROOT
+    },
+    "installer": {                  # the installer/updater tooling itself — WITHOUT this, updater
+        "asset": "installer.zip",   # fixes never reach installed servers short of a full reinstall
+        "pending": os.path.join(ROOT, "pending_installer.zip"),
+        "meta": os.path.join(ROOT, "pending_installer.json"),
+        "deployed": os.path.join(ROOT, "deployed_installer.json"),
+        "apply": "extract-installer",   # extract into installer/ — NEVER touches trusted.pub (trust root)
     },
 }
 
@@ -160,6 +199,11 @@ def _repo_and_channel(channel_override=None):
 
 
 def check(components=("plugin", "bot"), channel_override=None, verbose=True):
+    bad = [c for c in components if c not in COMPONENTS]
+    if bad:                                            # friendly message + audit, not a raw KeyError
+        print("Unknown component(s): %s. Valid: %s" % (", ".join(bad), ", ".join(COMPONENTS)))
+        _audit("check REJECTED unknown component(s): %s" % ", ".join(bad))
+        return None
     repo, channel = _repo_and_channel(channel_override)
     if not repo:
         print("No GitHub repo configured. Re-run setup (or set update.github_repo in %s)." % CONFIG)
@@ -184,22 +228,32 @@ def check(components=("plugin", "bot"), channel_override=None, verbose=True):
     out = {"repo": repo, "channel": channel, "release": rel, "latest": latest,
            "installed": installed, "components": {}}
     for comp in components:
-        c_have = _deployed_version(comp)
+        # A component with no per-component marker yet falls back to the bundle-stamped toolkit
+        # baseline, so a FRESH install doesn't report every component as "needs update (have none)"
+        # for the very version it just installed (which `update` would then reinstall as a no-op).
+        c_have = _deployed_version(comp) or installed
         out["components"][comp] = {"in_release": _asset(rel, COMPONENTS[comp]["asset"]) is not None,
                                    "installed": c_have, "newer": _vt(latest) > _vt(c_have)}
     out["newer"] = any(c["in_release"] and c["newer"] for c in out["components"].values())
     if verbose:
         print("Repo:    %s  (%s channel)" % (repo, channel))
+        print("Config:  %s" % CONFIG)
         print("Latest:  %s" % latest)
         for comp in components:
             st = out["components"][comp]
             tag = ("(not in this release)" if not st["in_release"]
                    else "<-- UPDATE (have %s)" % (st["installed"] or "none") if st["newer"]
                    else "up to date (%s)" % (st["installed"] or "?"))
-            print("  %-7s %s" % (comp, tag))
+            print("  %-10s %s" % (comp, tag))
         if out["newer"] and rel.get("body"):
             print("\nRelease notes:\n" + "\n".join("  " + ln for ln in rel["body"].splitlines()[:25]))
-            print("\nRun `python updater.py update --component all --apply` to download + verify + apply.")
+            print("\nRun `python updater.py update` to download + verify + install (backups kept).")
+        _audit("check channel=%s latest=%s config=%s :: %s"
+               % (channel, latest, CONFIG,
+                  "; ".join("%s=%s" % (c, "update-available"
+                                       if (out["components"][c]["newer"] and out["components"][c]["in_release"])
+                                       else "not-in-release" if not out["components"][c]["in_release"]
+                                       else "up-to-date") for c in components)))
     return out
 
 
@@ -334,61 +388,137 @@ def _apply_webcc(latest):
           % (latest, ", ".join(applied) or "(empty)"))
 
 
-def update(components=("plugin",), channel_override=None, do_deploy=False, do_apply=False, allow_unsigned=False):
+def _apply_installer(latest):
+    """Extract installer.zip into installer/ (self-update of the tooling). The trust root
+    (trusted.pub) is NEVER written from a download — a compromised release must not be able
+    to rotate the key that verifies releases."""
+    c = COMPONENTS["installer"]
+    if not os.path.exists(c["pending"]):
+        print("  nothing staged to apply.")
+        return
+    import zipfile
+    applied = []
+    with zipfile.ZipFile(c["pending"]) as z:
+        for name in z.namelist():
+            base = os.path.basename(name)
+            # Normalise before the trust-root check: Windows is case-insensitive and strips
+            # trailing dots/spaces, so an exact `== "trusted.pub"` compare would let a crafted
+            # zip entry ("Trusted.pub", "trusted.pub.", "trusted.pub ", "trusted.pub::$DATA")
+            # overwrite the key that verifies every future release. Reject any alias.
+            norm = os.path.normcase(base).split(":")[0].rstrip(". ")
+            if name.endswith("/") or not base or norm == "trusted.pub":
+                continue
+            target = os.path.join(HERE, base)
+            if os.path.exists(target):
+                shutil.copy2(target, target + ".bak-" + str(latest).lstrip("v"))
+            with z.open(name) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            applied.append(base)
+    with open(c["deployed"], "w", encoding="utf-8") as f:
+        json.dump({"version": str(latest).lstrip("v")}, f, indent=2)
+    print("  [ok] applied installer tooling %s: %s" % (latest, ", ".join(applied) or "(empty)"))
+
+
+def update(components=("plugin", "bot", "webcc", "installer"), channel_override=None,
+           do_deploy=False, do_apply=True, allow_unsigned=False):
     info = check(components, channel_override, verbose=False)
     if not info:
-        return
+        _audit("update FAILED before start (bad component / no repo / GitHub unreachable) argv=%r"
+               % (sys.argv[1:],))
+        return False
     rel, latest, repo = info["release"], info["latest"], info["repo"]
-    did = []
+    did, result, failed = [], {}, False
     for comp in components:
         st = info["components"].get(comp, {})
         if not st.get("in_release"):
             print("- %s: not in the latest %s release — skipping." % (comp, info["channel"]))
+            result[comp] = "not in this release"
             continue
         if not st.get("newer"):
             print("- %s: already up to date (%s)." % (comp, st.get("installed") or "?"))
+            result[comp] = "already up to date (%s)" % (st.get("installed") or "?")
             continue
         asset = COMPONENTS[comp]["asset"]
         url = _asset(rel, asset)
         print("%s: downloading %s ..." % (comp, asset))
-        data = _get(url, raw=True)
+        try:
+            data = _get(url, raw=True)
+        except Exception as e:                          # noqa: BLE001  transient net error -> one component fails, run still summarises
+            print("  [FAIL] download error: %s" % e)
+            result[comp] = "DOWNLOAD FAILED (%s)" % e
+            failed = True
+            continue
         ok, sha = _verify(asset, data, rel, allow_unsigned)
         if not ok:
+            result[comp] = "FAILED verification — not staged"
+            failed = True
             continue
         _stage(comp, rel, latest, data, sha, repo)
         did.append(comp)
+        result[comp] = "staged"
 
-    if not did:
-        print("Nothing to fetch — all requested components are already up to date.")
-        return
-    if "plugin" in did and do_deploy:
-        runbat = os.path.join(ROOT, "run.bat")
-        if os.path.exists(runbat):
-            subprocess.Popen(["cmd", "/c", runbat, "--deploy-plugin"], cwd=ROOT)
-            print("plugin: run.bat --deploy-plugin launched.")
+    if "plugin" in did:
+        # --stage-only (do_apply False) means "download + verify only": it must win over --deploy,
+        # never surprise-restart the live match.
+        if do_deploy and do_apply:
+            runbat = os.path.join(ROOT, "run.bat")
+            if os.path.exists(runbat):
+                subprocess.Popen(["cmd", "/c", runbat, "--deploy-plugin"], cwd=ROOT)
+                result["plugin"] = "DEPLOY LAUNCHED via run.bat --deploy-plugin"
+            else:
+                result["plugin"] = "STAGED -- run.bat not found, run your deploy command to install"
         else:
-            print("plugin: run.bat not found — run your deploy command to apply it.")
+            result["plugin"] = "STAGED -- install with: run.bat --deploy-plugin (restarts the match)"
     if "bot" in did and do_apply:
         _apply_bot(latest)
+        result["bot"] = "APPLIED %s -- restart the bot to load it" % latest
     if "webcc" in did and do_apply:
         _apply_webcc(latest)
-    if did and (do_deploy or do_apply):
-        _set_toolkit_installed(latest)
-        print("Toolkit now marked as %s (what 'up to date' checks against)." % latest)
-    if did and not (do_deploy or do_apply):
-        print("\nStaged only. Apply when ready: plugin -> run.bat --deploy-plugin ; "
-              "bot + web command centre -> update --component all --apply")
+        result["webcc"] = "APPLIED %s -- restart the web command centre to load it" % latest
+    if "installer" in did and do_apply:
+        _apply_installer(latest)
+        result["installer"] = "APPLIED %s (takes effect next updater run)" % latest
+
+    # ---- plain-English summary: what is on disk NOW. An update run must never end ambiguously.
+    applied_any = any(r.startswith(("APPLIED", "DEPLOY")) for r in result.values())
+    staged_any = any(r.startswith("STAGED") for r in result.values())
+    if applied_any or (staged_any and do_deploy and do_apply):
+        _set_toolkit_installed(latest)               # only bump the marker when something INSTALLED
+    print("\n================ UPDATE SUMMARY ================")
+    print("Channel: %-8s Latest: %s" % (info["channel"], latest))
+    print("Config:  %s" % CONFIG)
+    for comp in components:
+        print("  %-10s %s" % (comp, result.get(comp, "?")))
+    if failed:
+        print(">> ONE OR MORE COMPONENTS FAILED (see above) — nothing broken was installed. <<")
+    if not applied_any:
+        if staged_any and not do_apply:
+            print(">> Downloads were STAGED only (--stage-only). Re-run without it to install. <<")
+        elif staged_any:
+            print(">> Nothing was INSTALLED yet -- the staged plugin needs its deploy step (see above). <<")
+        elif not failed:
+            print(">> NO FILES WERE CHANGED BY THIS RUN. <<")
+            if info["channel"] == "stable":
+                print("   (You are on the STABLE channel -- for the latest nightly add: --channel nightly)")
+    print("================================================")
+    _audit("update channel=%s latest=%s config=%s :: %s"
+           % (info["channel"], latest, CONFIG,
+              "; ".join("%s=%s" % (c, result.get(c, "?")) for c in components)))
+    return not failed                                # False if any requested component failed
+
+
+ALL_COMPONENTS = ("plugin", "bot", "webcc", "installer")
 
 
 def _parse(argv):
-    comp = "plugin"
+    comp = "all"                                     # default = everything; "run the update" updates
     channel = None
     for i, a in enumerate(argv):
         if a == "--component" and i + 1 < len(argv):
             comp = argv[i + 1]
         elif a == "--channel" and i + 1 < len(argv):
             channel = argv[i + 1]
-    comps = ("plugin", "bot", "webcc") if comp == "all" else (comp,)
+    comps = ALL_COMPONENTS if comp == "all" else (comp,)
     return comps, channel
 
 
@@ -397,11 +527,18 @@ if __name__ == "__main__":
     cmd = args[0] if args else "check"
     comps, channel = _parse(args)
     if cmd == "check":
-        check(("plugin", "bot", "webcc"), channel)
+        # non-zero when GitHub can't be reached / repo misconfigured, so scripts can tell
+        info = check(ALL_COMPONENTS if "--component" not in args else comps, channel)
+        sys.exit(0 if info is not None else 2)
     elif cmd == "update":
-        update(comps, channel,
-               do_deploy=("--deploy" in args),
-               do_apply=("--apply" in args),
-               allow_unsigned=("--i-understand-unsigned" in args))
+        # `update` INSTALLS by default (with backups). --stage-only restores download-only.
+        # (--apply is still accepted for backward compatibility; it is now the default.)
+        # Exit non-zero if any requested component failed (verify/download) or the check failed,
+        # so `updater.py update && restart-bot` can't proceed on a refused/failed update.
+        ok = update(comps, channel,
+                    do_deploy=("--deploy" in args),
+                    do_apply=("--stage-only" not in args),
+                    allow_unsigned=("--i-understand-unsigned" in args))
+        sys.exit(0 if ok else 1)
     else:
         print(__doc__)

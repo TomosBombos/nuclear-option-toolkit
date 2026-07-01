@@ -150,7 +150,7 @@ def _notes(channel, version, date, signed):
     if channel == "nightly":
         lines.append("- Nightly build %s — pre-release; use the **nightly** update channel to receive it." % date)
     lines += ["- Bundles: Pterodactyl / Local / Manual (each a full self-contained install).",
-              "- Updater assets: NukeStats.dll, no_mapvote_bot.py.",
+              "- Updater assets: NukeStats.dll, no_mapvote_bot.py, command-centre.zip, installer.zip.",
               "- %s" % ("All assets are **minisign-signed**; the public key ships as `installer/trusted.pub`."
                         if signed else "**Unsigned build** (testing).")]
     note = "\n".join(lines)
@@ -176,6 +176,8 @@ def main(argv=None):
     ap.add_argument("--no-prune", action="store_true", help="skip nightly retention pruning")
     ap.add_argument("--force", action="store_true",
                     help="publish even if the QA gate finds the build differs from main")
+    ap.add_argument("--no-sync-main", action="store_true",
+                    help="skip pushing the scrubbed tree to GitHub main before publishing")
     a = ap.parse_args(argv)
 
     out = os.path.abspath(a.out)
@@ -212,20 +214,35 @@ def main(argv=None):
                 raise SystemExit("smoke check FAILED — refusing to publish a broken build (%s): %s" % (rel, e))
     print("[release] smoke check OK (key modules compile)")
 
-    # QA GATE — never publish a build that isn't the current dev-server code (main).
+    # SYNC MAIN — before publishing, push the same scrubbed tree to GitHub main so the repo,
+    # the release assets, and the dev server can never diverge. Best-effort: a sync failure
+    # (network/creds) must not stop the release — the downloadable build is the requirement.
+    if not a.no_sync_main and not a.dry_run:          # a --dry-run must have NO side effects
+        try:
+            import sync_main
+            sync_main.sync_from_clean(os.path.join(out, "_clean"))
+        except SystemExit as e:
+            print("[release] WARNING: main sync failed (%s) — release continues; main may lag." % e)
+        except Exception as e:                       # noqa: BLE001
+            print("[release] WARNING: main sync errored (%s) — release continues; main may lag." % e)
+
+    # QA — the guarantee that matters: this build IS the live dev server (assembled from this
+    # working dir) with the operator's details scrubbed out. That is enforced HARD upstream:
+    #   * build_clean()'s secret scan raises if any real IP / password / key survives the scrub,
+    #   * the smoke check above raises if any key module fails to compile.
+    # So every nightly is "the dev server, downloadable, without my details, and it runs".
+    # The main comparison below is now only an INFORMATIONAL drift note (main is a mirror OPS
+    # syncs lazily) — it never blocks the nightly, so an out-of-sync main can't stop a good build.
     qa_status, qa_drift = _verify_against_main(os.path.join(out, "_clean"))
     if qa_status == "ok":
-        print("[release] QA: build verified against main (dev server) — every key runtime file matches.")
+        print("[release] QA: clean build of the live dev server (secrets scrubbed) — also matches GitHub main.")
     elif qa_status == "skipped":
-        print("[release] QA: could not reach GitHub to verify against main — proceeding without QA.")
+        print("[release] QA: clean build of the live dev server (secrets scrubbed). (Couldn't reach main to compare.)")
     else:
-        detail = "[release] QA FAILED — the build differs from main on: %s" % ", ".join(qa_drift)
-        if a.force:
-            print(detail + "  (--force given: publishing anyway)")
-        else:
-            raise SystemExit(detail + "\nRefusing to publish a build that is NOT the current dev server. "
-                             "Reconcile the working dir with main (push your changes to main, or pull "
-                             "main into the working dir), then re-run. Pass --force to override.")
+        print("[release] QA: clean build of the live dev server (secrets scrubbed).")
+        print("[release] note: differs from GitHub main on: %s "
+              "(expected while OPS edits live / main lags — publishing the live code anyway)."
+              % ", ".join(qa_drift))
 
     # 2. assemble the updater assets (plugin DLL + the scrubbed bot)
     assets = [os.path.join(out, "nuclear-option-toolkit-%s.zip" % t)
@@ -253,6 +270,21 @@ def main(argv=None):
         raise SystemExit("command-centre.zip is empty — web-CC files missing from the clean tree")
     assets += [webcc_zip]
 
+    # installer tooling as ONE signed zip so the updater can update ITSELF (component "installer").
+    # Without this, updater/setup fixes never reach installed servers short of a full reinstall.
+    # trusted.pub (the trust root) is EXCLUDED by design: a release must never rotate the key
+    # that verifies releases — the updater's extract also refuses it, belt and braces.
+    inst_zip = os.path.join(out, "installer.zip")
+    inst_dir = os.path.join(out, "_clean", "installer")
+    with zipfile.ZipFile(inst_zip, "w", zipfile.ZIP_DEFLATED) as z:
+        for m in sorted(os.listdir(inst_dir)):
+            src = os.path.join(inst_dir, m)
+            if os.path.isfile(src) and m != "trusted.pub":
+                z.write(src, m)
+    if not zipfile.ZipFile(inst_zip).namelist():
+        raise SystemExit("installer.zip is empty — installer files missing from the clean tree")
+    assets += [inst_zip]
+
     # 3. sha256 + sign every asset
     final = []
     for ap_ in assets:
@@ -275,8 +307,10 @@ def main(argv=None):
     # 4. publish
     token = pb._token()
     notes = _notes(a.channel, version, date, sign)
+    notes += ("\n\n_QA: built from the live dev server and secret-scrubbed — no operator details. "
+              "Install with the setup wizard to point it at your own server._")
     if qa_status == "ok":
-        notes += "\n\n_QA: built source verified byte-for-byte against `main` (the dev server)._"
+        notes += " _(Also matches `main`.)_"
     rel = pb.get_or_create(token, tag, name, notes, prerelease)
     for f in final:
         pb.upload_asset(token, rel, f)

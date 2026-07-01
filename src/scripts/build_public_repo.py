@@ -62,7 +62,8 @@ TREE_INCLUDES = {
                    "PRE_UPLOAD_CHECKLIST.md", "INSTALL_WIZARD_CONTENT.md",
                    "PUBLIC_REPO_MANIFEST.md", "SETTINGS_AND_INSTALL_V2.md"],  # internal-only docs
     "installer":  ["__pycache__/*", "sources.lock.json"],         # local install state
-    "scripts":    ["__pycache__/*", "scrub_targets.json"],        # never ship real targets
+    "scripts":    ["__pycache__/*", "scrub_targets.json",         # never ship real targets
+                   "sync_main.py"],                               # operator-only (local clone paths)
     "NukeStats":  ["libs/*", "bin/*", "obj/*", "bepinex_pack/*", "bepinex_pack_win/*"],  # proprietary/build/binaries (bundles re-add from source)
     "map-build":  ["__pycache__/*"],
     "relay":      [],                                            # localhost->WAN remote-command relay

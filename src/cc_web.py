@@ -113,9 +113,18 @@ def _send_cmd(name, args):
 
 
 def _tail(path, n):
+    """Last n non-empty lines. Reads only the file's last 256KB — activity.log is never trimmed and
+    console_mirror.log can be 2MB, and this runs on EVERY ~1s /api/state poll per open tab."""
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.read().splitlines()
+        window = 262144
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - window))
+            data = f.read().decode("utf-8", errors="replace")
+        lines = data.splitlines()
+        if size > window and lines:
+            lines = lines[1:]                            # drop the first line (likely cut mid-way by the seek)
         return [ln for ln in lines if ln.strip()][-n:]
     except Exception:                                    # noqa: BLE001
         return []
@@ -247,8 +256,21 @@ def _catalog():
 
 
 def _missions():
-    return (list(getattr(bot, "PVP_MISSIONS", [])) + list(getattr(bot, "ESCALATION_MISSIONS", []))
+    base = (list(getattr(bot, "PVP_MISSIONS", [])) + list(getattr(bot, "BUILTIN_COOP_MISSIONS", []))
+            + list(getattr(bot, "ESCALATION_MISSIONS", []))
             + list(getattr(bot, "TERMINAL_CONTROL_MISSIONS", [])))
+    # + the bot's live votable universe (enabled custom/uploaded USER missions) from the dashboard,
+    # so the Change-map picker and nextmap autocomplete can reach missions the static lists can't know
+    try:
+        with open(DASHBOARD, encoding="utf-8") as f:
+            votable = (json.load(f).get("votemap") or {}).get("votable") or []
+        for v in votable:
+            n = v.get("name") if isinstance(v, dict) else None
+            if n and n not in base:
+                base.append(n)
+    except Exception:                                    # noqa: BLE001
+        pass
+    return base
 
 
 def _resolve_mission(q):
@@ -550,7 +572,22 @@ def _local_resources():
 # We READ deployed_toolkit.json + the toolkit config and CALL the fork's updater (never edit installer/).
 # Inert in a dev checkout (no deployed_toolkit.json / no ~/.nuke-option-toolkit/config.json -> "not configured").
 TOOLKIT_META = os.path.join(HERE, "deployed_toolkit.json")
-_USER_DIR    = os.environ.get("NOST_DATA_DIR") or os.path.join(os.path.expanduser("~"), ".nuke-option-toolkit")
+
+
+def _toolkit_user_dir():
+    """Folder-safe config dir, matching installer/updater.py: env pin > this folder's
+    .nost-data > legacy shared dir. The legacy-first fallback silently read the WRONG
+    config (wrong channel) on per-folder installs when launched without the wrapper."""
+    env = os.environ.get("NOST_DATA_DIR")
+    if env:
+        return env
+    local = os.path.join(HERE, ".nost-data")
+    if os.path.isdir(local):
+        return local
+    return os.path.join(os.path.expanduser("~"), ".nuke-option-toolkit")
+
+
+_USER_DIR    = _toolkit_user_dir()
 _TOOLKIT_CFG = os.path.join(_USER_DIR, "config.json")
 _toolkit_chk = {"ts": 0.0, "data": None}   # cached result of the last (network) update check
 
@@ -573,12 +610,15 @@ def _toolkit_cfg():
 
 
 def _updater_mod():
+    import importlib
     import sys as _sys
     idir = os.path.join(HERE, "installer")
     if idir not in _sys.path:
         _sys.path.insert(0, idir)
     import updater
-    return updater
+    # reload each call (it's on-demand only): a self-updated installer/updater.py must take
+    # effect without restarting the web CC
+    return importlib.reload(updater)
 
 
 # ── routes ────────────────────────────────────────────────────────────────────
@@ -606,7 +646,9 @@ def api_toolkit_check():
     """On-demand: ask GitHub (via the fork's updater.check) whether a newer release exists on the channel."""
     upd = (_toolkit_cfg().get("update") or {})
     try:
-        info = _updater_mod().check(("plugin", "bot"), verbose=False)
+        mod = _updater_mod()
+        comps = getattr(mod, "ALL_COMPONENTS", ("plugin", "bot", "webcc", "installer"))
+        info = mod.check(comps, verbose=False)           # ALL components — a web-CC-only update must show
     except Exception as e:                               # noqa: BLE001
         return jsonify({"ok": False, "error": str(e)})
     if not info:                                         # no repo configured or GitHub unreachable
@@ -642,18 +684,28 @@ def api_toolkit_channel():
 
 @app.route("/api/toolkit/update", methods=["POST"])
 def api_toolkit_update():
-    """Download + VERIFY + STAGE the latest (plugin -> pending_plugin.dll, bot -> pending_bot.py). Does NOT
-    auto-apply: the staged plugin deploys via the normal Schedule / --deploy-plugin flow (no surprise restart)."""
+    """Download + VERIFY + INSTALL the latest. Bot / web CC / installer are applied immediately
+    (every replaced file is backed up; a bot / web-CC restart loads them). The PLUGIN is only
+    STAGED — it deploys via the normal Schedule / --deploy-plugin flow, so clicking Update can
+    never surprise-restart the match."""
     import subprocess
     import sys as _sys
     upy = os.path.join(HERE, "installer", "updater.py")
     if not os.path.exists(upy):
         return jsonify({"ok": False, "error": "installer/updater.py not present"})
     try:
+        env = dict(os.environ)
+        env.setdefault("NOST_DATA_DIR", _USER_DIR)       # same config the web CC itself resolved
         r = subprocess.run([_sys.executable, upy, "update", "--component", "all"],
-                           cwd=HERE, capture_output=True, text=True, timeout=300)
-        return jsonify({"ok": r.returncode == 0, "output": (r.stdout or "")[-4000:],
-                        "error": ((r.stderr or "").strip()[-1000:] or None)})
+                           cwd=HERE, capture_output=True, text=True, timeout=300, env=env)
+        out = r.stdout or ""
+        summary = out.split("================ UPDATE SUMMARY ================")[-1].strip() \
+            if "UPDATE SUMMARY" in out else None
+        return jsonify({"ok": r.returncode == 0,
+                        "applied": "APPLIED" in out,      # bot/webcc/installer installed now
+                        "staged": "STAGED" in out,        # plugin downloaded, awaiting its deploy step
+                        "summary": summary,
+                        "output": out[-4000:], "error": ((r.stderr or "").strip()[-1000:] or None)})
     except Exception as e:                               # noqa: BLE001
         return jsonify({"ok": False, "error": str(e)})
 
@@ -669,8 +721,18 @@ def api_state():
     st["activity"] = _tail(ACTIVITY, 80)
     st["console"] = _console_view(_tail(CONSOLE, 400), raw)
     m = (st.get("mission") or "").lower()
-    st["map_key"] = ("heartland" if ("heartland" in m or "escalation" in m)
-                     else "ignus" if ("ignus" in m or "terminal" in m) else None)
+    # mission -> atlas terrain. Every stock Large Operation runs on Heartland EXCEPT Terminal
+    # Control (Ignus Archipelago); Carrier Duel is on Ignus; scenario 13. Reprisal is on
+    # Heartland (wiki + owner-confirmed 2026-07-02). Ignus keywords are checked FIRST so
+    # "Terminal Control ..." never falls through to a heartland keyword. Unknown missions stay
+    # None (no map is better than the wrong map).
+    if any(k in m for k in ("ignus", "terminal", "carrier duel")):
+        st["map_key"] = "ignus"
+    elif any(k in m for k in ("heartland", "escalation", "altercation", "confrontation",
+                              "domination", "breakout", "reprisal")):
+        st["map_key"] = "heartland"
+    else:
+        st["map_key"] = None
     st["server_age"] = round(time.time() - st.get("ts", 0), 1) if st.get("ts") else None
     st["deploy"] = _deploy_status()
     st["toolkit_version"] = _json_version(TOOLKIT_META) or None   # header chip; None in a dev checkout
@@ -1236,7 +1298,8 @@ def api_cmd():
             full = _resolve_mission(text)
             if not full:
                 return jsonify({"ok": False, "error": f"no mission matches '{text}'"})
-            res = _send_cmd("set-next-mission", ["User", full, "7200"])
+            grp = bot.mission_group(full)      # was hardcoded "User": stock BuiltIn missions silently no-opped with a success toast
+            res = _send_cmd("set-next-mission", [grp, full, "7200"])
             return jsonify({"ok": True, "result": res, "info": f"next map -> {full}"})
         if name == "endmission":
             res = _send_cmd("set-time-remaining", ["5"])

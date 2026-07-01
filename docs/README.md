@@ -4,6 +4,8 @@ A three‑process toolkit that turns a vanilla *Nuclear Option* dedicated server
 
 **New here?** Start with **[FEATURES.md](FEATURES.md)** for what it does, then **[COMMANDS.md](COMMANDS.md)** for how to drive it.
 
+**Ideas, questions, or want to chat?** Join the community on **[Discord](https://discord.gg/B46h4Dd7uj)**.
+
 ## Documents
 
 | Doc | What it is |

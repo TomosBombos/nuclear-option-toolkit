@@ -46,7 +46,7 @@ namespace NukeStats
     public class NukeStatsPlugin : BaseUnityPlugin
     {
         public const string Guid = "anz.nukestats";
-        public const string Version = "0.9.21";
+        public const string Version = "0.9.22";
         internal static ManualLogSource Log;
         internal static NukeStatsPlugin Instance;
 

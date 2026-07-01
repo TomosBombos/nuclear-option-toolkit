@@ -652,7 +652,7 @@ const entHistory={};          // 'a'+i / 's'+i -> {prev,curr,meta} for the same 
 const cpuHist=[],memHist=[];
 
 async function jget(u){const r=await fetch(u);return r.json();}
-var _settleAt=0;function settle(){_settleAt=Date.now()+3000;}   // after a user change, briefly hold the ~1s poll from re-rendering the settings panels with the dashboard's OLD value, so an optimistic edit doesn't flicker back (then a conditional element vanish) before the bot applies it
+var _settleAt=0;function settle(){_settleAt=Date.now()+10000;}   // after a user change, hold the ~1s poll from re-rendering the editable panels with the dashboard's OLD value. The admin round trip is queue-file -> bot loop -> dashboard write -> next poll = 2-5s+ (worse when the SFTP console poll stalls), so 10s: an optimistic edit must NEVER flicker back mid-flight; if the bot is truly down the panels honestly resync after the window.
 async function jpost(u,b){settle();const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});return r.json();}
 function getCSS(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
 function facClass(f){return /bosc/i.test(f)?'bdf':/prim|pala/i.test(f)?'pala':'';}
@@ -678,11 +678,12 @@ function worldToGridLabel(d,x,z){const R=majRow(d,z),C=majCol(d,x);if(R<0||C<0)r
 const GUT_L=26,GUT_T=20;                       // coordinate-gutter sizes (css px)
 let mapImg=null,view={scale:1,base:1,panX:0,panY:0,init:false};
 async function ensureMap(k){
-  if(k===atlasKey)return;atlasKey=k;atlas=null;mapImg=null;view.init=false;$('#maptitle').textContent='';
-  if(!k){render();return;}
-  const d=await jget('/api/map?key='+k);if(d.error){render();return;}
-  atlas=d;$('#maptitle').textContent=d.name;
-  if(d.img){const im=new Image();im.onload=()=>{mapImg=im;view.init=false;render();};im.src='/api/mapimg?key='+k+'&v='+Date.now();}
+  if(k===atlasKey)return;
+  if(!k){atlasKey=k;atlas=null;mapImg=null;view.init=false;$('#maptitle').textContent='';render();return;}
+  let d; try{ d=await jget('/api/map?key='+k); }catch(e){ return; }   // transient fetch failure: keep the OLD atlas; the next 1s tick retries (atlasKey unchanged)
+  if(!d||d.error){atlasKey=k;atlas=null;mapImg=null;view.init=false;$('#maptitle').textContent='';render();return;}   // definitive "no atlas for this mission": clear — no map is better than the WRONG map
+  atlasKey=k;atlas=d;mapImg=null;view.init=false;$('#maptitle').textContent=d.name;   // commit only on SUCCESS — a failure must not wedge atlasKey and blank the map for the whole mission
+  if(d.img){const im=new Image();im.onload=()=>{mapImg=im;view.init=false;render();};im.onerror=()=>{render();};im.src='/api/mapimg?key='+k+'&v='+Date.now();}
   else render();}
 function mapM(){const wrap=$('#map').parentElement;const W=wrap.clientWidth||10,H=wrap.clientHeight||10;
   return{W,H,ix:GUT_L,iy:GUT_T,iw:Math.max(1,W-GUT_L),ih:Math.max(1,H-GUT_T)};}
@@ -1072,12 +1073,15 @@ async function openFilters(){
 }
 
 function renderPlayers(ps){players=ps;const _ph=$('#phcount');if(_ph)_ph.textContent='· '+ps.length;
-  const _sig=JSON.stringify(ps.map(p=>[p.name,p.faction,p.rank_abbr,(p.points||0)|0,p.aircraft,p.ingame_rank,(p.match_points||0)|0,p.skill,(p.x||0)|0,(p.z||0)|0]));
+  // sig on what the table DISPLAYS (the grid label), not raw metre coords — raw x/z change every
+  // tick while anyone is flying, so the old sig rebuilt the tbody ~1/s and swallowed row clicks
+  const _lbl=ps.map(p=>(p.x!=null&&p.z!=null&&atlas)?(worldToGridLabel(atlas,p.x,p.z)||grid_ref(atlas,p.x,p.z)||'—'):'—');
+  const _sig=JSON.stringify(ps.map((p,i)=>[p.name,p.faction,p.rank_abbr,(p.points||0)|0,p.aircraft,p.ingame_rank,(p.match_points||0)|0,p.skill,_lbl[i]]));
   if(_sig===renderPlayers._sig)return; renderPlayers._sig=_sig;   // guard: skip the tbody teardown (which drops row focus/hover) when nothing changed
   const tb=$('#ptbl tbody');tb.innerHTML='';
   if(!ps.length){tb.innerHTML='<tr><td colspan="9" class="dim" style="text-align:center;padding:14px">No players online.</td></tr>';return;}
-  ps.forEach(p=>{const tr=document.createElement('tr');tr.onclick=()=>playerPopup(p);tr.tabIndex=0;tr.setAttribute('role','button');tr.dataset.kbd='1';tr.setAttribute('aria-label','Player '+(p.name||''));
-    const coords=(p.x!=null&&p.z!=null&&atlas)?(worldToGridLabel(atlas,p.x,p.z)||grid_ref(atlas,p.x,p.z)||'—'):'—';
+  ps.forEach((p,_i)=>{const tr=document.createElement('tr');tr.onclick=()=>playerPopup(p);tr.tabIndex=0;tr.setAttribute('role','button');tr.dataset.kbd='1';tr.setAttribute('aria-label','Player '+(p.name||''));
+    const coords=_lbl[_i];
     tr.innerHTML=`<td>${esc(p.name)}</td><td class="fac ${facClass(p.faction)}">${esc(facShort(p.faction))}</td>
       <td style="color:${p.rank_color||'#aaa'}">${esc(p.rank_abbr||'')}</td><td class="mono" style="color:#7fe0a0">${(p.points||0).toFixed(0)}</td>
       <td class="muted">${esc(p.aircraft||'')}</td>
@@ -1163,11 +1167,12 @@ function spark(id,hist,max,col){const cv=$('#'+id),ctx=cv.getContext('2d'),W=cv.
 
 // ── state loop ────────────────────────────────────────────────────────────────
 function fmtTime(s){if(!s)return'—';s=Math.max(0,s|0);return((s/60)|0)+':'+String(s%60).padStart(2,'0');}
-async function tick(){try{
+async function tick(){const _g=(tick._gen=(tick._gen||0)+1);try{
   const st=await jget('/api/state'+(rawConsole?'?raw=1':''));
+  if(_g!==tick._gen)return;   // a newer tick already painted — never let a slower, OLDER snapshot overwrite it
   const up=st.server_up,fresh=st.server_age!=null&&st.server_age<8;
   const _stale=!up||!fresh;const _sb=$('#staleBar'),_app=document.querySelector('.app');
-  if(_sb){_sb.classList.toggle('on',_stale);_sb.textContent=up?'⚠ Data is stale — the server stopped updating. Showing the last snapshot.':'⚠ Server offline — showing the last known data.';}
+  if(_sb){_sb.classList.toggle('on',_stale);_sb.textContent=up?'⚠ Data is stale — the bot stopped updating. Showing the last snapshot; changes you make now may NOT apply until it\'s back.':'⚠ Server offline — showing the last known data. Changes you make now may NOT apply.';}
   if(_app)_app.classList.toggle('stale',_stale);
   if($('#toolkv')){ const _tv=st.toolkit_version, _c=$('#toolkv'), _s=_c.closest('.st'); _c.textContent=_tv?('v'+_tv):'—'; if(_s)_s.style.display=_tv?'':'none'; }   // toolkit version chip (hidden when not installed via the toolkit, e.g. a dev build)
   $('#srv').innerHTML=`<span class="dot" style="background:${up&&fresh?'#37d67a':up?'#FFC857':'#FF5C5C'}"></span>`+(up?(fresh?'online':'stale'):'offline');
@@ -1180,16 +1185,16 @@ async function tick(){try{
   $('#pcount').textContent=st.online_count||0;
   await ensureMap(st.map_key);entities=st.entities||null;lastPlayers=st.players||[];
   if(Date.now()>=_settleAt){missionPool=st.mission_pool||missionPool;missionAudit=st.mission_audit||missionAudit;votemapCfg=st.votemap||votemapCfg;const _mpl=$('#mpList');if($('#mpOv').classList.contains('on')&&_mpl&&!(_mpl.contains(document.activeElement)||_mpl.matches(':hover')))renderMissionPool();}   // don't tear down the panel (open <select>, scroll pos, hover) mid-interaction — only the 1s tick was doing this
-  if(st.server_messages){serverMessages=st.server_messages;if($('#msgOv').classList.contains('on')&&msgEditId===null)renderMessages();}
-  if(st.rank_ladder){rankLadderLive=st.rank_ladder;if($('#rankOv').classList.contains('on')&&!rankDirty&&!$('#rankBody').contains(document.activeElement))renderRankLadder(true);}
-  if(st.shared_ranks){sharedRanksLive=st.shared_ranks;if($('#lbOv').classList.contains('on')&&!$('#lbShared').contains(document.activeElement))renderSharedRanks();}
+  if(st.server_messages&&Date.now()>=_settleAt){serverMessages=st.server_messages;if($('#msgOv').classList.contains('on')&&msgEditId===null)renderMessages();}   // settle-gated like 1182: pause/delete must not flick back
+  if(st.rank_ladder&&Date.now()>=_settleAt){rankLadderLive=st.rank_ladder;if($('#rankOv').classList.contains('on')&&!rankDirty&&!$('#rankBody').contains(document.activeElement))renderRankLadder(true);}
+  if(st.shared_ranks&&Date.now()>=_settleAt){sharedRanksLive=st.shared_ranks;if($('#lbOv').classList.contains('on')&&!$('#lbShared').contains(document.activeElement))renderSharedRanks();}
   if(st.reports){serverReports=st.reports;updateRepBtn();}
   if(st.banned_players){bannedPlayers=st.banned_players;}
   if(st.ban_log){banLog=st.ban_log;}
   if($('#repOv').classList.contains('on')){ if($('#banPane')&&$('#banPane').style.display!=='none')renderBanned(); else renderReports(); }
   if(st.sys_messages&&Date.now()>=_settleAt){sysMessages=st.sys_messages;if($('#msgOv').classList.contains('on'))renderSysMessages();}
   if(st.help_config&&Date.now()>=_settleAt){helpCfg=st.help_config;if($('#msgOv').classList.contains('on'))renderHelpEditor();}
-  if(st.server_config){serverConfig=st.server_config;if($('#srvOv').classList.contains('on'))renderServerCfg();}
+  if(st.server_config&&Date.now()>=_settleAt){serverConfig=st.server_config;if($('#srvOv').classList.contains('on'))renderServerCfg();}
   const _safe=(f)=>{try{f();}catch(_e){console.error('tick render',_e);}};   // one panel throwing must not skip the rest of the tick or mislabel the server 'backend?'
   lastKillfeed=st.killfeed||[];lastActivity=st.activity||[];
   _safe(()=>drawMap(lastPlayers));_safe(()=>recordEntities(entities));_safe(()=>renderPlayers(lastPlayers));_safe(()=>renderAir(st.air));_safe(()=>renderNet(st.net));
@@ -1402,7 +1407,11 @@ function renderUpdates(){
     +'<div><div class="dim" style="font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px">Update status</div>'
       +'<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
         +'<button class="sm" onclick="checkUpdates(this)">Check for updates</button><span>'+badge+'</span></div>'
-      +(chk&&chk.newer===true?'<div style="margin-top:9px"><button class="sm bad" onclick="stageUpdate(this)" title="Download + verify + stage; deploys via Schedule (no surprise restart)">⬇ Download &amp; stage</button> <span class="dim" style="font-size:11px">stages it; deploy via ⏱ Schedule</span></div>':'')
+      +(chk&&chk.components?('<div class="dim" style="font-size:11px;margin-top:7px">'+Object.keys(chk.components).map(function(k){
+        const c=chk.components[k]; if(!c.in_release)return esc(k)+': <span class="dim">n/a</span>';
+        return esc(k)+': '+(c.newer?'<span style="color:var(--warn)">update</span>':'<span style="color:var(--ok)">current</span>');
+      }).join(' &nbsp;·&nbsp; ')+'</div>'):'')
+    +(chk&&chk.newer===true?'<div style="margin-top:9px"><button class="sm bad" onclick="stageUpdate(this)" title="Installs bot + web command centre updates now (backups kept — restart them to load). The plugin is staged and deploys via ⏱ Schedule (no surprise match restart).">⬇ Download &amp; install</button> <span class="dim" style="font-size:11px">installs bot + web CC now; plugin deploys via ⏱ Schedule</span></div>':'')
     +'</div>'
     +'<div><div class="dim" style="font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px">Update channel</div>'
       +'<div style="display:flex;gap:8px">'+_chBtn('stable',ch)+_chBtn('nightly',ch)+'</div>'
@@ -1424,11 +1433,18 @@ async function setChannel(ch){
   renderUpdates();
 }
 async function stageUpdate(btn){
-  if(!confirm('Download, verify, and STAGE the latest update?\n\nIt will NOT restart the server — the staged plugin deploys via ⏱ Schedule (or the 5am auto-deploy).')) return;
-  if(btn){btn.disabled=true;btn.textContent='Downloading…';}
-  try{ const r=await jpost('/api/toolkit/update',{}); showToast(r&&r.ok?'Update staged — deploy via ⏱ Schedule.':'Stage failed: '+((r&&r.error)||'see server log')); }
-  catch(e){ showToast('Stage failed.'); }
-  if(btn){btn.disabled=false;btn.textContent='⬇ Download & stage';}
+  if(!confirm('Download, verify, and install the latest update?\n\nBot + web command centre updates are installed immediately (backups kept — restart them to load). The plugin is only staged and deploys via ⏱ Schedule / the auto-deploy, so the match will NOT restart now.')) return;
+  if(btn){btn.disabled=true;btn.textContent='Updating…';}
+  try{ const r=await jpost('/api/toolkit/update',{});
+    if(r&&r.ok){
+      if(r.applied) showToast('Update installed — restart the bot & web command centre to load it.'+(r.staged?' Plugin staged — deploys via ⏱ Schedule.':''));
+      else if(r.staged) showToast('Plugin update downloaded & staged — deploy it via ⏱ Schedule. Nothing else was newer.');
+      else showToast('Nothing new to install — already up to date.');
+    }
+    else showToast('Update failed: '+((r&&r.error)||'see server log'));
+  }catch(e){ showToast('Update failed.'); }
+  if(btn){btn.disabled=false;btn.textContent='⬇ Download & install';}
+  checkUpdates(null);
 }
 // ── settings dropdown (popover, not a modal) ───────────────────────────────────
 function toggleSettingsMenu(e){ if(e&&e.stopPropagation)e.stopPropagation();
@@ -1494,9 +1510,30 @@ document.addEventListener('keydown',e=>{if(e.key!=='Enter'&&e.key!==' ')return;c
   if(t&&t.matches&&t.matches('[data-kbd]')){e.preventDefault();t.click();}});
 // ── change map ────────────────────────────────────────────────────────────────
 let settingsData=null, setView='simple', setSelKey=null, setCat='all', setPending=null;
+// Applied-but-unconfirmed values: key -> {v, ts}. The admin queue -> bot -> (plugin dump) round trip
+// takes seconds (and plugin keys only re-report while a player is ONLINE), so refetches would
+// otherwise paint the STALE value right back over what the user just applied. The overlay keeps the
+// applied value on screen until the server reports it (then drops) or 20s passes (honest resync).
+var _setOverlay={};
+function _setMerge(data){
+  if(!data||!data.settings) return data;
+  const now=Date.now();
+  for(const k in _setOverlay){ const o=_setOverlay[k];
+    if(now-o.ts>20000){ delete _setOverlay[k]; continue; }
+    const s=data.settings.find(x=>x.key===k); if(!s) continue;
+    if(String(s.value)===String(o.v)) delete _setOverlay[k];   // server confirmed — overlay done
+    else s.value=o.v;
+  }
+  return data;
+}
+async function _setRefetch(){
+  if(!$('#setOv').classList.contains('on')||setPending) return;   // modal closed / user mid-edit
+  try{ settingsData=_setMerge(await jget('/api/settings')); renderSettings(); }catch(e){}
+}
 async function openSettings(){
   $('#setOv').classList.add('on');$('#setMsg').textContent='';$('#setSearch').value='';setPending=null;$('#setList').textContent='loading…';
-  settingsData=await jget('/api/settings');
+  try{ settingsData=_setMerge(await jget('/api/settings')); }
+  catch(e){ $('#setList').innerHTML='<div class="er" style="padding:12px 4px">Couldn\'t load the settings — is the backend running? Close this and try again.</div>'; return; }
   if(settingsData && !settingsData.live){$('#setMsg').innerHTML='<span class="info">Showing defaults — the server isn\'t reporting live values (it pauses when empty). Changes you make are queued and apply, and live values appear, once a player is on.</span>';}
   renderSettings();
 }
@@ -1587,7 +1624,12 @@ function settingControl(s){
 }
 function stageChange(key,value){ setPending={key:key,value:value}; renderSetDetail(); }
 function cancelChange(){ setPending=null; renderSetDetail(); }
-function confirmChange(){ if(!setPending)return; const p=setPending; setPending=null; renderSetDetail(); applySetting(p.key,p.value); }
+function confirmChange(){ if(!setPending)return; const p=setPending; setPending=null;
+  const s=(settingsData&&settingsData.settings||[]).find(x=>x.key===p.key);
+  if(s) s.value=p.value;                        // optimistic: control + master-row chip show the NEW value immediately
+  _setOverlay[p.key]={v:p.value,ts:Date.now()}; // survive the refetches until the server reports it applied
+  renderSettings();
+  applySetting(p.key,p.value); }
 function confirmBox(s,newVal){
   let warn='';
   if(s.key==='Admin.SteamIds'){
@@ -1636,7 +1678,9 @@ async function applySetting(key,value,el){
   $('#setMsg').innerHTML = (r&&r.ok)
     ? '<span class="ok">✓ '+esc(key)+' = '+esc(String(shown))+(r.needs_restart?' — saved, restart to apply':'')+'</span>'
     : '<span class="er">✗ '+esc((r&&r.error)||'failed')+'</span>';
-  setTimeout(async()=>{ try{ settingsData=await jget('/api/settings'); renderSettings(); }catch(e){} },800);
+  // reconcile with the real applied values once the round trip has had time to land (the overlay
+  // keeps the user's value on screen meanwhile; a rejected/never-applied value resyncs at ~20s)
+  setTimeout(_setRefetch,4000); setTimeout(_setRefetch,12000); setTimeout(_setRefetch,22000);
 }
 let missionPool=[], missionAudit=null, votemapCfg=null, missionTab='default';
 function openMissionPool(){ $('#mpOv').classList.add('on'); renderMissionPool(); jpost('/api/missionaudit',{}).catch(function(){}); }
@@ -1655,10 +1699,12 @@ function _customMissionsHtml(){
   let h='<div style="display:flex;align-items:center;gap:8px;margin:16px 0 5px;border-top:1px solid var(--bd);padding-top:12px"><b style="color:var(--ac);font-size:12px">🧩 Custom / Workshop missions</b><span class="dim" style="font-size:11px">'+u.length+' detected</span></div>';
   if(!u.length){ h+='<div class="dim" style="font-size:11.5px;padding:4px 6px">None yet — every mission in your pool is official.</div>'; }
   else for(const m of u){
-    const nm=esc(m.name).replace(/'/g,"\\'"), gp=esc(m.group||'User').replace(/'/g,"\\'");
+    // name/group ride in data-attributes: the attribute parser decodes esc()'d entities back into
+    // dataset verbatim, so an apostrophe (or worse) in a mission name can never break out of a JS
+    // string literal (the old esc-then-backslash approach was a no-op and allowed attribute injection)
     h+='<div style="display:flex;align-items:center;gap:10px;padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.05)">'
       +'<div style="flex:1;font-size:12.5px">'+esc(m.name)+' <span class="dim" style="font-size:10px">'+esc(m.group||'User')+'</span></div>'
-      +'<button onclick="missionToggle(\''+nm+'\',\''+gp+'\','+(m.enabled?'false':'true')+')" style="min-width:64px;border:1px solid var(--bd);border-radius:6px;cursor:pointer;padding:4px 8px;font-weight:700;font-size:11px;background:'+(m.enabled?'#3a1414':'#0c3a24')+';color:'+(m.enabled?'#ff9a9a':'#5df2a0')+'">'+(m.enabled?'ENABLED':'off')+'</button></div>';
+      +'<button data-nm="'+esc(m.name)+'" data-gp="'+esc(m.group||'User')+'" onclick="missionToggle(this.dataset.nm,this.dataset.gp,'+(m.enabled?'false':'true')+')" style="min-width:64px;border:1px solid var(--bd);border-radius:6px;cursor:pointer;padding:4px 8px;font-weight:700;font-size:11px;background:'+(m.enabled?'#3a1414':'#0c3a24')+';color:'+(m.enabled?'#ff9a9a':'#5df2a0')+'">'+(m.enabled?'ENABLED':'off')+'</button></div>';
   }
   h+='<div style="border-top:1px dashed var(--bd);margin-top:12px;padding-top:11px">'
     +'<div style="font-weight:700;font-size:12px;margin-bottom:6px">Add a custom / workshop mission</div>'
@@ -1839,10 +1885,11 @@ function setVotemapGuaranteed(action,name){
 function _unofRows(list){
   let h='';
   for(const m of list){
-    const nm=esc(m.name).replace(/'/g,"\\'"), gp=esc(m.group||'User').replace(/'/g,"\\'");
+    // data-attribute passing — see the audit-banner variant: entities decode safely into dataset,
+    // so apostrophes in Workshop/custom names can't break the onclick or inject
     h+='<div style="display:flex;align-items:center;gap:10px;padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.05)">'
       +'<div style="flex:1;font-size:12.5px">'+esc(m.name)+' <span class="dim" style="font-size:10px">'+esc(m.group||'User')+'</span></div>'
-      +'<button onclick="missionToggle(\''+nm+'\',\''+gp+'\','+(m.enabled?'false':'true')+')" style="min-width:64px;border:1px solid var(--bd);border-radius:6px;cursor:pointer;padding:4px 8px;font-weight:700;font-size:11px;background:'+(m.enabled?'#3a1414':'#0c3a24')+';color:'+(m.enabled?'#ff9a9a':'#5df2a0')+'">'+(m.enabled?'ENABLED':'off')+'</button></div>';
+      +'<button data-nm="'+esc(m.name)+'" data-gp="'+esc(m.group||'User')+'" onclick="missionToggle(this.dataset.nm,this.dataset.gp,'+(m.enabled?'false':'true')+')" style="min-width:64px;border:1px solid var(--bd);border-radius:6px;cursor:pointer;padding:4px 8px;font-weight:700;font-size:11px;background:'+(m.enabled?'#3a1414':'#0c3a24')+';color:'+(m.enabled?'#ff9a9a':'#5df2a0')+'">'+(m.enabled?'ENABLED':'off')+'</button></div>';
   }
   return h;
 }
@@ -1882,17 +1929,17 @@ function _missionCatRows(filterFn){
 }
 function _missionDefaultTab(){
   if(!missionPool||!missionPool.length) return '<div class="dim" style="padding:14px 4px">No mission-pool data yet — this fills in once the bot has loaded the pool.</div>';
-  const rows=_missionCatRows(function(c){return true;});   // ALL built-in game content: PvP modes + the Co-op scenarios that ship with the game
-  return '<div class="muted" style="font-size:11px;margin:9px 2px 5px">Every built-in mission that ships with Nuclear Option — the PvP modes (Escalation, Terminal Control, Altercation, Confrontation, Domination, Breakout) and the Co-op scenarios (Escalation &amp; Terminal Control Co-op). Toggle which can appear in the map vote.</div>'
+  const rows=_missionCatRows(c=>c==='PvP'||c==='Built-in Co-op');   // stock operations + stock co-op scenarios
+  return '<div class="muted" style="font-size:11px;margin:9px 2px 5px">The built-in missions that ship with Nuclear Option — the versus operations (Escalation, Terminal Control, Altercation, Confrontation, Domination, Carrier Duel) and the stock co-op missions (Escalation / Terminal Control Co-op as BDF &amp; PALA, Breakout, 13. Reprisal). Your weather/time variants live under the User tab. Toggle which can appear in the map vote.</div>'
     +(rows||'<div class="dim" style="font-size:11.5px;padding:10px 6px">No built-in missions in the pool.</div>');
 }
 function _missionUserTab(){
   const loaded=missionAudit&&missionAudit.loaded;
   const userM=loaded?((missionAudit.unofficial||[]).filter(m=>(m.group||'User')==='User')):[];
-  let h='<div class="muted" style="font-size:11px;margin:9px 2px 5px">Custom missions you\'ve uploaded to this server. The built-in PvP + Co-op missions now live in the 🏛 Built-in tab.</div>';
+  let h='<div class="muted" style="font-size:11px;margin:9px 2px 5px">Your custom missions — the co-op rotation you built (the Escalation / Terminal Control Co-op faction + weather/time variants), plus any you upload.</div>';
+  h+=_missionCatRows(c=>c!=='PvP'&&c!=='Built-in Co-op');  // your custom co-op missions (Group "User")
   if(!loaded) h+=_missionScanHint();
   else if(userM.length) h+=_unofRows(userM);
-  else h+='<div class="dim" style="font-size:11.5px;padding:10px 6px">No custom missions uploaded yet.</div>';
   return h+_uploadControlHtml();
 }
 function _missionWorkshopTab(){
@@ -1907,9 +1954,10 @@ function _missionWorkshopTab(){
 function setMissionTab(t){ missionTab=t; renderMissionPool(); }
 function _missionTabBar(){
   const pool=missionPool||[];
-  const def=pool.length;                                 // Built-in = the whole official pool (PvP modes + Co-op)
+  const isB=function(c){return c==='PvP'||c==='Built-in Co-op';};
+  const def=pool.filter(m=>isB(m.cat)).length;           // Built-in = stock operations + stock co-op scenarios
   const unof=(missionAudit&&missionAudit.unofficial)||[];
-  const nU=unof.filter(m=>(m.group||'User')==='User').length;   // User = only genuinely uploaded/custom missions
+  const nU=pool.filter(m=>!isB(m.cat)).length + unof.filter(m=>(m.group||'User')==='User').length;   // User = your custom co-op variants + uploads
   const nW=unof.filter(m=>(m.group||'User')==='Workshop').length;
   const tab=function(id,label,n){ const on=missionTab===id;
     return '<button onclick="setMissionTab(\''+id+'\')" style="border:1px solid '+(on?'var(--ac)':'var(--bd)')+';background:'+(on?'var(--inset)':'transparent')+';color:'+(on?'var(--ac)':'inherit')+';border-radius:8px 8px 0 0;cursor:pointer;padding:7px 13px;font-weight:700;font-size:12px;margin-bottom:-1px;'+(on?'border-bottom-color:var(--inset)':'')+'">'+label+' <span class="dim" style="font-weight:400;font-size:10px">'+n+'</span></button>';
@@ -1948,7 +1996,7 @@ function openMessages(){ $('#msgOv').classList.add('on'); msgResetForm(); render
 let sysMessages=[];
 function renderSysMessages(){
   const L=$('#sysMsgList'); if(!L)return;
-  if(L.contains(document.activeElement)) return;   // don't clobber a field being typed in
+  { const _ae=document.activeElement; if(L.contains(_ae)&&(_ae.tagName==='INPUT'||_ae.tagName==='TEXTAREA')) return; }   // don't clobber a field being typed in — but a focused BUTTON must not swallow the optimistic re-render after its own click
   { const _sysSig=JSON.stringify(sysMessages||[]); if(_sysSig===window._sysSigPrev)return; window._sysSigPrev=_sysSig; }   // change-detection: only rebuild on real change (no per-poll flash)
   if(!sysMessages||!sysMessages.length){ L.innerHTML='<div class="dim" style="padding:8px 4px">activates when the bot restarts (bundled for the next update).</div>'; return; }
   L.innerHTML=sysMessages.map(m=>{
@@ -1984,7 +2032,7 @@ async function sysMsgSet(key,fields){
 let helpCfg=null;
 function renderHelpEditor(){
   const L=$('#helpEdList'); if(!L)return;
-  if(L.contains(document.activeElement)) return;   // don't clobber a field being edited
+  { const _ae=document.activeElement; if(L.contains(_ae)&&(_ae.tagName==='INPUT'||_ae.tagName==='TEXTAREA')) return; }   // text fields only — a focused toggle BUTTON must not swallow the optimistic re-render
   { const _heSig=JSON.stringify(helpCfg&&helpCfg.rows||[]); if(_heSig===window._heSigPrev)return; window._heSigPrev=_heSig; }   // change-detection: only rebuild on real change (no per-poll flash)
   if(!helpCfg||!helpCfg.rows||!helpCfg.rows.length){ L.innerHTML='<div class="dim" style="padding:8px 4px">activates when the bot restarts (bundled for the next update).</div>'; return; }
   const groupName={stats:'Your stats',teams:'Teams',match:'Match',info:'Info'};
@@ -2112,7 +2160,15 @@ async function msgSave(){
     color: (/<color=#[0-9a-fA-F]{6}>/.test(text)?'':(msgColorOn?($('#msgColor').value||''):'')) };
   if(msgEditId) body.id=msgEditId;
   let r; try{ r=await jpost('/api/messages',body); }catch(e){ r={ok:false,error:String(e)}; }
-  if(r.ok){ $('#msgMsg').innerHTML='<span class="ok">✓ saved</span>'; msgResetForm(); }
+  if(r.ok){
+    // optimistic list update so the edited/new message is visible IMMEDIATELY (the dashboard copy
+    // reconciles after the settle window; an 'add' placeholder is replaced by the bot's real row)
+    if(msgEditId){ const m=serverMessages.find(x=>x.id===msgEditId);
+      if(m){ m.text=body.text; m.trigger=body.trigger; m.interval_min=body.interval_min; m.at=body.at; m.color=body.color; } }
+    else serverMessages.push({id:'pending-'+Date.now(),text:body.text,trigger:body.trigger,interval_min:body.interval_min,at:body.at,color:body.color,enabled:true});
+    renderMessages();
+    msgResetForm(); $('#msgMsg').innerHTML='<span class="ok">✓ saved</span>';   // AFTER reset — msgResetForm clears #msgMsg, which used to wipe this confirmation instantly
+  }
   else $('#msgMsg').innerHTML='<span class="er">✗ '+esc(r.error||'failed')+'</span>';
 }
 async function msgToggle(id,on){
@@ -2350,7 +2406,7 @@ function openServerCfg(){ $('#srvOv').classList.add('on'); $('#srvMsg').textCont
 async function srvRefresh(){ try{ await jpost('/api/serverconfig/refresh',{}); }catch(e){} }
 function renderServerCfg(){
   const L=$('#srvList'); if(!L)return;
-  if(L.contains(document.activeElement)) return;   // don't clobber a field the user is typing in
+  { const _ae=document.activeElement; if(L.contains(_ae)&&(_ae.tagName==='INPUT'||_ae.tagName==='TEXTAREA')) return; }   // text fields only — a focused ON/OFF button must not swallow its own optimistic re-render
   { const _scSig=JSON.stringify(serverConfig||{}); if(_scSig===window._srvSigPrev)return; window._srvSigPrev=_scSig; }   // change-detection: only rebuild on real change (no per-poll flash)
   const sc=serverConfig;
   if(!sc){ L.innerHTML='<div class="dim" style="padding:12px 4px">Loading server config…</div>'; return; }
@@ -2385,6 +2441,9 @@ function renderServerCfg(){
 }
 function srvSetFromInput(el){ srvSet(el.getAttribute('data-k'), el.value); }
 async function srvSet(key,value){
+  // optimistic: show the new value NOW (jpost arms the settle window so the ~1s poll can't
+  // paint the stale copy back before the bot's SFTP write + re-read lands)
+  if(serverConfig&&serverConfig.fields){ const f=serverConfig.fields.find(x=>x.key===key); if(f&&!f.mask){ f.value=value; renderServerCfg(); } }
   $('#srvMsg').innerHTML='<span class="dim">saving '+esc(key)+'…</span>';
   let r; try{ r=await jpost('/api/serverconfig',{key:key,value:value}); }catch(e){ r={ok:false,error:String(e)}; }
   if(r.ok){ $('#srvMsg').innerHTML='<span class="ok">✓ '+esc(key)+' queued</span>'; setTimeout(srvRefresh,500); }
@@ -2476,7 +2535,13 @@ async function power(sig){if(!confirm(sig.toUpperCase()+' the server?'))return;
     out((r.ok?'<span class="ok">✓ ':'<span class="er">✗ ')+esc(r.message)+'</span>'); }
   catch(e){ out('<span class="er">✗ power request failed</span>'); }
   finally{ _powerBusy=false; btns.forEach(b=>b.disabled=false); }}
-document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeSettingsMenu();closeOv();}});
+document.addEventListener('keydown',e=>{if(e.key!=='Escape')return;
+  closeSettingsMenu();
+  // don't let a global Escape silently discard in-progress work (closing wipes the form/clone state)
+  const _top=[...document.querySelectorAll('.ov.on')].pop();
+  if(_top&&_top.id==='msgOv'&&(msgEditId!==null||($('#msgText')&&$('#msgText').value.trim()))){showToast('Message draft in progress — Save or Cancel it first');return;}
+  if(_top&&_top.id==='rankOv'&&rankDirty){showToast('Unsaved rank changes — Save or Reset first');return;}
+  closeOv();});
 
 (async()=>{const c=await jget('/api/commands');catalog=c.commands;missions=c.missions;})();
 (function(){const b=document.getElementById('themeBtn');if(b)b.textContent=(document.documentElement.getAttribute('data-theme')==='light')?'☀':'🌙';})();

@@ -129,13 +129,45 @@ PVP_MISSIONS = [
     "Altercation",
     "Confrontation",
     "Domination",
-    "Breakout",
+    "Carrier Duel",              # stock naval mode; Key CONFIRMED live 2026-07-02 (console: set-next-mission [BuiltIn,Carrier Duel] -> loaded)
 ]
+
+# Stock CO-OP missions (Tomo 2026-07-02 + wiki). The game ships co-op faction variants of the
+# big ops as their own missions — "<Op> Co-op as BDF/PALA" — and Tomo's custom User missions are
+# weather/time EDITS of these (name + " - Dawn" etc.), so the bare names here are BUILT-IN and
+# must never be confused with the User variants. Breakout is a CO-OP mission (wiki: "Challenging
+# co-op mission where PALA provokes BDF navy"), NOT PvP. "13. Reprisal" is the only
+# multiplayer-capable numbered Scenario.
+BUILTIN_COOP_MISSIONS = [
+    "Escalation Co-op as BDF",
+    "Escalation Co-op as PALA",
+    "Terminal Control Co-op as BDF",
+    "Terminal Control Co-op as PALA",
+    "Breakout",
+    "13. Reprisal",
+]
+
+# Candidate rotation Keys for missions whose exact server identity is unconfirmed, best guess
+# first (in-game display name == wire Name for every confirmed mission so far, e.g. Carrier Duel).
+# _resolve_mission_key() tries these in order against the live server (set -> read back the
+# override; an invalid Key never 'takes') and caches the accepted one in mission_keys.json.
+# Until a mission's Key is verified it is LISTED in the pool but kept OFF auto-ballots, so a
+# map vote can never silently no-op on it. (Breakout is exempt: same BuiltIn group as the other
+# long-offered ops.)
+MISSION_KEY_CANDIDATES = {
+    "13. Reprisal": [("BuiltIn", "13. Reprisal"), ("Default", "13. Reprisal"),
+                     ("BuiltIn", "Reprisal"),     ("Default", "Reprisal")],
+    "Escalation Co-op as BDF":          [("BuiltIn", "Escalation Co-op as BDF"),          ("Default", "Escalation Co-op as BDF")],
+    "Escalation Co-op as PALA":         [("BuiltIn", "Escalation Co-op as PALA"),         ("Default", "Escalation Co-op as PALA")],
+    "Terminal Control Co-op as BDF":    [("BuiltIn", "Terminal Control Co-op as BDF"),    ("Default", "Terminal Control Co-op as BDF")],
+    "Terminal Control Co-op as PALA":   [("BuiltIn", "Terminal Control Co-op as PALA"),   ("Default", "Terminal Control Co-op as PALA")],
+}
 
 # The curated OFFICIAL mission pool this server ships (every mission in the stock MissionRotation). Any
 # mission present/enabled BEYOND this set = unofficial (uploaded or Steam Workshop). The mission audit flags
 # unofficial-enabled or edited-official missions so owners can see when the pool diverges from stock.
-OFFICIAL_MISSIONS = set(ESCALATION_MISSIONS) | set(TERMINAL_CONTROL_MISSIONS) | set(PVP_MISSIONS)
+OFFICIAL_MISSIONS = (set(ESCALATION_MISSIONS) | set(TERMINAL_CONTROL_MISSIONS)
+                     | set(PVP_MISSIONS) | set(BUILTIN_COOP_MISSIONS))
 
 # Weather/time variants treated as "dark". A single ballot may contain at most
 # MAX_DARK_PER_VOTE of these, so at least one of the four options is always a
@@ -152,7 +184,7 @@ PVP_OPTIONS = [
     ("BuiltIn", "Altercation",      "Altercation <color=#8FA9C9>· dogfight focus</color>"),
     ("BuiltIn", "Confrontation",    "Confrontation <color=#8FA9C9>· combined arms</color>"),
     ("BuiltIn", "Domination",       "Domination <color=#8FA9C9>· air superiority</color>"),
-    ("BuiltIn", "Breakout",         "Breakout <color=#8FA9C9>· naval attack</color>"),
+    ("BuiltIn", "Carrier Duel",     "Carrier Duel <color=#8FA9C9>· carrier vs carrier</color>"),
 ]
 
 # Current ballot, rebuilt each vote by open_vote(). Keys "1".."6" map to
@@ -413,6 +445,22 @@ def trim_console_mirror():
         with open(tmp, "w", encoding="utf-8") as f:
             f.writelines(tail)
         os.replace(tmp, CONSOLE_MIRROR_FILE)
+    except OSError:
+        pass
+
+
+def trim_activity_log():
+    """Keep activity.log bounded (it was never trimmed and cc_web re-reads its tail every ~1s).
+    5000 lines ≈ weeks of history; the webcc only ever shows the last 80."""
+    try:
+        if os.path.getsize(ACTIVITY_FILE) <= 1_500_000:
+            return
+        with open(ACTIVITY_FILE, "r", encoding="utf-8", errors="replace") as f:
+            tail = f.readlines()[-5000:]
+        tmp = ACTIVITY_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(tail)
+        os.replace(tmp, ACTIVITY_FILE)
     except OSError:
         pass
 
@@ -828,10 +876,11 @@ _mission_disabled = set()
 
 
 def _all_pool_missions():
-    """[(name, category)] for every toggleable mission: the co-op variants + the 2 stock PvP options."""
+    """[(name, category)] for every toggleable mission: the co-op variants + the stock modes/scenarios."""
     out = [(m, "Escalation Co-op") for m in ESCALATION_MISSIONS]
     out += [(m, "Terminal Control Co-op") for m in TERMINAL_CONTROL_MISSIONS]
     out += [(p[1], "PvP") for p in PVP_OPTIONS]
+    out += [(m, "Built-in Co-op") for m in BUILTIN_COOP_MISSIONS]
     return out
 
 
@@ -905,7 +954,7 @@ _VOTEMAP_DEFAULTS = {
     "force_pvp_coop":    0,          # co-op maps while forcing (0 = PvP-only)
     "force_pvp_pvp":     6,          # PvP modes while forcing (capped by how many are enabled)
 }
-_COOP_CATEGORIES = ("Escalation", "Terminal Control", "Custom")   # weightable co-op pool keys
+_COOP_CATEGORIES = ("Escalation", "Terminal Control", "Built-in Co-op", "Custom")   # weightable co-op pool keys
 
 
 def _vm_int(v, default, lo, hi):
@@ -1023,7 +1072,13 @@ def set_votemap_cfg(key, value):
         cfg[key] = {k: w for k, w in _vm_weights(value).items() if k in allow}   # whitelist built-in modes
     elif key == "guaranteed":
         allow = _votable_names()
-        cfg[key] = [n for n in _vm_strlist(value) if n in allow]                 # only pin real votable maps
+        if mission_audit_state().get("loaded"):
+            cfg[key] = [n for n in _vm_strlist(value) if n in allow]             # only pin real votable maps
+        else:
+            # audit not loaded yet (every bot restart until the first SFTP scan): _votable_names() is
+            # missing the custom USER missions, so filtering now would PERMANENTLY drop those pins.
+            # Keep unknown names; open_vote() re-validates per-ballot anyway.
+            cfg[key] = _vm_strlist(value)
     elif key in _VOTEMAP_BOOL_KEYS:
         cfg[key] = value if isinstance(value, bool) else str(value).lower() in ("1", "true", "on", "yes")
     else:
@@ -2210,6 +2265,11 @@ def _votemap_pool():
         pool["Escalation"] = e
     if t:
         pool["Terminal Control"] = t
+    # Stock co-op scenarios: ballot-eligible only once their rotation Key is LIVE-VERIFIED
+    # (first successful admin "Change map" or --probe-missions), so a vote can never no-op.
+    b = [m for m in BUILTIN_COOP_MISSIONS if mission_enabled(m) and mission_key_verified(m)]
+    if b:
+        pool["Built-in Co-op"] = b
     if cfg["include_custom"]:
         c = [n for n in _enabled_custom_names() if mission_enabled(n)]
         if c:
@@ -2261,6 +2321,9 @@ def _votable_names():
 def _ballot_entry(name):
     """(group, name, max_time, label) for a votable mission name (co-op variant, custom, or PvP mode)."""
     label = _PVP_LABEL.get(name) or friendly_label(name)
+    if name in MISSION_KEY_CANDIDATES:
+        g, n = _mission_key(name)        # verified wire Key (or best guess for an unverified pin)
+        return (g, n, MISSION_MAX_TIME, label)
     return (mission_group(name), name, MISSION_MAX_TIME, label)
 
 
@@ -2270,6 +2333,8 @@ def _coop_cat(name):
         return "Escalation"
     if name in TERMINAL_CONTROL_MISSIONS:
         return "Terminal Control"
+    if name in BUILTIN_COOP_MISSIONS:
+        return "Built-in Co-op"
     return "Custom"
 
 
@@ -2368,9 +2433,19 @@ def open_vote(online_count=0):
         coop_n = cfg["force_pvp_coop"]
         pvp_n  = cfg["force_pvp_pvp"] if cfg["include_pvp"] else 0
 
-    # guaranteed pins: keep only those still enabled + valid, deduped, in config order
+    # guaranteed pins: keep only those still enabled + valid, deduped, in config order. A pinned
+    # stock mission whose rotation Key is UNVERIFIED is skipped (a ballot must never offer a map
+    # the server might reject) — it becomes pinnable the moment a first admin map change verifies it.
     votable = _votable_names()
-    guaranteed = [n for n in cfg["guaranteed"] if mission_enabled(n) and n in votable]
+    guaranteed = []
+    for n in cfg["guaranteed"]:
+        if not (mission_enabled(n) and n in votable):
+            continue
+        if not mission_key_verified(n):
+            activity(f"Votemap: pinned '{friendly_label(n)}' left off this ballot - its mission key is "
+                     f"unverified (load it once via Change map to arm it)", "MAP")
+            continue
+        guaranteed.append(n)
     g_coop = [n for n in guaranteed if n not in PVP_MISSIONS]
     g_pvp  = [n for n in guaranteed if n in PVP_MISSIONS]
 
@@ -2442,23 +2517,107 @@ def apply_winner(rc, votes, first_vote_at, force_switch=False):
 
 
 def mission_group(name):
-    """Server-side group for a mission NAME: BuiltIn for the stock PvP option, User for every co-op map."""
-    return "BuiltIn" if name in PVP_MISSIONS else MISSION_GROUP
+    """Server-side group for a mission NAME: BuiltIn for stock ops/co-op, User for the custom maps."""
+    if name in MISSION_KEY_CANDIDATES:
+        return _mission_key(name)[0]
+    if name in PVP_MISSIONS or name in BUILTIN_COOP_MISSIONS:
+        return "BuiltIn"
+    return MISSION_GROUP
+
+
+# ── Rotation-Key resolution for missions whose exact server identity is unconfirmed ─────────────
+# mission_keys.json caches the (Group, Name) the live server actually ACCEPTED, per pool name.
+MISSION_KEYS_FILE = os.path.join(_BASE_DIR, "mission_keys.json")
+
+
+def _load_mission_keys():
+    try:
+        with open(MISSION_KEYS_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _mission_key(name):
+    """Best-known rotation (group, name) for a candidate mission: the live-verified cached Key
+    when we have one, else the first (best-guess) candidate."""
+    k = _load_mission_keys().get(name)
+    if isinstance(k, list) and len(k) == 2:
+        return (str(k[0]), str(k[1]))
+    return MISSION_KEY_CANDIDATES[name][0]
+
+
+def mission_key_verified(name):
+    """True once a candidate mission's rotation Key has been confirmed against the live server
+    (always True for missions that never needed resolving)."""
+    if name not in MISSION_KEY_CANDIDATES:
+        return True
+    k = _load_mission_keys().get(name)
+    return isinstance(k, list) and len(k) == 2
+
+
+def _resolve_mission_key(rc, name):
+    """Find the rotation Key the server actually accepts for a MISSION_KEY_CANDIDATES mission.
+    set-next-mission always replies 2000 but only changes the override for a VALID mission (the
+    --probe-missions mechanism), so try each candidate and read back the override. A rejected
+    candidate leaves the override untouched; the accepted one leaves it QUEUED (which is what the
+    callers want anyway). Returns (group, name) and caches it, or None if nothing was accepted."""
+    if mission_key_verified(name):
+        return _mission_key(name)
+    for g, n in MISSION_KEY_CANDIDATES[name]:
+        try:
+            rc.set_next_mission(g, n, MISSION_MAX_TIME)
+            r = rc.send("get-mission-rotation")
+            k = {}
+            if isinstance(r, dict) and r.get("hasNextOverride"):
+                k = (r.get("nextOverride") or {}).get("Key") or {}
+            if (k.get("Group"), k.get("Name")) == (g, n):
+                d = _load_mission_keys()
+                d[name] = [g, n]
+                try:
+                    tmp = MISSION_KEYS_FILE + ".tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(d, f, indent=1)
+                    os.replace(tmp, MISSION_KEYS_FILE)
+                except OSError:
+                    pass
+                activity(f"Verified mission key for {name} -> {g}/{n} (now eligible for ballots)", "MAP")
+                print(f"[mission-key] {name} resolved to {g}/{n}")
+                return (g, n)
+        except Exception as e:                             # noqa: BLE001
+            print(f"[mission-key] resolve {name} failed mid-probe: {e}")
+            return None
+    print(f"[mission-key] {name}: NO candidate key accepted by the server")
+    return None
 
 
 def force_change_map(rc, name):
     """Admin (web CC 'Change map'): cut the LIVE match over to an explicit mission NOW. The caller
-    (main loop) then suppresses the automatic mission-end vote so this choice sticks (no ballot override)."""
+    (main loop) then suppresses the automatic mission-end vote so this choice sticks (no ballot override).
+    Missions with an unconfirmed rotation Key are resolved (readback-verified) first, so a bad Key
+    fails LOUDLY here instead of silently keeping the current mission after the rollover cut."""
     global CURRENT_MISSION
     if not name:
-        return
-    group = mission_group(name)
-    rc.set_next_mission(group, name, MISSION_MAX_TIME)       # queue it (3h)
-    CURRENT_MISSION = friendly_label(name)                   # keep the warn-dedupe key stable
+        return False
+    if name in MISSION_KEY_CANDIDATES:
+        key = _resolve_mission_key(rc, name)
+        if key is None:
+            rc.say(f"<color=#FF5555>Couldn't load {friendly_label(name)} - the server did not accept "
+                   f"any known mission key. Map unchanged.</color>")
+            activity(f"ADMIN map change to {friendly_label(name)} FAILED - server rejected all "
+                     f"{len(MISSION_KEY_CANDIDATES[name])} candidate keys", "MAP")
+            return False
+        group, wire = key
+    else:
+        group, wire = mission_group(name), name
+    rc.set_next_mission(group, wire, MISSION_MAX_TIME)       # queue it (3h)
+    CURRENT_MISSION = friendly_label(wire)                   # keep the warn-dedupe key stable
     rc.set_time_remaining(ROLLOVER_SECONDS)                  # force the cut now (same as a !votemap force-switch)
     rc.say(f"<color=#55FF55>Admin changed the map -> {friendly_label(name)}</color>")
     activity(f"ADMIN changed map -> {friendly_label(name)}", "MAP")
-    print(f"[admin] force-change map -> {group}/{name}")
+    print(f"[admin] force-change map -> {group}/{wire}")
+    return True
 
 
 _RANK_TAG_RE = None
@@ -3889,8 +4048,8 @@ def process_admin_commands(rc):
         size = os.path.getsize(ADMIN_CMD_FILE)
     except OSError:
         return                               # no queue file yet -> nothing to do
-    if size < _admin_cmd_offset:             # truncated/rotated
-        _admin_cmd_offset = 0
+    if size < _admin_cmd_offset:             # truncated/rotated: resume from the new END — replaying from 0
+        _admin_cmd_offset = size             # would re-apply every surviving command (double grants/bans)
     if size == _admin_cmd_offset:
         return
     try:
@@ -3915,13 +4074,22 @@ def process_admin_commands(rc):
             admin_team(rc, cmd)
         elif cmd.get("action") == "changemap":
             try:
-                force_change_map(rc, cmd.get("name", ""))
-                did_changemap = True              # tell main() to suppress the auto mission-end vote
+                if force_change_map(rc, cmd.get("name", "")):
+                    did_changemap = True          # tell main() to suppress the auto mission-end vote — but ONLY
+                                                  # on success: a rejected map change must not eat the next vote
             except Exception as e:                # noqa: BLE001
                 print(f"[admin] changemap error: {e}")
         elif cmd.get("action") == "setcfg":       # webcc settings menu: change a plugin/bot/game setting
             try:
                 set_cfg_dispatch(rc, cmd.get("key", ""), cmd.get("value", ""), cmd.get("owner", "plugin"))
+                if str(cmd.get("owner", "plugin")).lower() == "plugin":
+                    try:                          # plugin cfg only APPLIES while a player is online — say so
+                        with open(DASHBOARD_STATE_FILE, encoding="utf-8") as _df:
+                            if not json.load(_df).get("online_count"):
+                                activity(f"Setting {cmd.get('key')} queued - the plugin applies it when "
+                                         f"a player is next online (server is empty now)", "ADMIN")
+                    except (OSError, ValueError):
+                        pass
             except Exception as e:                # noqa: BLE001
                 print(f"[admin] setcfg error: {e}")
         elif cmd.get("action") == "dumpcfg":      # webcc settings menu: ask the plugin to re-emit its live config
@@ -3934,6 +4102,8 @@ def process_admin_commands(rc):
                 if set_mission_enabled(cmd.get("mission", ""), bool(cmd.get("on", True))):
                     activity(f"Mission pool: {friendly_label(cmd.get('mission', ''))} -> "
                              f"{'on' if cmd.get('on', True) else 'off'}", "MAP")
+                else:
+                    activity(f"Mission pool: REJECTED toggle for '{cmd.get('mission', '')}' (unknown mission)", "MAP")
             except Exception as e:                # noqa: BLE001
                 print(f"[admin] missionpool error: {e}")
         elif cmd.get("action") == "servermsg":    # webcc Messages modal: CRUD an automated server message
@@ -3941,6 +4111,8 @@ def process_admin_commands(rc):
                 ok, info = server_msg_apply(cmd.get("op", ""), cmd.get("msg", {}))
                 if ok:
                     activity(f"Server message {cmd.get('op', '')}: {info}", "BOT")
+                else:
+                    activity(f"Server message {cmd.get('op', '')} REJECTED: {info}", "BOT")
             except Exception as e:                # noqa: BLE001
                 print(f"[admin] servermsg error: {e}")
         elif cmd.get("action") in ("ban_steamid", "unban_steamid"):   # webcc Reports tab: ban/unban a SteamID
@@ -4029,6 +4201,8 @@ def process_admin_commands(rc):
             try:
                 if set_votemap_cfg(cmd.get("key", ""), cmd.get("value")):
                     activity(f"Votemap: {cmd.get('key')} = {cmd.get('value')}", "MAP")
+                else:
+                    activity(f"Votemap: REJECTED {cmd.get('key')} = {cmd.get('value')} (invalid key/value)", "MAP")
             except Exception as e:                # noqa: BLE001
                 print(f"[admin] setvotemap error: {e}")
         elif cmd.get("action") == "banaudit":     # webcc Moderation 'Banned' tab: re-read plugin_bans.txt
@@ -4047,12 +4221,16 @@ def process_admin_commands(rc):
             try:
                 if sysmsg_set(cmd.get("key", ""), cmd.get("fields", {}) or {}):
                     activity(f"System message '{cmd.get('key', '')}' updated", "BOT")
+                else:
+                    activity(f"System message '{cmd.get('key', '')}' update REJECTED (unknown key)", "BOT")
             except Exception as e:                # noqa: BLE001
                 print(f"[admin] sysmsg error: {e}")
         elif cmd.get("action") == "helpcfg":            # webcc Help editor: show/hide a command in the !help list
             try:
                 if set_help_gate(cmd.get("cmd", ""), bool(cmd.get("on", True))):
                     activity(f"!help: '{cmd.get('cmd', '')}' {'shown' if cmd.get('on') else 'hidden'}", "BOT")
+                else:
+                    activity(f"!help: gate change for '{cmd.get('cmd', '')}' REJECTED (unknown/locked command)", "BOT")
             except Exception as e:                # noqa: BLE001
                 print(f"[admin] helpcfg error: {e}")
         elif cmd.get("action") == "rankladder":         # webcc Ranks modal: replace the whole rank ladder + rank-up template
@@ -5181,6 +5359,7 @@ def main():
         if now - last_mirror_trim >= 60:
             last_mirror_trim = now
             trim_console_mirror()
+            trim_activity_log()
 
         # approval poll closes: pass -> open a map vote; fail -> nothing happens
         if state == "APPROVAL" and now >= approval_ends_at:
@@ -5332,10 +5511,12 @@ def remote_cat():
 
 
 def probe_missions():
-    """run.bat --probe-missions: discover the Group/Name of the built-in (stock)
-    Escalation / Terminal Control missions. set-next-mission always replies 2000
-    but only actually changes the override for a VALID mission, so we set a known
-    baseline, try a candidate, and read back the override to see if it 'took'."""
+    """run.bat --probe-missions: discover the Group/Name of the built-in (stock) missions.
+    set-next-mission always replies 2000 but only actually changes the override for a VALID
+    mission, so we set a known baseline, try a candidate, and read back the override to see if
+    it 'took'. Accepted keys for MISSION_KEY_CANDIDATES missions are CACHED into
+    mission_keys.json (arming them for ballots — same effect as a first successful Change map).
+    The pre-existing next-mission override, if any, is restored at the end."""
     rc = RemoteCommand(RCMD_HOST, RCMD_PORT)
     baseline = ("User", "Escalation Co-op as BDF - Dawn")
 
@@ -5346,9 +5527,13 @@ def probe_missions():
             return (k.get("Group"), k.get("Name"))
         return None
 
+    orig = current_override()
+    print(f"[probe] pre-existing next-mission override: {orig or 'none'}")
     groups = ["Built-in", "Built-In", "BuiltIn", "Builtin", "",
               "Official", "Base", "Stock", "Default", "Campaign"]
-    names = ["Escalation", "Terminal Control"]
+    names = ["Escalation", "Terminal Control", "Carrier Duel", "13. Reprisal", "Reprisal",
+             "Escalation Co-op as BDF", "Escalation Co-op as PALA",
+             "Terminal Control Co-op as BDF", "Terminal Control Co-op as PALA", "Breakout"]
     candidates = [(g, n) for n in names for g in groups]
     accepted = []
     print(f"[probe] testing {len(candidates)} candidate(s) ...")
@@ -5360,9 +5545,24 @@ def probe_missions():
         if ok:
             accepted.append((g, n))
         print(f"  {'ACCEPTED' if ok else 'rejected':>8}  Group={g!r:14} Name={n!r}")
-    rc.send("set-next-mission", baseline[0], baseline[1], 10800)      # leave sane
+    # cache accepted keys for the candidate-resolved missions (first accepted candidate wins)
+    for pool_name, cand in MISSION_KEY_CANDIDATES.items():
+        hit = next(((g, n) for g, n in cand if (g, n) in accepted), None)
+        if hit and not mission_key_verified(pool_name):
+            d = _load_mission_keys()
+            d[pool_name] = [hit[0], hit[1]]
+            try:
+                tmp = MISSION_KEYS_FILE + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(d, f, indent=1)
+                os.replace(tmp, MISSION_KEYS_FILE)
+                print(f"[probe] cached mission key: {pool_name} -> {hit[0]}/{hit[1]} (now ballot-eligible)")
+            except OSError:
+                pass
+    restore = orig or baseline
+    rc.send("set-next-mission", restore[0], restore[1], 10800)
     print(f"\n[probe] accepted: {accepted or 'NONE'}")
-    print("[probe] override left at baseline; a server restart clears it entirely.")
+    print(f"[probe] override restored to {restore}; a server restart clears it entirely.")
 
 
 def remote_get():
