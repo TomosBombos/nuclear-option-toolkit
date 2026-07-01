@@ -63,6 +63,13 @@ COMPONENTS = {
         "target": os.path.join(ROOT, "no_mapvote_bot.py"),
         "apply": "replace",         # applied by backing up + replacing the file
     },
+    "webcc": {                      # the web command centre (dashboard) — cc_web.py + webcc.html + deps
+        "asset": "command-centre.zip",
+        "pending": os.path.join(ROOT, "pending_webcc.zip"),
+        "meta": os.path.join(ROOT, "pending_webcc.json"),
+        "deployed": os.path.join(ROOT, "deployed_webcc.json"),
+        "apply": "extract",         # applied by backing up + extracting the files into ROOT
+    },
 }
 
 
@@ -293,6 +300,30 @@ def _apply_bot(latest):
     print("  [ok] applied bot %s -> %s   (restart the bot to load it)" % (latest, os.path.basename(target)))
 
 
+def _apply_webcc(latest):
+    c = COMPONENTS["webcc"]
+    if not os.path.exists(c["pending"]):
+        print("  nothing staged to apply.")
+        return
+    import zipfile
+    applied = []
+    with zipfile.ZipFile(c["pending"]) as z:
+        for name in z.namelist():
+            base = os.path.basename(name)
+            if name.endswith("/") or not base:
+                continue
+            target = os.path.join(ROOT, base)
+            if os.path.exists(target):
+                shutil.copy2(target, target + ".bak-" + str(latest).lstrip("v"))
+            with z.open(name) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            applied.append(base)
+    with open(c["deployed"], "w", encoding="utf-8") as f:
+        json.dump({"version": str(latest).lstrip("v")}, f, indent=2)
+    print("  [ok] applied web command centre %s: %s   (restart the web CC to load it)"
+          % (latest, ", ".join(applied) or "(empty)"))
+
+
 def update(components=("plugin",), channel_override=None, do_deploy=False, do_apply=False, allow_unsigned=False):
     info = check(components, channel_override, verbose=False)
     if not info:
@@ -327,11 +358,14 @@ def update(components=("plugin",), channel_override=None, do_deploy=False, do_ap
             print("plugin: run.bat not found — run your deploy command to apply it.")
     if "bot" in did and do_apply:
         _apply_bot(latest)
+    if "webcc" in did and do_apply:
+        _apply_webcc(latest)
     if did and (do_deploy or do_apply):
         _set_toolkit_installed(latest)
         print("Toolkit now marked as %s (what 'up to date' checks against)." % latest)
     if did and not (do_deploy or do_apply):
-        print("\nStaged only. Apply when ready: plugin -> run.bat --deploy-plugin ; bot -> update --component bot --apply")
+        print("\nStaged only. Apply when ready: plugin -> run.bat --deploy-plugin ; "
+              "bot + web command centre -> update --component all --apply")
 
 
 def _parse(argv):
@@ -342,7 +376,7 @@ def _parse(argv):
             comp = argv[i + 1]
         elif a == "--channel" and i + 1 < len(argv):
             channel = argv[i + 1]
-    comps = ("plugin", "bot") if comp == "all" else (comp,)
+    comps = ("plugin", "bot", "webcc") if comp == "all" else (comp,)
     return comps, channel
 
 
@@ -351,7 +385,7 @@ if __name__ == "__main__":
     cmd = args[0] if args else "check"
     comps, channel = _parse(args)
     if cmd == "check":
-        check(("plugin", "bot"), channel)
+        check(("plugin", "bot", "webcc"), channel)
     elif cmd == "update":
         update(comps, channel,
                do_deploy=("--deploy" in args),

@@ -190,6 +190,22 @@ def main(argv=None):
     shutil.copy2(bot_src, bot)
     assets += [dll, bot]
 
+    # web command centre (dashboard) as ONE signed zip, so the updater can deliver the UI +
+    # backend the same verify-before-apply way it delivers the plugin/bot. WITHOUT this, every
+    # web-CC feature (rank editor, killfeed panel, cross-server ranks, ...) is unreachable by update.
+    import zipfile
+    webcc_zip = os.path.join(out, "command-centre.zip")
+    webcc_members = ["cc_web.py", "webcc.html", "map_atlas.py", "command_centre.py",
+                     "settings_catalogue.json"]
+    with zipfile.ZipFile(webcc_zip, "w", zipfile.ZIP_DEFLATED) as z:
+        for m in webcc_members:
+            src = os.path.join(out, "_clean", m)
+            if os.path.exists(src):
+                z.write(src, m)
+    if not zipfile.ZipFile(webcc_zip).namelist():
+        raise SystemExit("command-centre.zip is empty — web-CC files missing from the clean tree")
+    assets += [webcc_zip]
+
     # 3. sha256 + sign every asset
     final = []
     for ap_ in assets:
