@@ -56,6 +56,36 @@ def _sha256_file(path):
     return digest
 
 
+def _verify_against_main(clean_dir):
+    """QA GATE. Confirm the built source matches `main` (the dev-server reference) for the key
+    runtime files, so we never publish a build that isn't the current dev code. Returns
+    (status, drifted): status is 'ok' | 'drift' | 'skipped' (couldn't reach GitHub)."""
+    import urllib.request as _u
+    files = ["cc_web.py", "webcc.html", "no_mapvote_bot.py", "settings_catalogue.json",
+             "map_atlas.py", "command_centre.py", "installer/setup.py", "installer/updater.py",
+             "NukeStats/NukeStatsPlugin.cs"]
+    def _norm(b):
+        return hashlib.sha256(b.replace(b"\r\n", b"\n").replace(b"\r", b"\n")).hexdigest()
+    tok = os.environ.get("GITHUB_TOKEN")
+    drift = []
+    for rel in files:
+        local_p = os.path.join(clean_dir, *rel.split("/"))
+        if not os.path.exists(local_p):
+            continue
+        try:
+            req = _u.Request("https://api.github.com/repos/%s/contents/src/%s?ref=main" % (pb.REPO, rel),
+                             headers={"User-Agent": "nuke-qa", "Accept": "application/vnd.github.raw"})
+            if tok:
+                req.add_header("Authorization", "Bearer " + tok)
+            remote = _u.urlopen(req, timeout=30).read()
+        except Exception:                                  # noqa: BLE001  (network blip -> don't block)
+            return ("skipped", [])
+        with open(local_p, "rb") as f:
+            if _norm(f.read()) != _norm(remote):
+                drift.append(rel)
+    return ("ok" if not drift else "drift", drift)
+
+
 def _sign(path, key, minisign):
     """minisign-sign a file -> <path>.minisig. Uses a no-password key (NO_SIGN_KEY). Never logs the key."""
     sig = path + ".minisig"
@@ -144,6 +174,8 @@ def main(argv=None):
     ap.add_argument("--keep-nightly", type=int, default=3,
                     help="retain only the N most-recent nightly pre-releases (nightly channel; default 3)")
     ap.add_argument("--no-prune", action="store_true", help="skip nightly retention pruning")
+    ap.add_argument("--force", action="store_true",
+                    help="publish even if the QA gate finds the build differs from main")
     a = ap.parse_args(argv)
 
     out = os.path.abspath(a.out)
@@ -179,6 +211,21 @@ def main(argv=None):
             except py_compile.PyCompileError as e:
                 raise SystemExit("smoke check FAILED — refusing to publish a broken build (%s): %s" % (rel, e))
     print("[release] smoke check OK (key modules compile)")
+
+    # QA GATE — never publish a build that isn't the current dev-server code (main).
+    qa_status, qa_drift = _verify_against_main(os.path.join(out, "_clean"))
+    if qa_status == "ok":
+        print("[release] QA: build verified against main (dev server) — every key runtime file matches.")
+    elif qa_status == "skipped":
+        print("[release] QA: could not reach GitHub to verify against main — proceeding without QA.")
+    else:
+        detail = "[release] QA FAILED — the build differs from main on: %s" % ", ".join(qa_drift)
+        if a.force:
+            print(detail + "  (--force given: publishing anyway)")
+        else:
+            raise SystemExit(detail + "\nRefusing to publish a build that is NOT the current dev server. "
+                             "Reconcile the working dir with main (push your changes to main, or pull "
+                             "main into the working dir), then re-run. Pass --force to override.")
 
     # 2. assemble the updater assets (plugin DLL + the scrubbed bot)
     assets = [os.path.join(out, "nuclear-option-toolkit-%s.zip" % t)
@@ -227,7 +274,10 @@ def main(argv=None):
 
     # 4. publish
     token = pb._token()
-    rel = pb.get_or_create(token, tag, name, _notes(a.channel, version, date, sign), prerelease)
+    notes = _notes(a.channel, version, date, sign)
+    if qa_status == "ok":
+        notes += "\n\n_QA: built source verified byte-for-byte against `main` (the dev server)._"
+    rel = pb.get_or_create(token, tag, name, notes, prerelease)
     for f in final:
         pb.upload_asset(token, rel, f)
     print("DONE. https://github.com/%s/releases/tag/%s" % (pb.REPO, tag))
