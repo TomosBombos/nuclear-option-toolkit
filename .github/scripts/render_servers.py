@@ -69,14 +69,43 @@ def esc(s):
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+_GM_BY_NAME = None
+
+
+def _gm_name_map():
+    """Best-effort name -> id map from the public gamemonitoring.net list for this game, so an
+    opted-in server gets its banner AUTOMATICALLY even when its JSON carries no id (e.g. the
+    operator listed the server after publishing, or the bot republished without the field).
+    One API call per render; any failure just disables the fallback."""
+    global _GM_BY_NAME
+    if _GM_BY_NAME is not None:
+        return _GM_BY_NAME
+    _GM_BY_NAME = {}
+    try:
+        import urllib.request
+        req = urllib.request.Request("https://api.gamemonitoring.net/servers?game=2168680",
+                                     headers={"User-Agent": "nuclear-option-toolkit-directory"})
+        d = json.loads(urllib.request.urlopen(req, timeout=30).read())
+        for it in (d.get("response") or {}).get("items") or []:
+            nm = str(it.get("name") or "").strip().lower()
+            gid = str(it.get("id") or "").strip()
+            if nm and gid.isdigit():
+                _GM_BY_NAME[nm] = gid
+    except Exception:                                  # noqa: BLE001  (fallback only — never fail the render)
+        pass
+    return _GM_BY_NAME
+
+
 def gm_id(s):
     """Return the gamemonitoring.net server id as a digits-only string, or None.
-    Validated (digits only) because the value may originate from operator input."""
+    Explicit gamemonitoring_id (digits-validated — operator input) wins; otherwise fall back
+    to an exact name match against the live gamemonitoring list."""
     v = s.get("gamemonitoring_id")
-    if v is None:
-        return None
-    sv = str(v).strip()
-    return sv if sv.isdigit() else None
+    if v is not None:
+        sv = str(v).strip()
+        if sv.isdigit():
+            return sv
+    return _gm_name_map().get(str(s.get("name") or "").strip().lower())
 
 
 def build_block(servers):
