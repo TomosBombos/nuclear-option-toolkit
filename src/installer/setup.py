@@ -37,10 +37,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)                      # the toolkit root (where the bot/web CC live)
 CATALOGUE = os.path.join(ROOT, "settings_catalogue.json")
 # User data dir: where the generated config + secrets live. Kept OUT of the repo.
-USER_DIR = os.environ.get("NOST_DATA_DIR") or os.path.join(
-    os.path.expanduser("~"), ".nuke-option-toolkit")
+# PER-FOLDER by default (a `.nost-data` inside THIS server's own folder) so two installs
+# in sibling folders never share a config — a 2nd install can't overwrite the 1st server's
+# config and take it down. Override with NOST_DATA_DIR or --data-dir for explicit control.
+USER_DIR = os.environ.get("NOST_DATA_DIR") or os.path.join(ROOT, ".nost-data")
 CONFIG = os.path.join(USER_DIR, "config.json")
 SECRETS = os.path.join(USER_DIR, "secrets.json")
+FORCE = False            # --force: allow overwriting a DIFFERENT server's config in this data dir
 TOKEN = _secrets.token_urlsafe(16)                # guards the setup API for this run
 _SERVER = None                                    # set in main(); used by /api/shutdown
 
@@ -99,6 +102,20 @@ def _free_port():
     p = s.getsockname()[1]
     s.close()
     return p
+
+
+def _suggest_web_port(start=8770):
+    """First free local port from `start`. A 2nd install won't default to the port the 1st
+    server's web CC is already using (which would leave the 2nd dashboard unable to bind)."""
+    for p in range(int(start), int(start) + 50):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("127.0.0.1", p))
+            s.close()
+            return p
+        except OSError:
+            s.close()
+    return int(start)
 
 
 def _load_catalogue():
@@ -323,42 +340,173 @@ def _generate_launch(game_dir, platform, rcmd_port):
     return script, logp
 
 
-def _generate_start_everything(game_dir, platform, web_port):
-    """Own-PC: ONE launcher that (re)starts the server + bot + web CC and opens the dashboard,
-    exactly like the live server's START EVERYTHING (which starts bot + web CC)."""
-    if platform == "windows":
-        path = os.path.join(game_dir, "START EVERYTHING.bat")
-        body = ("@echo off\r\n"
-                "cd /d \"%~dp0\"\r\n"
-                "echo Starting your Nuclear Option community server (server + bot + web CC)...\r\n"
-                "powershell -NoProfile -Command \"Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'no_mapvote_bot.py|cc_web.py' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }\" 2>nul\r\n"
-                "tasklist /FI \"IMAGENAME eq NuclearOptionServer.exe\" | find /I \"NuclearOptionServer.exe\" >nul || start \"Nuclear Option - Server\" \"%~dp0StartServer.bat\"\r\n"
-                "timeout /t 5 >nul\r\n"
-                "start \"Nuke Option - Bot\" cmd /k python -u no_mapvote_bot.py\r\n"
-                "timeout /t 2 >nul\r\n"
-                "start \"Nuke Option - Web CC\" cmd /k python -u cc_web.py\r\n"
-                "timeout /t 3 >nul\r\n"
-                "start \"\" http://localhost:" + str(web_port) + "\r\n")
-    else:
-        path = os.path.join(game_dir, "start_everything.sh")
-        body = ("#!/usr/bin/env bash\n"
-                "cd \"$(dirname \"$0\")\"\n"
-                "pkill -f 'no_mapvote_bot.py|cc_web.py' 2>/dev/null || true\n"
-                "pgrep -f NuclearOptionServer >/dev/null || (bash ./start_server.sh &)\n"
-                "sleep 5\n"
-                "(python3 -u no_mapvote_bot.py &)\n"
-                "sleep 2\n"
-                "(python3 -u cc_web.py &)\n"
-                "sleep 3\n"
-                "(xdg-open http://localhost:" + str(web_port) + " 2>/dev/null || true)\n")
+# --- Folder-safe launcher templates (per-server, sibling-safe). --------------
+# Each launcher: sets a PER-FOLDER NOST_DATA_DIR, kills ONLY this folder's python
+# (directory-PREFIX match so 'Server\' can't match 'Server 2\'), launches bot + web CC
+# by FULL %~dp0 path (so the folder is in the command line for future folder-scoped
+# kills), pins THIS server's web-CC port, and tags every window with the folder name.
+# `__P__` is replaced with this server's web port; `__GAMESTART__` with the own-PC
+# game-server start (empty for a Pterodactyl/admin install). NO name-blind kills, and
+# NO shared 'START EVERYTHING' — that killed every server's processes.
+
+_WIN_RUN = r'''@echo off
+REM --- Nuke Option BOT (folder-safe, per-folder data dir) ---
+for %%I in ("%~dp0.") do set "NOST_FOLDER=%%~nxI"
+title Nuke Option BOT - %NOST_FOLDER%
+if not defined NOST_DATA_DIR set "NOST_DATA_DIR=%~dp0.nost-data"
+if not exist "%NOST_DATA_DIR%" mkdir "%NOST_DATA_DIR%"
+python -u "%~dp0no_mapvote_bot.py" %*
+'''
+
+_WIN_WEBCC = r'''@echo off
+cd /d "%~dp0"
+for %%I in ("%~dp0.") do set "NOST_FOLDER=%%~nxI"
+title Nuke Option WEBCC - %NOST_FOLDER%
+if not defined NOST_DATA_DIR set "NOST_DATA_DIR=%~dp0.nost-data"
+if not exist "%NOST_DATA_DIR%" mkdir "%NOST_DATA_DIR%"
+set "NOCC_PORT=__P__"
+echo ============================================
+echo   Nuke Option - Web Command Centre
+echo   Folder: %NOST_FOLDER%
+echo   http://127.0.0.1:__P__
+echo ============================================
+echo Stopping any old command-centre instances for THIS folder only...
+powershell -NoProfile -Command "$d='%~dp0'; if (-not $d.EndsWith([char]92)) { $d=$d+[char]92 }; Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -like '*cc_web.py*' -and $_.CommandLine -like ('*' + $d + '*') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+ping -n 2 127.0.0.1 >nul
+echo Opening your browser... (Ctrl+F5 to hard-refresh if it looks stale)
+start "" http://127.0.0.1:__P__
+python -u "%~dp0cc_web.py"
+echo.
+echo Server stopped.
+pause
+'''
+
+_WIN_START_THIS = r'''@echo off
+REM ===========================================================================
+REM  Nuke Option - START THIS SERVER (per-folder, folder-safe)
+REM  Kills ONLY this folder's python, opens ONE bot + ONE web CC window tagged
+REM  with THIS folder. Starting another server's copy will NOT touch this one.
+REM ===========================================================================
+for %%I in ("%~dp0..\.") do set "NOST_FOLDER=%%~nxI"
+title Nuke Option LAUNCHER - %NOST_FOLDER%
+set "NOST_ROOT=%~dp0..\"
+echo ============================================
+echo   NUKE OPTION - starting THIS server
+echo   Folder: %NOST_FOLDER%
+echo ============================================
+set "NOST_DATA_DIR=%NOST_ROOT%.nost-data"
+if not exist "%NOST_DATA_DIR%" mkdir "%NOST_DATA_DIR%"
+echo Stopping any old copies for THIS folder only...
+powershell -NoProfile -Command "$d=(Resolve-Path '%NOST_ROOT%').Path; if (-not $d.EndsWith([char]92)) { $d=$d+[char]92 }; $me=$PID; Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $me -and $_.CommandLine -and ($_.CommandLine -match 'run_keepalive') -and ($_.CommandLine -like ('*' + $d + '*')) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+powershell -NoProfile -Command "$d=(Resolve-Path '%NOST_ROOT%').Path; if (-not $d.EndsWith([char]92)) { $d=$d+[char]92 }; Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match 'no_mapvote_bot\.py|cc_web\.py' -and $_.CommandLine -like ('*' + $d + '*') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+ping -n 3 127.0.0.1 >nul
+__GAMESTART__echo Opening the BOT window...
+start "Nuke Option BOT - %NOST_FOLDER%" cmd /k "cd /d "%NOST_ROOT%" & set "NOST_DATA_DIR=%NOST_DATA_DIR%" & call run.bat"
+ping -n 3 127.0.0.1 >nul
+echo Opening the WEB COMMAND CENTRE window...
+start "Nuke Option WEBCC - %NOST_FOLDER%" cmd /k "cd /d "%NOST_ROOT%" & set "NOST_DATA_DIR=%NOST_DATA_DIR%" & set "NOCC_PORT=__P__" & start "" http://127.0.0.1:__P__ & python -u "%NOST_ROOT%cc_web.py""
+echo.
+echo Done - bot + web CC opened for %NOST_FOLDER%. Leave them OPEN.
+ping -n 5 127.0.0.1 >nul
+'''
+
+_WIN_GAMESTART = ('echo Starting the game server...\r\n'
+                  'tasklist /FI "IMAGENAME eq NuclearOptionServer.exe" | find /I "NuclearOptionServer.exe" >nul '
+                  '|| start "Nuclear Option - Server" "__GAMEDIR__StartServer.bat"\r\n'
+                  'ping -n 6 127.0.0.1 >nul\r\n')
+
+_WIN_WRAP_BOT = r'''@echo off
+for %%I in ("%~dp0..\.") do set "NOST_FOLDER=%%~nxI"
+title Nuke Option BOT - %NOST_FOLDER%
+echo Folder: %NOST_FOLDER%
+set "NOST_DATA_DIR=%~dp0..\.nost-data"
+call "%~dp0..\run.bat"
+pause >nul
+'''
+
+_WIN_WRAP_WEBCC = r'''@echo off
+for %%I in ("%~dp0..\.") do set "NOST_FOLDER=%%~nxI"
+title Nuke Option WEBCC - %NOST_FOLDER%
+echo Folder: %NOST_FOLDER%
+set "NOST_DATA_DIR=%~dp0..\.nost-data"
+call "%~dp0..\webcc.bat"
+pause >nul
+'''
+
+_SH_START_THIS = r'''#!/usr/bin/env bash
+# Nuke Option - start THIS server (per-folder, folder-safe).
+here="$(cd "$(dirname "$0")/.." && pwd)/"
+export NOST_DATA_DIR="${here}.nost-data"; mkdir -p "$NOST_DATA_DIR"
+export NOCC_PORT=__P__
+# Kill ONLY this folder's bot + web CC (match the full folder path in the command line).
+for pid in $(pgrep -f "${here}no_mapvote_bot.py") $(pgrep -f "${here}cc_web.py"); do kill "$pid" 2>/dev/null || true; done
+__GAMESTART__( cd "$here" && python3 -u "${here}no_mapvote_bot.py" & )
+sleep 2
+( cd "$here" && NOCC_PORT=__P__ python3 -u "${here}cc_web.py" & )
+sleep 3
+( xdg-open "http://127.0.0.1:__P__" 2>/dev/null || true )
+'''
+
+_SH_GAMESTART = ('pgrep -f "__GAMEDIR__.*NuclearOptionServer" >/dev/null '
+                 '|| ( cd "__GAMEDIR__" && bash "__GAMEDIR__start_server.sh" & )\nsleep 5\n')
+
+
+def _write_bat(path, text):
     with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text.replace("\r\n", "\n").replace("\n", "\r\n"))
+
+
+def _folder_safe_launchers(root, platform, web_port, own_pc=False, game_dir=None):
+    """Generate the folder-safe, per-server launchers into `root` (where the bot + web CC live)
+    and return the primary launcher's path (START THIS SERVER). Replaces the old name-blind
+    'START EVERYTHING': every process kill is scoped to THIS folder, so installing/starting a
+    2nd server in a sibling folder can never touch the 1st. Ports are pinned per folder. For an
+    own-PC install, `game_dir` is where the local game server's StartServer lives."""
+    p = str(int(web_port))
+    win_gd = os.path.join(game_dir, "") if game_dir else ""            # trailing separator
+    sh_gd = (game_dir.rstrip("/") + "/") if game_dir else ""
+    start_here = os.path.join(root, "START HERE")
+    if platform == "windows":
+        os.makedirs(start_here, exist_ok=True)
+        _write_bat(os.path.join(root, "run.bat"), _WIN_RUN)
+        _write_bat(os.path.join(root, "webcc.bat"), _WIN_WEBCC.replace("__P__", p))
+        gamestart = _WIN_GAMESTART.replace("__GAMEDIR__", win_gd) if own_pc else ""
+        main = _WIN_START_THIS.replace("__GAMESTART__", gamestart).replace("__P__", p)
+        main_path = os.path.join(start_here, "START THIS SERVER.bat")
+        _write_bat(main_path, main)
+        _write_bat(os.path.join(start_here, "1. Start Bot.bat"), _WIN_WRAP_BOT)
+        _write_bat(os.path.join(start_here, "2. Start Web Command Centre.bat"), _WIN_WRAP_WEBCC)
+        # remove any legacy name-blind launcher left in the folder
+        for legacy in (os.path.join(root, "START EVERYTHING.bat"),
+                       os.path.join(start_here, "START EVERYTHING.bat")):
+            try:
+                os.remove(legacy)
+            except OSError:
+                pass
+        return main_path
+    # Linux: a single folder-safe start script (best-effort folder-scoped kill).
+    os.makedirs(start_here, exist_ok=True)
+    gamestart = _SH_GAMESTART.replace("__GAMEDIR__", sh_gd) if own_pc else ""
+    body = _SH_START_THIS.replace("__GAMESTART__", gamestart).replace("__P__", p)
+    main_path = os.path.join(start_here, "start_this_server.sh")
+    with open(main_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(body)
-    if platform != "windows":
+    try:
+        os.chmod(main_path, 0o755)
+    except OSError:
+        pass
+    for legacy in (os.path.join(root, "start_everything.sh"),):
         try:
-            os.chmod(path, 0o755)
+            os.remove(legacy)
         except OSError:
             pass
-    return path
+    return main_path
+
+
+def _generate_start_everything(game_dir, platform, web_port):
+    """Own-PC: generate the folder-safe per-server launchers in the TOOLKIT ROOT (where the bot +
+    web CC live), and start the local game server in `game_dir` too."""
+    return _folder_safe_launchers(ROOT, platform, web_port, own_pc=True, game_dir=game_dir)
 
 
 def _place_local_gameside(game_dir, platform):
@@ -428,9 +576,32 @@ def _apply_options(config, payload):
     return config
 
 
+def _guard_config(new_server_id):
+    """Refuse to overwrite a DIFFERENT server's config.json. The per-folder USER_DIR default
+    already isolates installs; this is defence-in-depth for the case where someone points two
+    installs at ONE data dir (via NOST_DATA_DIR / --data-dir). Returns an error string or None."""
+    if FORCE or not os.path.exists(CONFIG):
+        return None
+    try:
+        with open(CONFIG, encoding="utf-8") as f:
+            existing = json.load(f)
+    except (OSError, ValueError):
+        return None
+    old = ((existing.get("server") or {}).get("server_id") or "").strip()
+    new = (new_server_id or "").strip()
+    if old and new and old != new:
+        return ("This data dir already holds a DIFFERENT server (server_id '%s'); refusing to "
+                "overwrite its config. Install into a separate folder, or pass --data-dir for an "
+                "explicit location (or --force to override). Data dir: %s" % (old, USER_DIR))
+    return None
+
+
 def _save(payload):
     scenario = payload.get("scenario", "external_linux")
     conn = payload.get("connection", {})
+    _err = _guard_config(conn.get("server_id", ""))
+    if _err:
+        return {"ok": False, "error": _err}
     features = payload.get("features", {})
     srv = payload.get("server", {}) or {}          # the Server step (install/ports/name)
     # config.json — SAFE TO SHARE: no secrets.
@@ -754,38 +925,10 @@ def _write_power_files(conn):
 
 
 def _generate_admin_start_everything(root, platform, web_port):
-    """External (Pterodactyl) bundle: ONE launcher that starts the admin-side stack — the bot +
-    the web command centre — and opens the dashboard. The game itself runs in the container; the
-    web CC's power button (and the bot) drive it via the panel API. Mirrors the live admin START."""
-    if platform == "windows":
-        path = os.path.join(root, "START EVERYTHING.bat")
-        body = ("@echo off\r\n"
-                "cd /d \"%~dp0\"\r\n"
-                "echo Starting your Nuclear Option admin tools (bot + web command centre)...\r\n"
-                "powershell -NoProfile -Command \"Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'no_mapvote_bot.py|cc_web.py' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }\" 2>nul\r\n"
-                "start \"Nuke Option - Bot\" cmd /k python -u no_mapvote_bot.py\r\n"
-                "timeout /t 2 >nul\r\n"
-                "start \"Nuke Option - Web CC\" cmd /k python -u cc_web.py\r\n"
-                "timeout /t 3 >nul\r\n"
-                "start \"\" http://localhost:" + str(web_port) + "\r\n")
-    else:
-        path = os.path.join(root, "start_everything.sh")
-        body = ("#!/usr/bin/env bash\n"
-                "cd \"$(dirname \"$0\")\"\n"
-                "pkill -f 'no_mapvote_bot.py|cc_web.py' 2>/dev/null || true\n"
-                "(python3 -u no_mapvote_bot.py &)\n"
-                "sleep 2\n"
-                "(python3 -u cc_web.py &)\n"
-                "sleep 3\n"
-                "(xdg-open http://localhost:" + str(web_port) + " 2>/dev/null || true)\n")
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        f.write(body)
-    if platform != "windows":
-        try:
-            os.chmod(path, 0o755)
-        except OSError:
-            pass
-    return path
+    """External (Pterodactyl) bundle: the folder-safe per-server launchers (bot + web CC). The
+    game runs in the container; the web CC power button + the bot drive it via the panel API.
+    Folder-scoped so it can never touch another server's processes."""
+    return _folder_safe_launchers(root, platform, web_port, own_pc=False)
 
 
 def _write_admin_config(payload, conn, srv, features, gp, qp, relay_port):
@@ -886,6 +1029,9 @@ def _api_deploy(payload):
         return {"ok": False, "error": str(e), "log": "\n".join(log)}
     except Exception as e:                               # noqa: BLE001
         return {"ok": False, "error": "deploy failed: %s" % e, "log": "\n".join(log)}
+    _cfg_err = _guard_config(conn.get("server_id", ""))
+    if _cfg_err:
+        return {"ok": False, "error": _cfg_err, "log": "\n".join(log)}
     launch = _write_admin_config(payload, conn, srv, features, gp, qp, relay_port)
     return {"ok": True, "log": "\n".join(log), "summary": summary, "launch": launch,
             "powered": bool(ptero)}
@@ -924,7 +1070,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self._guard():
             return self._send(403, json.dumps({"error": "bad token"}))
         if path == "/api/preflight":
-            return self._send(200, json.dumps({"checks": _preflight()}))
+            return self._send(200, json.dumps({"checks": _preflight(),
+                                               "suggested_web_port": _suggest_web_port()}))
         if path == "/api/catalogue":
             return self._send(200, json.dumps({"settings": _load_catalogue()}))
         if path == "/api/current":
@@ -1010,7 +1157,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=0, help="bind a fixed port (default: a free one)")
     ap.add_argument("--no-browser", action="store_true", help="don't auto-open the browser")
+    ap.add_argument("--data-dir", "--target", dest="data_dir", default="",
+                    help="where this server's config/secrets live (default: <this folder>\\.nost-data)")
+    ap.add_argument("--force", action="store_true",
+                    help="allow overwriting a DIFFERENT server's config in the data dir")
     a, _ = ap.parse_known_args()
+    if a.data_dir or a.force:
+        global USER_DIR, CONFIG, SECRETS, FORCE
+        FORCE = bool(a.force)
+        if a.data_dir:
+            USER_DIR = os.path.abspath(a.data_dir)
+            CONFIG = os.path.join(USER_DIR, "config.json")
+            SECRETS = os.path.join(USER_DIR, "secrets.json")
     port = a.port or int(os.environ.get("NOST_PORT") or 0) or _free_port()
     url = "http://127.0.0.1:%d/?t=%s" % (port, TOKEN)
     httpd = http.server.HTTPServer(("127.0.0.1", port), Handler)

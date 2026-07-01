@@ -81,6 +81,7 @@ async function render(){
     const blurb=BUNDLE_TYPE?WELCOME_BLURB[BUNDLE_TYPE]:"This sets up the toolkit for your Nuclear Option server. We'll check prerequisites, ask where your server runs, take your connection details, let you pick which plugin features you want, and write a clean config.";
     p.innerHTML='<div class="card"><b>Welcome.</b> '+blurb+' <div class="hint" style="margin-top:8px">Everything runs locally — your credentials stay on this machine and are never committed. Network is used only for the “Test connection” buttons and the actual upload to your server.</div><div id="pf" style="margin-top:12px" class="dim">checking…</div></div>';
     const r=await api('/api/preflight');
+    if(r.suggested_web_port && Number(state.web_port)===8770) state.web_port=r.suggested_web_port;
     $('#pf').innerHTML=r.checks.map(c=>`<div><span class="chk" style="background:${c.ok?'var(--ok)':'var(--warn)'}"></span><b>${esc(c.name)}</b> — <span class="${c.ok?'ok':'warn'}">${esc(c.detail)}</span></div>`).join('')
       +'<div class="row" style="margin-top:10px"><button class="go" onclick="installDeps(this)">Install Python packages</button> <span id="depsMsg" class="msg"></span></div>';
     try{const dt=await api('/api/detect');state.detected=dt;state.platformTarget=dt.platform_target||'';
@@ -374,15 +375,15 @@ async function deployNow(btn){btn.disabled=true;const m=$('#depMsg');
   d.innerHTML='<b class="ok" style="font-size:16px">✅ Your server is set up!</b>'
     +'<ol style="margin:8px 0 4px 20px;padding:0;line-height:1.7">'
     +'<li>Your Pterodactyl server now has the plugin, missions and config'+(r.powered?' and is restarting':' — restart it from the panel')+'. Watch the panel console for <code>NukeStats loaded</code>.</li>'
-    +'<li>Click <b>🚀 Launch Everything</b> to start the bot + web command centre here and open your dashboard.</li>'
-    +'<li>Any time after, double-click <b>START EVERYTHING.bat</b> in this folder.</li></ol>'
-    +'<div class="row" style="margin-top:12px"><button class="pri" onclick="launchNow(this)">🚀 Launch Everything</button> <button class="go" onclick="finishClose(this)">✓ Finish &amp; close</button></div>'
+    +'<li>Click <b>🚀 Launch This Server</b> to start the bot + web command centre here and open your dashboard.</li>'
+    +'<li>Any time after, double-click <b>START THIS SERVER.bat</b> in this folder.</li></ol>'
+    +'<div class="row" style="margin-top:12px"><button class="pri" onclick="launchNow(this)">🚀 Launch This Server</button> <button class="go" onclick="finishClose(this)">✓ Finish &amp; close</button></div>'
     +'<div class="hint" style="margin-top:6px">Dashboard: <code>http://localhost:'+webPort+'</code></div><div id="launchMsg" class="msg"></div>';
 }
 function renderInstallLocal(p){
   const sv=state.server;
   p.innerHTML='<div class="card"><b>Install on this PC</b>'
-    +'<div class="hint" style="margin-top:4px">This writes your config, copies the bundled BepInEx + plugin + missions into your server folder, and creates a <b>START EVERYTHING</b> launcher (server + bot + web command centre).</div>'
+    +'<div class="hint" style="margin-top:4px">This writes your config, copies the bundled BepInEx + plugin + missions into your server folder, and creates a <b>START THIS SERVER</b> launcher (server + bot + web command centre).</div>'
     +((!sv.dir)?'<div class="warn" style="margin-top:8px">Go back to the <b>Server</b> step and choose/point to your server folder first.</div>':'')
     +'<div class="row" style="margin-top:12px"><button class="pri" '+(sv.dir?'':'disabled')+' onclick="placeLocal(this)">⬇ Install &amp; set up</button> <span id="depMsg" class="msg"></span></div>'
     +'<div id="depDone" class="hide" style="margin-top:12px"></div></div>';
@@ -394,9 +395,9 @@ async function placeLocal(btn){btn.disabled=true;const m=$('#depMsg');m.textCont
   m.innerHTML='<span class="ok">✓ set up</span>';window._launchInfo=r.launch||{};
   const d=$('#depDone');d.classList.remove('hide');
   d.innerHTML='<b class="ok" style="font-size:16px">✅ Ready!</b>'
-    +(r.launch?'<div class="hint" style="margin-top:6px">Click Launch Everything to boot the server + bot + web command centre and open your dashboard.</div>'
-      +'<div class="row" style="margin-top:10px"><button class="pri" onclick="launchNow(this)">🚀 Launch Everything</button> <button onclick="openFolder(this)">Open server folder</button> <button class="go" onclick="finishClose(this)">✓ Finish</button></div><div id="launchMsg" class="msg"></div>'
-      :'<div class="hint" style="margin-top:6px">Config written. Open your server folder and run START EVERYTHING.</div><div class="row" style="margin-top:10px"><button class="go" onclick="finishClose(this)">✓ Finish</button></div>');
+    +(r.launch?'<div class="hint" style="margin-top:6px">Click Launch This Server to boot the server + bot + web command centre and open your dashboard.</div>'
+      +'<div class="row" style="margin-top:10px"><button class="pri" onclick="launchNow(this)">🚀 Launch This Server</button> <button onclick="openFolder(this)">Open server folder</button> <button class="go" onclick="finishClose(this)">✓ Finish</button></div><div id="launchMsg" class="msg"></div>'
+      :'<div class="hint" style="margin-top:6px">Config written. Open your server folder and run START THIS SERVER.</div><div class="row" style="margin-top:10px"><button class="go" onclick="finishClose(this)">✓ Finish</button></div>');
 }
 function renderInstallManual(p){
   p.innerHTML='<div class="card"><b>Manual setup</b>'
@@ -431,9 +432,9 @@ async function saveAll(btn){btn.disabled=true;$('#savemsg').textContent='writing
       +(r.launch?(
         '<div style="margin-top:14px;font-weight:700;color:var(--ac)">▶ Start your whole community server</div>'
         +'<ol style="margin:6px 0 4px 20px;padding:0;line-height:1.7">'
-        +'<li>Click <b>🚀 Launch now</b> — it runs <b>START EVERYTHING</b>: boots the server (BepInEx loads the plugin), starts the <b>bot</b> and the <b>web command centre</b>, and opens your dashboard.</li>'
+        +'<li>Click <b>🚀 Launch now</b> — it runs <b>START THIS SERVER</b>: boots the server (BepInEx loads the plugin), starts the <b>bot</b> and the <b>web command centre</b>, and opens your dashboard.</li>'
         +'<li>Your dashboard opens at <code>http://localhost:'+webPort+'</code> — the same view as the live server.</li>'
-        +'<li>Any time after, just double-click <b>START EVERYTHING.bat</b> in your server folder.</li>'
+        +'<li>Any time after, just double-click <b>START THIS SERVER.bat</b> in your server folder.</li>'
         +'</ol>'
         +'<div class="row" style="margin-top:12px"><button class="pri" onclick="launchNow(this)">🚀 Launch now</button> <button onclick="openFolder(this)">Open server folder</button> <button class="go" onclick="finishClose(this)">✓ Finish &amp; close</button></div>'
         +'<div id="launchMsg" class="msg"></div>'
