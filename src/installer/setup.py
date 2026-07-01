@@ -350,6 +350,7 @@ def _generate_launch(game_dir, platform, rcmd_port):
 # NO shared 'START EVERYTHING' — that killed every server's processes.
 
 _WIN_RUN = r'''@echo off
+cd /d "%~dp0"
 REM --- Nuke Option BOT (folder-safe, per-folder data dir) ---
 for %%I in ("%~dp0.") do set "NOST_FOLDER=%%~nxI"
 title Nuke Option BOT - %NOST_FOLDER%
