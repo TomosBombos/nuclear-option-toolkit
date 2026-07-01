@@ -83,10 +83,20 @@ def _tag_for(channel, version, date):
 
 
 def _changelog_section(channel, version):
-    """Pull the [<version>] section body from CHANGELOG.md (repo root), or '' if absent.
-    Only released versions are documented there, so a nightly of an as-yet-unreleased version
-    returns '' — we never present unreleased work as a finished changelog."""
+    """Release-notes changelog body, or '' if none.
+    Stable pulls the [<version>] section from CHANGELOG.md. Nightly pulls the in-development
+    notes from CHANGELOG.unreleased.md (between the NIGHTLY-NOTES markers) — so nightlies carry
+    a changelog without listing unreleased work as 'done' on the main CHANGELOG.md."""
     import re as _re
+    if channel == "nightly":
+        p = os.path.join(ROOT, "CHANGELOG.unreleased.md")
+        if not os.path.exists(p):
+            return ""
+        with open(p, encoding="utf-8") as f:
+            text = f.read()
+        m = _re.search(r"<!--\s*NIGHTLY-NOTES:START\s*-->(.*?)<!--\s*NIGHTLY-NOTES:END\s*-->",
+                       text, _re.S)
+        return m.group(1).strip() if m else ""
     path = os.path.join(ROOT, "CHANGELOG.md")
     if not os.path.exists(path):
         return ""
@@ -116,7 +126,8 @@ def _notes(channel, version, date, signed):
     note = "\n".join(lines)
     changes = _changelog_section(channel, version)
     if changes:
-        note += "\n\n---\n\n### What's changed\n\n" + changes
+        hdr = "### What's in this build (in development)" if channel == "nightly" else "### What's changed"
+        note += "\n\n---\n\n" + hdr + "\n\n" + changes
     return note
 
 

@@ -3,6 +3,9 @@
 What changed in each release. Versioned by the plugin version (`0.9.x`). Every release on GitHub shows
 its own section from this file.
 
+> Looking for what's coming? In-development changes live in
+> [CHANGELOG.unreleased.md](CHANGELOG.unreleased.md) and appear on the nightly builds.
+
 > **Maintainers:** when you cut a stable release, add a new `## [<version>] — <date>` section at the
 > top describing what's in it. Only list things that ship in that release — nothing unreleased.
 
