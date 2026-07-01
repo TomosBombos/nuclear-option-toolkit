@@ -158,25 +158,11 @@ def scrub_design_history(text):
     return _require(text, "The newest layer (v0.9.5) adds", "The v0.9.5 layer adds")
 
 
-def scrub_security(text):
-    old = ("The matching **public key ships with the toolkit** as "
-           "`installer/trusted.pub` (and is baked into the frozen launcher). "
-           "This is the trust root.")
-    new = ("The matching **public key ships with the toolkit** as "
-           "`installer/trusted.pub` **from the first signed release onward** "
-           "(and is baked into the frozen launcher). This is the trust root. "
-           "*(Until that first signed release `trusted.pub` is absent, and the "
-           "updater refuses to stage a binary unless you pass "
-           "`--i-understand-unsigned`.)*")
-    return _require(text, old, new)
-
-
 SCRUBS = {
     "no_mapvote_bot.py": scrub_bot,
     "NukeStats/NukeStatsPlugin.cs": scrub_plugin,
     "docs/INSTALL_SOURCES.md": strip_preamble,
     "docs/ARCHITECTURE.md": scrub_architecture,
-    "SECURITY.md": scrub_security,
 }
 
 # ---------------------------------------------------------------------------
