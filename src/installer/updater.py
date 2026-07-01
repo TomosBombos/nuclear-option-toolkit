@@ -178,18 +178,28 @@ def check(components=("plugin", "bot"), channel_override=None, verbose=True):
         return None
     latest = rel.get("tag_name") or rel.get("name") or ""
     installed = _toolkit_installed()
-    newer = _vt(latest) > _vt(installed)
+    # PER-COMPONENT state: each component tracks its OWN deployed version, so a component that was
+    # never applied (e.g. the web CC) is still seen as out of date even when the toolkit-level
+    # marker was bumped by another component's deploy.
     out = {"repo": repo, "channel": channel, "release": rel, "latest": latest,
-           "installed": installed, "newer": newer, "components": {}}
+           "installed": installed, "components": {}}
     for comp in components:
-        out["components"][comp] = {"in_release": _asset(rel, COMPONENTS[comp]["asset"]) is not None}
+        c_have = _deployed_version(comp)
+        out["components"][comp] = {"in_release": _asset(rel, COMPONENTS[comp]["asset"]) is not None,
+                                   "installed": c_have, "newer": _vt(latest) > _vt(c_have)}
+    out["newer"] = any(c["in_release"] and c["newer"] for c in out["components"].values())
     if verbose:
-        print("Repo:      %s  (%s channel)" % (repo, channel))
-        print("Installed: %s" % (installed or "(unknown)"))
-        print("Latest:    %s   %s" % (latest, "<-- UPDATE AVAILABLE" if newer else "(up to date)"))
-        if newer and rel.get("body"):
+        print("Repo:    %s  (%s channel)" % (repo, channel))
+        print("Latest:  %s" % latest)
+        for comp in components:
+            st = out["components"][comp]
+            tag = ("(not in this release)" if not st["in_release"]
+                   else "<-- UPDATE (have %s)" % (st["installed"] or "none") if st["newer"]
+                   else "up to date (%s)" % (st["installed"] or "?"))
+            print("  %-7s %s" % (comp, tag))
+        if out["newer"] and rel.get("body"):
             print("\nRelease notes:\n" + "\n".join("  " + ln for ln in rel["body"].splitlines()[:25]))
-            print("\nRun `python updater.py update --component all` to download + verify + stage.")
+            print("\nRun `python updater.py update --component all --apply` to download + verify + apply.")
     return out
 
 
@@ -329,15 +339,14 @@ def update(components=("plugin",), channel_override=None, do_deploy=False, do_ap
     if not info:
         return
     rel, latest, repo = info["release"], info["latest"], info["repo"]
-    if not info.get("newer"):
-        print("Already up to date — installed %s, latest %s (%s channel)."
-              % (info.get("installed") or "?", latest, info["channel"]))
-        return
     did = []
     for comp in components:
         st = info["components"].get(comp, {})
         if not st.get("in_release"):
             print("- %s: not in the latest %s release — skipping." % (comp, info["channel"]))
+            continue
+        if not st.get("newer"):
+            print("- %s: already up to date (%s)." % (comp, st.get("installed") or "?"))
             continue
         asset = COMPONENTS[comp]["asset"]
         url = _asset(rel, asset)
@@ -349,6 +358,9 @@ def update(components=("plugin",), channel_override=None, do_deploy=False, do_ap
         _stage(comp, rel, latest, data, sha, repo)
         did.append(comp)
 
+    if not did:
+        print("Nothing to fetch — all requested components are already up to date.")
+        return
     if "plugin" in did and do_deploy:
         runbat = os.path.join(ROOT, "run.bat")
         if os.path.exists(runbat):
