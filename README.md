@@ -191,9 +191,10 @@ direct-connect, so find them by **name** in the in-game server browser. This lis
 <!-- COMMUNITY-SERVERS:START -->
 
 <div align="center">
-<p><b>1 server</b> running the community toolkit</p>
+<p><b>2 servers</b> running the community toolkit</p>
 <table>
 <tr><th>Server</th><th>Region</th><th>Plugin</th></tr>
+<tr><td><b>Tomo's 24/7 PvP | Mission Vote | OCE | 60hz | Ranked | no-TKs</b></td><td>Oceania</td><td>v0.9.21</td></tr>
 <tr><td><a href="https://gamemonitoring.net/nuclear-option/servers/11798637"><img src="https://widgets.gamemonitoring.net/servers/11798637/560x95.webp?ts=20260701" width="560" alt="Tomo's Co-Op/PvP Mission Vote | OCE | 60hz | Ranked | no-TKs"></a></td><td>Oceania</td><td>v0.9.21</td></tr>
 </table>
 <p>▶ <a href="https://tomosbombos.github.io/nuclear-option-servers/"><b>Live directory</b></a> — real-time status</p>
