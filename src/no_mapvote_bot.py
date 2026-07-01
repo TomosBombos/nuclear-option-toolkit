@@ -3439,9 +3439,11 @@ _RANK_PUSH_FLAG = [False]
 
 def push_plugin_ranks():
     """Write sid|rank-label|#colour lines to plugin_ranks.txt on the container so the
-    NukeStats plugin can render [Name - Rank] chat in the rank colour. Best-effort."""
+    NukeStats plugin can render [Name - Rank] chat in the rank colour. Best-effort.
+    Atomic (.tmp + rename) so the plugin never latches a torn/empty read and blanks tags."""
     lines = []
-    for sid, rec in RANK_DATA.items():
+    seen = set()
+    for sid, rec in list(RANK_DATA.items()):                   # snapshot: the poll loop mutates RANK_DATA on another thread
         idx = rank_index_for(player_points(sid))               # COMBINED rank across the host's servers when sharing is on
         _, rname, abbr, color = RANKS[idx]
         # sid|ABBR|#colour|rankIndex(1..11)|FullName
@@ -3449,11 +3451,33 @@ def push_plugin_ranks():
         #   rankIndex-> numeric rank for PvP auto-balance
         #   FullName -> the CHAT name tag (e.g. "[Wing Commander] Tomo"; reads better in TTS)
         lines.append(f"{sid}|{abbr}|{color}|{idx + 1}|{rname}")
+        seen.add(sid)
+    if SHARED_RANKS_ENABLED:                                   # cross-server: also tag players whose points live ONLY on a peer
+        try:                                                   # server so their carried-over rank shows at join. The plugin bakes
+            for sid in _other_ranks():                         # the name tag ONCE at connect, so the line must exist BEFORE they join.
+                if sid in seen:                                # local record already emitted above (local always wins)
+                    continue
+                idx = rank_index_for(player_points(sid))       # combined == the peer points for a peer-only sid
+                if idx <= 0:                                   # rank-0 stub: no tag to show, skip
+                    continue
+                _, rname, abbr, color = RANKS[idx]
+                lines.append(f"{sid}|{abbr}|{color}|{idx + 1}|{rname}")
+                seen.add(sid)
+        except Exception as e:                                 # noqa: BLE001 - a display push must never raise
+            print(f"[plugin-ranks] peer merge skipped: {e}")
     body = ("\n".join(lines) + "\n").encode("utf-8")
 
     def _w(sftp):
-        with sftp.open("plugin_ranks.txt", "wb") as f:
+        with sftp.open("plugin_ranks.txt.tmp", "wb") as f:
             f.write(body)
+        try:
+            sftp.rename("plugin_ranks.txt.tmp", "plugin_ranks.txt")
+        except OSError:
+            try:
+                sftp.remove("plugin_ranks.txt")
+            except OSError:
+                pass
+            sftp.rename("plugin_ranks.txt.tmp", "plugin_ranks.txt")
     try:
         _sftp_op(_w)
     except Exception as e:                        # noqa: BLE001
