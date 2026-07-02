@@ -356,7 +356,42 @@ for %%I in ("%~dp0.") do set "NOST_FOLDER=%%~nxI"
 title Nuke Option BOT - %NOST_FOLDER%
 if not defined NOST_DATA_DIR set "NOST_DATA_DIR=%~dp0.nost-data"
 if not exist "%NOST_DATA_DIR%" mkdir "%NOST_DATA_DIR%"
+REM --- Clear THIS folder's leftover empty launcher windows (folder-scoped; keeps any live
+REM     bot/cc_web; never kills the current shell) so old consoles don't pile up over restarts.
+if exist "%~dp0clean_old_shells.ps1" powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0clean_old_shells.ps1" 1>nul 2>nul
 python -u "%~dp0no_mapvote_bot.py" %*
+'''
+
+# Folder-scoped cleanup helper written next to run.bat — clears this server's orphaned "empty shell"
+# consoles (launcher cmd.exe left after the python inside stopped). See run.bat call above.
+_WIN_CLEAN_PS1 = r'''# Clears THIS server folder's leftover empty launcher windows (the "empty shell" cmd.exe consoles
+# left behind after the bot / web-command-centre process inside them is stopped). Called from run.bat.
+# SAFE: FOLDER-SCOPED (only cmd.exe whose command line references this exact folder, so a sibling
+# server on the same box is never touched); KEEPS any shell with a live python child (a running
+# bot/cc_web); NEVER self-kills (excludes its own ancestor chain); spares anything under 30s old.
+# -WhatIf lists what it WOULD clear without killing anything.
+param([string]$Root = $PSScriptRoot, [switch]$WhatIf)
+$root = ([string]$Root).TrimEnd('\')
+$all  = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+if (-not $all) { return }
+$safe = @{}
+$p = $PID
+for ($i = 0; $i -lt 15 -and $p; $i++) {
+  $safe[[int]$p] = $true
+  $o = $all | Where-Object { $_.ProcessId -eq $p } | Select-Object -First 1
+  $p = if ($o) { [int]$o.ParentProcessId } else { 0 }
+}
+$now = Get-Date
+$killed = @()
+foreach ($c in ($all | Where-Object { $_.Name -eq 'cmd.exe' -and $_.CommandLine -and $_.CommandLine.Contains($root) })) {
+  if ($safe.ContainsKey([int]$c.ProcessId)) { continue }
+  if (($now - $c.CreationDate).TotalSeconds -lt 30) { continue }
+  $hasPy = [bool]($all | Where-Object { $_.ParentProcessId -eq $c.ProcessId -and $_.Name -eq 'python.exe' })
+  if ($hasPy) { continue }
+  $killed += [int]$c.ProcessId
+  if (-not $WhatIf) { Stop-Process -Id $c.ProcessId -Force -ErrorAction SilentlyContinue }
+}
+if ($killed.Count) { Write-Host ("[cleanup] {0} old empty shell(s) {1}: {2}" -f $killed.Count, $(if($WhatIf){'would be cleared'}else{'cleared'}), ($killed -join ', ')) }
 '''
 
 _WIN_WEBCC = r'''@echo off
@@ -544,6 +579,7 @@ def _folder_safe_launchers(root, platform, web_port, own_pc=False, game_dir=None
     if platform == "windows":
         os.makedirs(start_here, exist_ok=True)
         _write_bat(os.path.join(root, "run.bat"), _WIN_RUN)
+        _write_bat(os.path.join(root, "clean_old_shells.ps1"), _WIN_CLEAN_PS1)   # folder-scoped empty-shell cleanup helper (run.bat calls it)
         _write_bat(os.path.join(root, "webcc.bat"), _WIN_WEBCC.replace("__P__", p))
         gamestart = _WIN_GAMESTART.replace("__GAMEDIR__", win_gd) if own_pc else ""
         main = _WIN_START_THIS.replace("__GAMESTART__", gamestart).replace("__P__", p)

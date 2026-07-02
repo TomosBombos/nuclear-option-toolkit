@@ -3455,6 +3455,8 @@ def handle_stats_line(rc, obj):
             pts = float(obj.get("pts", 0))
         except (TypeError, ValueError):
             return
+        if not math.isfinite(pts):                # non-finite would poison curLife -> banked skillPoints (ranks.json corruption)
+            return
         rec = RANK_DATA.setdefault(sid, {"name": PLAYER_NAMES.get(sid, sid), "points": 0})
         rec["curLife"] = round(rec.get("curLife", 0.0) + pts, 1)
         # Audit-only: the lifetime points from a capture arrive via the snap/score stream;
@@ -3520,9 +3522,12 @@ def handle_stats_line(rc, obj):
         if not sid or sid == "0":
             return
         try:
-            pts = int(round(float(obj.get("pts", 0))))
+            _raw = float(obj.get("pts", 0))
         except (TypeError, ValueError):
             return
+        if not math.isfinite(_raw):               # 'inf'/'nan' pass float() but corrupt ranks.json (inf also -> OverflowError at round)
+            return
+        pts = int(round(_raw))
         if pts == 0:
             return
         name = obj.get("n") or STATS_META.get(sid, {}).get("name") or sid
@@ -3829,13 +3834,25 @@ def _match_grant_key(elapsed, now, mission):
 
 
 def _load_grant_set(key):
-    """Set of sids already granted the start bonus for this match key (restart-safe). {} / missing -> empty."""
+    """Set of sids already granted the start bonus for this match key (restart-safe). {} / missing -> empty.
+    Unions the +/-1 start-bucket neighbours of the same mission: a restart whose (now - elapsed) jitters
+    across a 300s bucket edge must still see the original match's grants (else the +250 re-awards)."""
     try:
         with open(START_BONUS_FILE, encoding="utf-8") as f:
             d = json.load(f)
-        return set(d.get(key, [])) if isinstance(d, dict) else set()
+        if not isinstance(d, dict):
+            return set()
     except (OSError, json.JSONDecodeError):
         return set()
+    mission, sep, bucket = key.rpartition("|")
+    keys = {key}
+    if sep and bucket.lstrip("-").isdigit():      # same mission, adjacent start buckets (same match under jitter;
+        b = int(bucket)                           # a genuinely different match starts hours away -> never adjacent)
+        keys.update(f"{mission}|{b + off}" for off in (-1, 1))
+    granted = set()
+    for k in keys:
+        granted.update(d.get(k, []))
+    return granted
 
 
 def _save_grant_set(key, sids):

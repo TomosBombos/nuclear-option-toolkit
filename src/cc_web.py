@@ -10,6 +10,7 @@ Run:  python cc_web.py   then open  http://127.0.0.1:8770
 Config: apiKey.txt (Pterodactyl client key) + panel.txt (panel URL).
 """
 import json
+import math
 import os
 import re
 import ssl
@@ -237,13 +238,16 @@ _LOCAL_CMDS = [
 ]
 
 
+_HIDDEN_VERBS = {"updateready", "update-ready", "banreload", "banlist-reload", "banclear",
+                 "banlist-clear", "clearkicks", "clear-kicked-players"}   # raw ops verbs: hidden from the palette AND rejected by /api/cmd
+
+
 def _catalog():
     out = []
-    _HIDE = {"updateready", "update-ready", "banreload", "banclear", "clearkicks"}   # raw ops verbs: hidden from the public palette
     for alias, wire, args, desc, danger in getattr(bot, "CENTRE_SERVER_CMDS", []):
         if wire == "send-chat-message":   # drop the raw server 'say' - the local 'say' below
             continue                      # covers it (adds the [Admin] prefix + mirrors to activity)
-        if alias in _HIDE or wire in _HIDE:   # public ship: don't surface raw operational verbs
+        if alias in _HIDDEN_VERBS or wire in _HIDDEN_VERBS:   # public ship: don't surface raw operational verbs
             continue
         ac = ("message" if wire == "send-chat-message" else
               "steamid" if wire in ("kick-player", "unkick-player", "banlist-add", "banlist-remove") else "")
@@ -751,6 +755,16 @@ def api_missionpool():
 
 
 _SID_RE = re.compile(r"^\d{6,20}$")
+
+
+def _finite(s):
+    """Parse a user-supplied number; None unless finite ('nan'/'inf' pass float() but would
+    corrupt ranks/funds downstream)."""
+    try:
+        v = float(s)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
 
 
 @app.route("/api/reports/ban", methods=["POST"])
@@ -1277,6 +1291,8 @@ def api_cmd():
     name = (b.get("name") or "").strip()
     args = [str(a) for a in b.get("args", [])]
     sid = str(b.get("sid", "")).strip()                  # set by the player popup
+    if sid and not _SID_RE.match(sid):                   # sid reaches pipe-framed plugin_cmd files -- digits only
+        return jsonify({"ok": False, "error": "bad SteamID"})
     text = " ".join(args).strip()
     try:
         if name in ("leaderboard", "lb", "top"):

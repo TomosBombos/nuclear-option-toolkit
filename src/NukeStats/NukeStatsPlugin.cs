@@ -46,7 +46,7 @@ namespace NukeStats
     public class NukeStatsPlugin : BaseUnityPlugin
     {
         public const string Guid = "anz.nukestats";
-        public const string Version = "0.9.22";
+        public const string Version = "0.9.23";
         internal static ManualLogSource Log;
         internal static NukeStatsPlugin Instance;
 
@@ -1749,15 +1749,19 @@ namespace NukeStats
         // (plugin_bans.txt) and are enforced by kicking on sight. Defensive: failures no-op (never
         // a false kick). TK is rare/intentional in this game, so auto-enforcement is safe.
         internal static ConfigEntry<bool> TeamkillEnforce;
-        static readonly List<string> _tkQueue = new List<string>();
+        // Each queued offence carries ITS OWN victim/method/weapon (a plain sid queue was last-writer-wins:
+        // two TKs before TkTick drained misreported the first victim). method = the contract tag for the
+        // moderation report: "direct" (the killer's own trigger-pull), "splash" (one blast catching several
+        // friendlies), "auto" (SAM/CRAM/AI-tasked unit the owner never aimed), "" when unknown.
+        struct TkEvent { public string sid, victim, method, weapon; }
+        static readonly List<TkEvent> _tkQueue = new List<TkEvent>();
+        const int TK_QUEUE_MAX = 64;         // bounded (drained every TkTick; overflow only under an absurd flood)
         static readonly Dictionary<string, int> _tkCount = new Dictionary<string, int>(StringComparer.Ordinal);   // per match
         static readonly HashSet<string> _tkBanned = new HashSet<string>(StringComparer.Ordinal);                  // persistent
         static readonly HashSet<string> _tkRankZero = new HashSet<string>(StringComparer.Ordinal);               // rank 0 on next sight
         static readonly List<KeyValuePair<string, float>> _tkKicks = new List<KeyValuePair<string, float>>();    // delayed kicks
-        static readonly Dictionary<string, string> _tkLastVictim = new Dictionary<string, string>(StringComparer.Ordinal);  // killer sid -> last teammate killed (moderation log cause)
-        static readonly Dictionary<string, string> _tkLastMethod = new Dictionary<string, string>(StringComparer.Ordinal);  // killer sid -> how the last TK happened (weapon/splash/SAM/ram) for the report
-        static readonly Dictionary<string, float>  _tkLastEventAt = new Dictionary<string, float>(StringComparer.Ordinal);  // killer sid -> last time we enqueued a TK offence (per-EVENT dedup, see TK_EVENT_DEDUP)
-        const float TK_EVENT_DEDUP = 1.5f;   // one blast/event (same instigator within this window) = AT MOST one offence, even if it kills several friendlies
+        static readonly Dictionary<string, float> _tkEventStart = new Dictionary<string, float>(StringComparer.Ordinal);  // killer sid -> start of the current blast/event (per-EVENT dedup anchor)
+        const float TK_EVENT_DEDUP = 1.5f;   // one blast/event (same instigator within this window OF THE FIRST kill) = AT MOST one offence; anchored, NOT slid per victim, so a serial TK still escalates
         static System.Reflection.FieldInfo _dmgCreditFI;
         static float _nextTkScan;
 
@@ -1772,19 +1776,19 @@ namespace NukeStats
             try { File.WriteAllText(BanFilePath, string.Join("\n", _tkBanned) + "\n"); }
             catch (Exception e) { Log?.LogError("SaveBans: " + e); }
         }
-        internal static void ClearMatchTeamkills() { _tkCount.Clear(); _tkRankZero.Clear(); _tkLastVictim.Clear(); _tkLastMethod.Clear(); _tkLastEventAt.Clear(); }   // per-match reset (bans persist)
+        internal static void ClearMatchTeamkills() { _tkCount.Clear(); _tkRankZero.Clear(); _tkEventStart.Clear(); }   // per-match reset (bans persist)
 
         // Emit a teamkill-moderation event to the bot ([NOSTATS] line it tails) -> activity log + the webcc
-        // Moderation tab, recording WHAT caused the eject/kick/ban (the teammate killed + the offense count).
-        // ts=0 -> the bot stamps the real time on ingest.
-        static void EmitTkMod(string sid, Player p, string action, int count)
+        // Moderation/Reports tab, recording WHAT caused the eject/kick/ban: the teammate killed, HOW
+        // (method = "direct"/"splash"/"auto"/"" per the report contract) and WITH WHAT (weapon = the damaging
+        // unit's display name, "" when unknown). ts=0 -> the bot stamps the real time on ingest.
+        static void EmitTkMod(string sid, Player p, string action, int count, TkEvent ev)
         {
             string nm = p != null ? RawNameOf(p) : sid;
-            string victim = (_tkLastVictim.TryGetValue(sid, out var v) && !string.IsNullOrEmpty(v)) ? v : "a teammate";
-            // method = HOW the last TK happened (direct weapon vs splash vs SAM/CRAM vs ram), for the moderation report
-            string method = (_tkLastMethod.TryGetValue(sid, out var m) && !string.IsNullOrEmpty(m)) ? m : "weapon";
+            string victim = !string.IsNullOrEmpty(ev.victim) ? ev.victim : "a teammate";
             Out("{\"t\":\"tk\",\"id\":\"" + sid + "\",\"n\":\"" + Esc(nm)
-                + "\",\"victim\":\"" + Esc(victim) + "\",\"method\":\"" + Esc(method) + "\",\"count\":" + count
+                + "\",\"victim\":\"" + Esc(victim) + "\",\"method\":\"" + Esc(ev.method ?? "")
+                + "\",\"weapon\":\"" + Esc(ev.weapon ?? "") + "\",\"count\":" + count
                 + ",\"action\":\"" + action + "\",\"ts\":0}");
         }
 
@@ -1799,34 +1803,27 @@ namespace NukeStats
                 || n.Contains("flak") || n.Contains(" aa") || n.EndsWith("aa") || n.Contains("anti-air") || n.Contains("anti air");
         }
 
-        // Classify HOW a friendly kill happened from the damaging unit's name + agency, AND whether it counts as a
+        // Classify HOW a friendly kill happened from the damaging unit's name, AND whether it counts as a
         // DELIBERATE teamkill. A directly-piloted weapon (a pilot's gun/missile/bomb, a player ramming) IS
         // deliberate; an auto-engaging deployed defense (heli-dropped SAM/CRAM/AA) or an AI-tasked / strategic
         // launcher fired itself and must NOT escalate the human owner through warn->kick->BAN (the #6 innocent-ban
         // bug). Fail-open: on any ambiguity treat it as a deliberate weapon kill (preserves catch-genuine-TK).
-        // `unitName` = the damaging unit's definition.unitName (may be null/empty); `killer` non-null = a resolved
-        // human controller. Out `deliberate` => count it as an offence; returns the report-method tag.
-        static string ClassifyTkMethod(string unitName, Player killer, out bool deliberate)
+        // `unitName` = the damaging unit's definition.unitName (may be null/empty). Out `deliberate` => count it
+        // as an offence. Returns the contract method tag: "auto" / "direct" / "" (unknown unit); "splash" is
+        // upgraded later at dedup time (a second friendly victim of the same blast proves the AoE).
+        static string ClassifyTkMethod(string unitName, out bool deliberate)
         {
             deliberate = true;
             try
             {
-                string ln = !string.IsNullOrEmpty(unitName) ? unitName.ToLowerInvariant() : "";
-                bool strategic = IsStrategicLauncher(unitName);
-                bool autoDef   = IsAutoDefenseUnit(unitName);
-                if (strategic || autoDef)
+                if (IsStrategicLauncher(unitName) || IsAutoDefenseUnit(unitName))
                 {
                     deliberate = false;   // auto/AI-tasked -> report it, but do NOT escalate the owner
-                    if (ln.Contains("cram") || ln.Contains("c-ram") || ln.Contains("phalanx")) return "CRAM (auto)";
-                    if (ln.Contains("sam")) return "SAM (auto)";
-                    if (strategic) return "strategic launcher (auto)";
-                    return "AA (auto)";
+                    return "auto";
                 }
-                // Directly-piloted weapon kill. Default to "weapon" when the damaging unit name is unknown.
-                if (!string.IsNullOrEmpty(unitName)) return "weapon (" + unitName + ")";
             }
             catch { }
-            return "weapon";
+            return string.IsNullOrEmpty(unitName) ? "" : "direct";
         }
 
         static void Kick(Player p)

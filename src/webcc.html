@@ -1466,12 +1466,12 @@ async function findSettings(){
     if(hay.indexOf(q)>=0) res.push({src:'server',key:f.key,name:f.label||f.key,grp:'Server Config'});});
   if(!res.length){R.innerHTML='<div class="lbempty" style="padding:12px">No settings match.</div>';R.style.display='block';return;}
   R.innerHTML=res.slice(0,14).map(m=>
-    '<div class="palrow" tabindex="0" role="option" data-kbd="1" onclick="openFoundSetting(\''+m.src+'\',\''+encodeURIComponent(m.key)+'\')">'
+    '<div class="palrow" tabindex="0" role="option" data-kbd="1" data-src="'+m.src+'" data-key="'+esc(m.key)+'" onclick="openFoundSetting(this.dataset.src,this.dataset.key)">'
     +'<span class="n">'+esc(m.name)+'</span><span class="d">'+esc(m.grp)+'</span></div>').join('');
   R.style.display='block';
 }
-async function openFoundSetting(src,keyEnc){
-  const key=decodeURIComponent(keyEnc); const R=$('#findRes'); if(R)R.style.display='none'; $('#findSet').value='';
+async function openFoundSetting(src,key){
+  const R=$('#findRes'); if(R)R.style.display='none'; $('#findSet').value='';
   if(src==='server'){ openServerCfg(); return; }
   await openSettings();
   setView='advanced'; setCat='all'; setPending=null;
@@ -1593,7 +1593,7 @@ function setValChip(s){
 function settingMasterRow(s){
   const sel=(s.key===setSelKey);
   const restart = s.live==='restart' ? ' <span title="needs restart" style="color:#ffce7a;font-size:10px">●</span>' : '';
-  return '<div tabindex="0" role="button" data-kbd="1" onclick="selectSetting(\''+esc(s.key)+'\')" style="display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:6px;cursor:pointer;'
+  return '<div tabindex="0" role="button" data-kbd="1" data-key="'+esc(s.key)+'" onclick="selectSetting(this.dataset.key)" style="display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:6px;cursor:pointer;'
     +(sel?'background:rgba(90,160,255,.16);':'')+'">'
     +'<div style="flex:1;font-size:12.5px;'+(sel?'font-weight:700':'')+'">'+esc(s.friendlyName)+restart+'</div>'
     +setValChip(s)+'</div>';
@@ -1601,26 +1601,25 @@ function settingMasterRow(s){
 function selectSetting(key){ setSelKey=key; setPending=null; renderSettings(); }
 // the value to SHOW in a control: the staged-pending one if the user is mid-change, else the live value
 function ctrlVal(s){ return (setPending&&setPending.key===s.key)?setPending.value:s.value; }
-// NOTE: setting KEYS are restricted to [A-Za-z0-9._] (plugin/catalogue config keys), so esc()-ing them
-// inside the inline onclick string literals below is sufficient — no key can carry a quote to break out.
+// setting KEYS ride on data-key + this.dataset.key — never re-parsed as a JS string literal
 function settingControl(s){
   const key=s.key;
   const cv=ctrlVal(s);
   if(s.type==='toggle'){
     const on=(cv===true||String(cv).toLowerCase()==='true');
-    return '<button role="switch" aria-pressed="'+(on?'true':'false')+'" aria-label="'+esc(s.friendlyName)+' — currently '+(on?'on':'off')+'" onclick="stageChange(\''+esc(key)+'\',\''+(on?'false':'true')+'\')" style="min-width:64px;border:1px solid var(--bd);border-radius:6px;cursor:pointer;padding:7px 13px;font-weight:700;background:'+(on?'#0c3a24':'#3a1414')+';color:'+(on?'#5df2a0':'#ff9a9a')+'">'+(on?'ON':'OFF')+'</button>';
+    return '<button role="switch" aria-pressed="'+(on?'true':'false')+'" aria-label="'+esc(s.friendlyName)+' — currently '+(on?'on':'off')+'" data-key="'+esc(key)+'" onclick="stageChange(this.dataset.key,\''+(on?'false':'true')+'\')" style="min-width:64px;border:1px solid var(--bd);border-radius:6px;cursor:pointer;padding:7px 13px;font-weight:700;background:'+(on?'#0c3a24':'#3a1414')+';color:'+(on?'#5df2a0':'#ff9a9a')+'">'+(on?'ON':'OFF')+'</button>';
   } else if(s.type==='int'||s.type==='float'){
     const step=s.type==='float'?'any':'1';
     const mn=(s.min!==undefined&&s.min!=='')?' min="'+esc(String(s.min))+'"':'';
     const mx=(s.max!==undefined&&s.max!=='')?' max="'+esc(String(s.max))+'"':'';
-    return '<input type="number" value="'+esc(String(cv))+'" step="'+step+'"'+mn+mx+' onchange="stageChange(\''+esc(key)+'\',this.value)" style="width:130px;background:#0a0f17;border:1px solid var(--bd);border-radius:6px;color:var(--txt);padding:7px 9px;font-size:14px">';
+    return '<input type="number" value="'+esc(String(cv))+'" step="'+step+'"'+mn+mx+' data-key="'+esc(key)+'" onchange="stageChange(this.dataset.key,this.value)" style="width:130px;background:#0a0f17;border:1px solid var(--bd);border-radius:6px;color:var(--txt);padding:7px 9px;font-size:14px">';
   } else if(s.type==='enum'){
     const opts=(s.options||[]);
-    return '<select onchange="stageChange(\''+esc(key)+'\',this.value)" style="min-width:160px;background:#0a0f17;border:1px solid var(--bd);border-radius:6px;color:var(--txt);padding:7px 9px;font-size:14px">'
+    return '<select data-key="'+esc(key)+'" onchange="stageChange(this.dataset.key,this.value)" style="min-width:160px;background:#0a0f17;border:1px solid var(--bd);border-radius:6px;color:var(--txt);padding:7px 9px;font-size:14px">'
       +(opts.some(o=>String(o)===String(cv))?'':'<option value="" selected>— choose —</option>')
       +opts.map(o=>'<option value="'+esc(String(o))+'"'+(String(cv)===String(o)?' selected':'')+'>'+esc(String(o))+'</option>').join('')+'</select>';
   }
-  return '<input type="text" value="'+esc(String(cv==null?'':cv))+'" onchange="stageChange(\''+esc(key)+'\',this.value)" style="width:100%;max-width:340px;background:#0a0f17;border:1px solid var(--bd);border-radius:6px;color:var(--txt);padding:7px 9px">';
+  return '<input type="text" value="'+esc(String(cv==null?'':cv))+'" data-key="'+esc(key)+'" onchange="stageChange(this.dataset.key,this.value)" style="width:100%;max-width:340px;background:#0a0f17;border:1px solid var(--bd);border-radius:6px;color:var(--txt);padding:7px 9px">';
 }
 function stageChange(key,value){ setPending={key:key,value:value}; renderSetDetail(); }
 function cancelChange(){ setPending=null; renderSetDetail(); }
@@ -1923,8 +1922,8 @@ function _missionCatRows(filterFn){
     const list=cats[c], onN=list.filter(m=>m.on).length;
     h+='<div style="display:flex;align-items:center;gap:8px;margin:12px 0 5px"><b style="color:var(--ac);font-size:12px">'+esc(c)+'</b>'
       +'<span class="dim" style="font-size:11px">'+onN+'/'+list.length+' on</span><span class="sp"></span>'
-      +'<button class="sm" onclick="toggleMissionCat(\''+esc(c)+'\',true)">all on</button>'
-      +'<button class="sm" onclick="toggleMissionCat(\''+esc(c)+'\',false)">all off</button></div>';
+      +'<button class="sm" data-cat="'+esc(c)+'" onclick="toggleMissionCat(this.dataset.cat,true)">all on</button>'
+      +'<button class="sm" data-cat="'+esc(c)+'" onclick="toggleMissionCat(this.dataset.cat,false)">all off</button></div>';
     for(const m of list){ const idx=missionPool.indexOf(m);
       h+='<div style="display:flex;align-items:center;gap:10px;padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.05)">'
         +'<div style="flex:1;font-size:12.5px;'+(m.on?'':'opacity:.5')+'">'+esc(m.label)+'</div>'
@@ -2007,7 +2006,7 @@ function renderSysMessages(){
   if(!sysMessages||!sysMessages.length){ L.innerHTML='<div class="dim" style="padding:8px 4px">activates when the bot restarts (bundled for the next update).</div>'; return; }
   L.innerHTML=sysMessages.map(m=>{
     const on=m.enabled!==false;
-    const tog='<button onclick="sysMsgSet(\''+esc(m.key)+'\',{enabled:'+(on?'false':'true')+'})" style="min-width:54px;border:1px solid var(--bd);border-radius:6px;cursor:pointer;padding:4px 9px;font-weight:700;background:'+(on?'#0c3a24':'#3a1414')+';color:'+(on?'#5df2a0':'#ff9a9a')+'">'+(on?'ON':'OFF')+'</button>';
+    const tog='<button data-sk="'+esc(m.key)+'" onclick="sysMsgSet(this.dataset.sk,{enabled:'+(on?'false':'true')+'})" style="min-width:54px;border:1px solid var(--bd);border-radius:6px;cursor:pointer;padding:4px 9px;font-weight:700;background:'+(on?'#0c3a24':'#3a1414')+';color:'+(on?'#5df2a0':'#ff9a9a')+'">'+(on?'ON':'OFF')+'</button>';
     let extra='';
     if(m.has_delay) extra+='<label class="msgfl">Delay <input type="number" min="0" max="120" value="'+esc(String(Math.round(m.delay||0)))+'" data-sk="'+esc(m.key)+'" data-sf="delay" onchange="sysMsgFromInput(this)" class="schin" style="width:60px">s</label>';
     if(m.has_interval) extra+='<label class="msgfl">Every <input type="number" min="1" value="'+esc(String(Math.max(1,Math.round((m.interval||0)/60))))+'" data-sk="'+esc(m.key)+'" data-sf="interval_min" onchange="sysMsgFromInput(this)" class="schin" style="width:62px">min</label>';
@@ -2050,7 +2049,7 @@ function renderHelpEditor(){
     rows.forEach(r=>{
       const taId='he_'+r.cmd, shown=r.shown!==false, lock=!!r.gate_locked;
       const col=(/^#[0-9a-fA-F]{6}$/.test(r.color||'')?r.color:'#cfd8e3');   // bot-sourced, but guard the hex
-      const tog='<button '+(lock?'disabled title="always managed by the votemap / help system"':'onclick="helpGate(\''+esc(r.cmd)+'\','+(shown?'false':'true')+')"')
+      const tog='<button data-cmd="'+esc(r.cmd)+'" '+(lock?'disabled title="always managed by the votemap / help system"':'onclick="helpGate(this.dataset.cmd,'+(shown?'false':'true')+')"')
         +' style="min-width:64px;border:1px solid var(--bd);border-radius:6px;cursor:'+(lock?'default':'pointer')+';padding:4px 9px;font-weight:700;opacity:'+(lock?'.5':'1')
         +';background:'+(shown?'#0c3a24':'#3a1414')+';color:'+(shown?'#5df2a0':'#ff9a9a')+'">'+(shown?'SHOWN':'HIDDEN')+'</button>';
       const dt=(r.label_default||'').replace(/<[^>]+>/g,'');
@@ -2297,7 +2296,7 @@ function renderBanned(){
     h+='<tr style="border-top:1px solid var(--bd2)"><td>'+esc(p.name||'(unknown)')+'</td>'
       +'<td class="mono" style="font-size:11px;color:var(--dim)">'+esc(p.id||'')+'</td>'
       +'<td class="dim" style="font-size:11px">'+esc(lists)+'</td>'
-      +'<td style="text-align:right"><button class="sm" onclick="unbanPlayer(\''+esc(String(p.id||'')).replace(/'/g,"\\'")+'\')">Unban</button></td></tr>';
+      +'<td style="text-align:right"><button class="sm" data-sid="'+esc(String(p.id||''))+'" onclick="unbanPlayer(this.dataset.sid)">Unban</button></td></tr>';
   }
   L.innerHTML=h+'</tbody></table>';
 }
@@ -2320,7 +2319,7 @@ function renderReports(){
   const blog=banLog||[]; const blBy={}; blog.forEach(function(x){blBy[x.id]=x;});
   // change-detection: the moderation overlay re-calls this every ~1s poll; without a guard the whole
   // innerHTML (incl. the Clear-all button) was rebuilt each tick -> a slow ~1Hz flash. Skip if unchanged.
-  const _sig=JSON.stringify([(serverReports||[]).map(function(r){return [r.seq,r.id,r.banned,r.action,r.method,r.count,r.rate,r.ts];}),
+  const _sig=JSON.stringify([(serverReports||[]).map(function(r){return [r.seq,r.id,r.banned,r.action,r.method,r.weapon,r.count,r.rate,r.ts];}),
                              blog.map(function(x){return [x.id,x.count,x.last_ts];})]);
   if(_sig===repSig)return; repSig=_sig;
   let h='';
@@ -2337,15 +2336,15 @@ function renderReports(){
         :r.action==='warn'?'<span style="color:var(--warn)">warned + ejected</span>'
         :'<span class="dim">flagged</span>';
       const banBtn=r.banned
-        ? '<button class="sm" onclick="repBan(\''+esc(String(r.id||'')).replace(/'/g,"\\'")+'\',true)">Unban</button>'
-        : '<button class="sm bad" onclick="repBan(\''+esc(String(r.id||'')).replace(/'/g,"\\'")+'\',false)">Ban</button>';
+        ? '<button class="sm" data-sid="'+esc(String(r.id||''))+'" onclick="repBan(this.dataset.sid,true)">Unban</button>'
+        : '<button class="sm bad" data-sid="'+esc(String(r.id||''))+'" onclick="repBan(this.dataset.sid,false)">Ban</button>';
       const bl=blBy[r.id];
       h+='<tr style="border-top:1px solid var(--bd2)">'
         +'<td class="mono" style="color:var(--dim)">'+esc(tm)+'</td>'
         +'<td>'+esc(r.name||'?')+(bl?(' <span style="color:var(--bad);font-size:10px;font-weight:700" title="times logged in the ban log">⛔'+bl.count+'×</span>'):'')+'</td>'
         +'<td class="mono" style="font-size:11px;color:var(--dim)">'+esc(r.id||'')+'</td>'
         +'<td>'+esc(repReasonLabel(r.reason))+'</td>'
-        +'<td class="dim" style="font-size:11px">'+(r.method?esc(r.method):'—')+'</td>'
+        +'<td class="dim" style="font-size:11px">'+(esc((r.method||'')+(r.weapon?((r.method?' · ':'')+r.weapon):''))||'—')+'</td>'
         +'<td class="mono">'+(r.rate?(r.count||0):'—')+'</td>'
         +'<td class="mono">'+(r.rate?(r.rate+'/s'):'—')+'</td>'
         +'<td>'+act+(r.banned?' · <span style="color:var(--bad)">BAN</span>':'')+'</td>'
@@ -2363,7 +2362,7 @@ function renderReports(){
         +'<td style="font-weight:700;color:'+(x.count>1?'var(--bad)':'var(--dim)')+'">'+x.count+'×</td>'
         +'<td class="dim" style="font-size:11px">'+esc(x.last_reason||'')+'</td>'
         +'<td class="mono dim" style="font-size:11px">'+esc(lt)+'</td>'
-        +'<td style="text-align:right;white-space:nowrap"><button class="sm" aria-label="Remove from ban log" onclick="rmBanLog(\''+esc(String(x.id||'')).replace(/'/g,"\\'")+'\')" title="Remove this player from the ban log (does NOT unban them)">🗑</button></td></tr>';
+        +'<td style="text-align:right;white-space:nowrap"><button class="sm" aria-label="Remove from ban log" data-sid="'+esc(String(x.id||''))+'" onclick="rmBanLog(this.dataset.sid)" title="Remove this player from the ban log (does NOT unban them)">🗑</button></td></tr>';
     }
     h+='</tbody></table></div>';
   }
