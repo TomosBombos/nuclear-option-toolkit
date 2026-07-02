@@ -403,6 +403,8 @@ def _strip_color(s):
 CONSOLE_MIRROR_FILE  = os.path.join(_BASE_DIR, "console_mirror.log")
 DASHBOARD_STATE_FILE = os.path.join(_BASE_DIR, "dashboard_state.json")
 ADMIN_CMD_FILE       = os.path.join(_BASE_DIR, "admin_commands.jsonl")  # command-centre admin queue (e.g. grant points)
+ADMIN_CMD_OFFSET_FILE = os.path.join(_BASE_DIR, "admin_commands.offset")  # persisted consume-offset: queue survives bot restarts
+ADMIN_CMD_MAX_AGE    = 900   # skip queued commands older than this (s) — replay-safety if the offset file is lost
 STATE_WRITE_INTERVAL = 1          # rewrite dashboard_state.json every 1s so the web map picks up
                                  # the plugin's position feed (~2s) promptly; the webcc interpolates
                                  # between anchors at 60fps for a smooth map regardless of this cadence.
@@ -953,6 +955,10 @@ _VOTEMAP_DEFAULTS = {
     "force_pvp_players": 24,         # ... once at least this many players are online
     "force_pvp_coop":    0,          # co-op maps while forcing (0 = PvP-only)
     "force_pvp_pvp":     6,          # PvP modes while forcing (capped by how many are enabled)
+    "coop_minutes":      180,        # match length (min) the bot assigns to co-op / custom maps (10800s=180 was fixed)
+    "builtin_minutes":   180,        # match length (min) the bot assigns to BUILT-IN ops/scenarios — set this
+                                     # to ~180 so a built-in isn't stuck on its 2h server default, leaving the
+                                     # bot room to end a timed-out match and open the next-map vote.
 }
 _COOP_CATEGORIES = ("Escalation", "Terminal Control", "Built-in Co-op", "Custom")   # weightable co-op pool keys
 
@@ -1040,6 +1046,8 @@ _VOTEMAP_INT_BOUNDS = {
     "force_pvp_players": (1, 200),
     "force_pvp_coop":    (0, 12),
     "force_pvp_pvp":     (0, len(PVP_OPTIONS)),
+    "coop_minutes":      (10, 600),
+    "builtin_minutes":   (10, 600),
 }
 _VOTEMAP_BOOL_KEYS = ("enabled", "include_pvp", "include_custom", "force_pvp_enabled")
 _VOTEMAP_ALIASES   = {"ballot_size": "coop_count", "mode": "coop_mode"}
@@ -1093,6 +1101,19 @@ def set_votemap_cfg(key, value):
     except OSError:
         return False
     return True
+
+
+def mission_max_time(name):
+    """Match length (SECONDS) the bot assigns to a mission NAME when it queues it. Built-in ops/
+    scenarios and co-op/custom maps have INDEPENDENT operator-set timers (votemap_config
+    builtin_minutes / coop_minutes), so a built-in can be given the same ~3h the co-op maps get
+    instead of running on the server's 2h default. Clamped 10min..10h; falls back to MISSION_MAX_TIME."""
+    is_builtin = name in PVP_MISSIONS or name in BUILTIN_COOP_MISSIONS or name in MISSION_KEY_CANDIDATES
+    mins = _votemap_cfg().get("builtin_minutes" if is_builtin else "coop_minutes")
+    try:
+        return max(10, min(600, int(mins))) * 60
+    except (TypeError, ValueError):
+        return MISSION_MAX_TIME
 
 
 def votemap_cfg_state():
@@ -2246,7 +2267,7 @@ def help_state():
 
 def _as_ballot(missions):
     """Turn an ordered list of mission names into a {"1": (...), ...} ballot."""
-    return {str(i): (MISSION_GROUP, n, MISSION_MAX_TIME, friendly_label(n))
+    return {str(i): (MISSION_GROUP, n, mission_max_time(n), friendly_label(n))
             for i, n in enumerate(missions, start=1)}
 
 
@@ -2323,8 +2344,8 @@ def _ballot_entry(name):
     label = _PVP_LABEL.get(name) or friendly_label(name)
     if name in MISSION_KEY_CANDIDATES:
         g, n = _mission_key(name)        # verified wire Key (or best guess for an unverified pin)
-        return (g, n, MISSION_MAX_TIME, label)
-    return (mission_group(name), name, MISSION_MAX_TIME, label)
+        return (g, n, mission_max_time(name), label)
+    return (mission_group(name), name, mission_max_time(name), label)
 
 
 def _coop_cat(name):
@@ -2567,7 +2588,7 @@ def _resolve_mission_key(rc, name):
         return _mission_key(name)
     for g, n in MISSION_KEY_CANDIDATES[name]:
         try:
-            rc.set_next_mission(g, n, MISSION_MAX_TIME)
+            rc.set_next_mission(g, n, mission_max_time(name))
             r = rc.send("get-mission-rotation")
             k = {}
             if isinstance(r, dict) and r.get("hasNextOverride"):
@@ -2611,7 +2632,7 @@ def force_change_map(rc, name):
         group, wire = key
     else:
         group, wire = mission_group(name), name
-    rc.set_next_mission(group, wire, MISSION_MAX_TIME)       # queue it (3h)
+    rc.set_next_mission(group, wire, mission_max_time(name))  # queue it (configured per-type length)
     CURRENT_MISSION = friendly_label(wire)                   # keep the warn-dedupe key stable
     rc.set_time_remaining(ROLLOVER_SECONDS)                  # force the cut now (same as a !votemap force-switch)
     rc.say(f"<color=#55FF55>Admin changed the map -> {friendly_label(name)}</color>")
@@ -3197,6 +3218,18 @@ def queue_welcome(sid, name, delay=None):
     if not sid or sid in WELCOMED or sid in WELCOME_QUEUE:
         return
     WELCOME_QUEUE[sid] = (time.time() + delay, name)
+
+
+def seed_welcomed_on_restart(current):
+    """FIRST roster poll after a bot restart: everyone in `current` was already online
+    through the restart, so mark the ones whose names we know as welcomed -- WELCOMED
+    starts empty each run, and without this the SECOND poll re-welcomes the whole
+    server. Unnamed+unranked sids stay unseeded on purpose: a brand-new player who
+    joined during the bot's downtime still gets their one welcome once their name
+    syncs (same name test as the welcome loop, so the seed suppresses exactly the
+    sids that loop would have re-welcomed)."""
+    WELCOMED.update(sid for sid in current
+                    if PLAYER_NAMES.get(sid) or RANK_DATA.get(sid, {}).get("name"))
 
 
 def say_welcome(rc, sid, name):
@@ -4059,7 +4092,13 @@ def process_admin_commands(rc):
             _admin_cmd_offset = f.tell()
     except OSError:
         return
+    try:                                         # persist the consume-offset: commands queued while the
+        with open(ADMIN_CMD_OFFSET_FILE, "w", encoding="utf-8") as _of:   # bot is down are picked up on restart
+            _of.write(str(_admin_cmd_offset))
+    except OSError:
+        pass
     did_changemap = False
+    _now_q = time.time()
     for line in data.splitlines():
         line = line.strip()
         if not line:
@@ -4067,6 +4106,10 @@ def process_admin_commands(rc):
         try:
             cmd = json.loads(line)
         except ValueError:
+            continue
+        _cts = cmd.get("ts")
+        if isinstance(_cts, (int, float)) and (_now_q - _cts) > ADMIN_CMD_MAX_AGE:
+            print(f"[admin] skipping stale queued command ({cmd.get('action')}, {int(_now_q - _cts)}s old)")
             continue
         if cmd.get("action") == "grant":
             admin_grant(rc, cmd)
@@ -4214,8 +4257,16 @@ def process_admin_commands(rc):
             try:
                 r = set_server_config(cmd.get("key", ""), cmd.get("value", ""))
                 if not r.get("ok"):
+                    # LOUD failure: into the activity feed AND last_set so the webcc shows a red
+                    # per-field badge within ~1s. A save that failed must never look successful.
+                    activity(f"Server config REJECTED: {cmd.get('key')}: {r.get('error')}", "!")
+                    _srvcfg_cache["last_set"] = {"ok": False, "key": cmd.get("key", ""),
+                                                 "error": r.get("error"), "ts": time.time()}
                     print(f"[admin] setserverconfig {cmd.get('key')}: {r.get('error')}")
             except Exception as e:                # noqa: BLE001
+                activity(f"Server config REJECTED: {cmd.get('key')}: {e}", "!")
+                _srvcfg_cache["last_set"] = {"ok": False, "key": cmd.get("key", ""),
+                                             "error": str(e), "ts": time.time()}
                 print(f"[admin] setserverconfig error: {e}")
         elif cmd.get("action") == "sysmsg":             # webcc Messages tab: edit a built-in automated message
             try:
@@ -4931,6 +4982,7 @@ def main():
     known_online = set()        # steamids seen online last poll (for join announces)
     seeded_online = False       # skip the first poll so we don't "welcome" everyone
     server_up = True            # connection health, for clean up/down activity lines
+    _down_since = 0.0           # when the relay went down (>=20s down + reconnect => real restart, see srvcfg check)
     last_thanks_at = time.time()  # last "thanks for playing" message (+10min)
     last_leaderboard_at = time.time()  # last auto leaderboard post (+30min during a match)
     last_spectip_at = time.time()      # last spectator/team-switch tip (+12min)
@@ -4947,13 +4999,25 @@ def main():
     # seed the current mission name (best effort) so the first match record is labelled
     refresh_current_mission(rc)
 
-    # start applying command-centre admin actions from NOW (skip any stale queued lines
-    # left over from before this bot started; new grants written after this are processed)
+    # Resume the admin queue from the PERSISTED offset so commands queued during a bot restart are
+    # no longer silently discarded (the old skip-to-EOF lost every click in a restart window — the
+    # bot restarts many times a day). A per-command 15-min staleness guard in process_admin_commands
+    # keeps genuinely old lines from replaying if the offset file is lost/stale.
     global _admin_cmd_offset
     try:
-        _admin_cmd_offset = os.path.getsize(ADMIN_CMD_FILE)
+        size_now = os.path.getsize(ADMIN_CMD_FILE)
     except OSError:
-        _admin_cmd_offset = 0
+        size_now = 0
+    _admin_cmd_offset = size_now
+    try:
+        with open(ADMIN_CMD_OFFSET_FILE, encoding="utf-8") as _of:
+            saved = int(_of.read().strip() or 0)
+        if 0 <= saved <= size_now:
+            _admin_cmd_offset = saved
+            if saved < size_now:
+                print(f"[admin] resuming queue from saved offset {saved} (catching up {size_now - saved} bytes queued while the bot was down)")
+    except (OSError, ValueError):
+        pass
 
     def open_map_vote(context):
         nonlocal votes, first_vote_at, vote_ends_at, vote_context, state
@@ -5229,6 +5293,15 @@ def main():
                 if not server_up:
                     server_up = True
                     activity("Reconnected to the server", "OK")
+                    # back after a REAL stop (>=20s down) => the game (re)loaded its config: verify the
+                    # pending "restart to apply" config values survived + clear their badges (re-apply
+                    # once if a panel re-templating boot reverted one). Short relay blips don't count.
+                    if _down_since and (now - _down_since) >= 20:
+                        try:
+                            srvcfg_after_restart_check()
+                        except Exception as _e:    # noqa: BLE001
+                            print(f"[srvcfg] post-restart check failed: {_e}")
+                    _down_since = 0.0
                 players = [p for p in (resp.get("Players") or resp.get("players") or [])
                            if isinstance(p, dict)]
                 # keep the per-sid roster (faction + name) fresh for the dashboard table
@@ -5267,10 +5340,12 @@ def main():
                         activity(f"{nm_l} left   -  {len(current)} online", "LEFT")
                 else:
                     seeded_online = True
+                    seed_welcomed_on_restart(current)   # a restart must not re-welcome everyone
                     activity(f"{len(current)} player(s) currently online", "INFO")
                 known_online = current
             elif server_up:
                 server_up = False
+                _down_since = now
                 activity("Lost connection to the server - retrying every few seconds...", "!")
 
         # every 10 min while players are on + idle: friendly reminder of the commands.
@@ -6399,15 +6474,24 @@ _SRVCFG_MAP = {k: (lbl, typ, mask, nr, note) for (k, lbl, typ, mask, nr, note) i
 _srvcfg_cache = {"ok": False, "err": "not loaded yet", "ts": 0, "values": {}, "last_set": None}
 
 
-def _srvcfg_walk(d, dotted, set_to=_SRVCFG_UNSET):
+def _srvcfg_walk(d, dotted, set_to=_SRVCFG_UNSET, create=False):
+    """Get/set a dotted-path leaf. With create=True (writes only), missing intermediate dicts and the
+    leaf are CREATED — a config born from a slim installer template lacks optional keys (VoteKick.*,
+    PostMissionDelay, ...) and refusing to add them made every save of those fields silently fail."""
     parts = dotted.split(".")
     cur = d
     for p in parts[:-1]:
-        if not isinstance(cur, dict) or p not in cur:
+        if not isinstance(cur, dict):
             return None
+        if p not in cur:
+            if not (create and set_to is not _SRVCFG_UNSET):
+                return None
+            cur[p] = {}
         cur = cur[p]
     last = parts[-1]
-    if not isinstance(cur, dict) or last not in cur:
+    if not isinstance(cur, dict):
+        return None
+    if last not in cur and not (create and set_to is not _SRVCFG_UNSET):
         return None
     if set_to is not _SRVCFG_UNSET:
         cur[last] = set_to
@@ -6464,7 +6548,72 @@ def server_config_state():
                "note": note, "value": vals.get(k)}
               for (k, lbl, typ, mask, nr, note) in _SRVCFG_SCHEMA]
     return {"ok": _srvcfg_cache.get("ok"), "err": _srvcfg_cache.get("err"),
-            "ts": _srvcfg_cache.get("ts"), "fields": fields, "last_set": _srvcfg_cache.get("last_set")}
+            "ts": _srvcfg_cache.get("ts"), "fields": fields, "last_set": _srvcfg_cache.get("last_set"),
+            "pending_restart": {k: {"ts": v.get("ts")} for k, v in _srvcfg_pending_load().items()}}
+
+
+# ── per-field "saved — pending restart" state (PERSISTED, survives bot restarts) ────────────────
+# Written on every successful set of a needs_restart field; verified + cleared when the game server
+# comes back after a real stop (>=20s down). If a re-templating boot REVERTED the file value, we say
+# so loudly and re-apply ONCE. Passwords are recorded with value=None (never persisted to disk).
+SRVCFG_PENDING_FILE = os.path.join(_BASE_DIR, "srvcfg_pending.json")
+
+
+def _srvcfg_pending_load():
+    try:
+        with open(SRVCFG_PENDING_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _srvcfg_pending_save(d):
+    try:
+        tmp = SRVCFG_PENDING_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=1)
+        os.replace(tmp, SRVCFG_PENDING_FILE)
+    except OSError:
+        pass
+
+
+def srvcfg_after_restart_check():
+    """Called when the game server comes back after a real stop: verify every pending needs_restart
+    value is still in the config file (a panel re-templating boot can revert it), clear the pending
+    flags, and re-apply ONCE if a value was reverted. Loud either way."""
+    pending = _srvcfg_pending_load()
+    if not pending:
+        return
+    cfg, err = _srvcfg_read()
+    if err:
+        print(f"[srvcfg] post-restart pending check skipped (read failed: {err})")
+        return
+    remaining = {}
+    for key, rec in pending.items():
+        want = rec.get("value")
+        have = _srvcfg_walk(cfg, key)
+        lbl = (_SRVCFG_MAP.get(key) or (key,))[0]
+        if want is None:                       # masked (password): can't verify content — just clear
+            activity(f"Server config: {lbl} applied by the restart", "ADMIN")
+            continue
+        if have == want:
+            activity(f"Server config: {lbl} verified in config after the restart - now active", "ADMIN")
+            continue
+        if rec.get("reapplied"):
+            activity(f"Server config: {lbl} REVERTED AGAIN after re-apply (panel keeps overwriting it) - "
+                     f"set it in the gpanel startup variables instead", "!")
+            continue
+        activity(f"Server config: {lbl} was REVERTED by the restart (panel re-templating) - re-applying", "!")
+        res = set_server_config(key, want)
+        if res.get("ok"):
+            rec["reapplied"] = True
+            rec["ts"] = time.time()
+            remaining[key] = rec
+        else:
+            activity(f"Server config: re-apply of {lbl} FAILED: {res.get('error')}", "!")
+    _srvcfg_pending_save(remaining)
+    refresh_server_config()
 
 
 def _srvcfg_panel_mirror(key, old, new):
@@ -6479,8 +6628,18 @@ def _srvcfg_panel_mirror(key, old, new):
         attrs = [v.get("attributes", {}) for v in d.get("data", [])]
     except Exception as e:                         # noqa: BLE001
         return {"mirrored": False, "reason": f"list: {e}"}
-    olds = str(old)
-    target = next((a for a in attrs if a.get("is_editable") and str(a.get("server_value")) == olds), None)
+    # 1st: explicit env-var names for the common egg fields (value-matching can hit the wrong var
+    # on coincidental values, and can NEVER match bools: Python str(False) != panel "false").
+    known = {"ServerName": "SERVER_NAME", "MaxPlayers": "MAX_PLAYERS", "Password": "SERVER_PASSWORD",
+             "Port.Value": "SERVER_PORT", "QueryPort.Value": "QUERY_PORT"}
+    target = None
+    if key in known:
+        target = next((a for a in attrs if a.get("is_editable")
+                       and str(a.get("env_variable", "")).upper() == known[key]), None)
+    if target is None:                             # fallback: match by current value, bool-normalized
+        olds = str(old)
+        target = next((a for a in attrs if a.get("is_editable")
+                       and str(a.get("server_value")).lower() == olds.lower()), None)
     if target is None:
         return {"mirrored": False, "reason": "no editable panel variable matched (config-file only)"}
     try:
@@ -6740,18 +6899,44 @@ def set_server_config(key, value):
     except Exception as e:                         # noqa: BLE001
         return {"ok": False, "error": f"sftp: {e}"}
     old = None
+    created = False
     try:
         with sftp.open(SRVCFG_PATH, "rb") as f:
             orig_text = f.read().decode("utf-8")
         cfg = json.loads(orig_text)
         old = _srvcfg_walk(cfg, key)
-        if _srvcfg_walk(cfg, key, set_to=coerced) is None:
-            return {"ok": False, "error": f"field {key} not present in config"}
+        created = old is None
+        if _srvcfg_walk(cfg, key, set_to=coerced, create=True) is None:
+            return {"ok": False, "error": f"could not set {key} (config shape unexpected)"}
         os.makedirs(BACKUP_DIR, exist_ok=True)
-        with open(os.path.join(BACKUP_DIR, "DedicatedServerConfig.beforeedit.json"), "w", encoding="utf-8") as bf:
+        bname = "DedicatedServerConfig.beforeedit." + time.strftime("%Y%m%d-%H%M%S") + ".json"
+        with open(os.path.join(BACKUP_DIR, bname), "w", encoding="utf-8") as bf:
             bf.write(orig_text)
-        with sftp.open(SRVCFG_PATH, "wb") as f:
-            f.write(json.dumps(cfg, indent=2).encode("utf-8"))
+        try:                                          # prune: keep the newest 5 timestamped backups
+            baks = sorted(fn for fn in os.listdir(BACKUP_DIR)
+                          if fn.startswith("DedicatedServerConfig.beforeedit.") and fn.endswith(".json"))
+            for fn in baks[:-5]:
+                os.remove(os.path.join(BACKUP_DIR, fn))
+        except OSError:
+            pass
+        new_text = json.dumps(cfg, indent=2)
+        tmp_path = SRVCFG_PATH + ".tmp"
+        with sftp.open(tmp_path, "wb") as f:          # atomic-ish: full write to a temp, then rename over
+            f.write(new_text.encode("utf-8"))
+        try:
+            sftp.posix_rename(tmp_path, SRVCFG_PATH)
+        except (AttributeError, IOError):
+            try:
+                sftp.remove(SRVCFG_PATH)
+            except IOError:
+                pass
+            sftp.rename(tmp_path, SRVCFG_PATH)
+        # VERIFY-AFTER-WRITE: re-read the file and confirm the value actually landed. A save that
+        # didn't land must FAIL LOUDLY, never look successful.
+        with sftp.open(SRVCFG_PATH, "rb") as f:
+            reread = json.loads(f.read().decode("utf-8"))
+        if _srvcfg_walk(reread, key) != coerced:
+            return {"ok": False, "error": f"verify failed: file does not show the new value after write"}
     except Exception as e:                         # noqa: BLE001
         return {"ok": False, "error": f"write: {e}"}
     finally:
@@ -6765,10 +6950,16 @@ def set_server_config(key, value):
         pass
     panel = _srvcfg_panel_mirror(key, old, coerced)
     refresh_server_config()
-    res = {"ok": True, "key": key, "needs_restart": nr, "panel": panel, "ts": time.time()}
+    res = {"ok": True, "key": key, "needs_restart": nr, "panel": panel, "ts": time.time(), "created": created}
     _srvcfg_cache["last_set"] = res
+    if nr:                                          # persist the per-field "pending restart" flag
+        pend = _srvcfg_pending_load()
+        pend[key] = {"value": (None if mask else coerced), "ts": time.time()}
+        _srvcfg_pending_save(pend)
     activity(f"Server config: {lbl} -> {'********' if mask else coerced}"
-             + (f" (synced to gpanel: {panel.get('var')})" if panel.get("mirrored") else ""), "ADMIN")
+             + (" (field added to config)" if created else "")
+             + (f" (synced to gpanel: {panel.get('var')})" if panel.get("mirrored") else "")
+             + (" - applies after a server restart" if nr else ""), "ADMIN")
     return res
 
 

@@ -174,13 +174,14 @@ def _latest_release(repo, channel="stable", token=None):
     rels = _get("https://api.github.com/repos/%s/releases" % repo, token=token)
     if not isinstance(rels, list):
         return None
-    for rel in rels:                                  # releases are newest-first
-        if rel.get("draft"):
-            continue
-        if channel == "stable" and rel.get("prerelease"):
-            continue                                   # stable skips pre-releases; nightly takes them
-        return rel
-    return None
+    eligible = [r for r in rels if not r.get("draft")
+                and not (channel == "stable" and r.get("prerelease"))]  # stable skips pre-releases
+    if not eligible:
+        return None
+    # Pick by highest (version, date) parsed from the tag — NOT by GitHub's release ordering.
+    # Defence in depth: if a version-bumped run ever leaves an OLDER same-date nightly live, the
+    # updater must never mistake the older one for "latest" just because of publish timing.
+    return max(eligible, key=lambda r: _vt(r.get("tag_name") or r.get("name") or ""))
 
 
 def _asset(rel, name):
@@ -468,7 +469,8 @@ def update(components=("plugin", "bot", "webcc", "installer"), channel_override=
             else:
                 result["plugin"] = "STAGED -- run.bat not found, run your deploy command to install"
         else:
-            result["plugin"] = "STAGED -- install with: run.bat --deploy-plugin (restarts the match)"
+            result["plugin"] = ("STAGED -- install with: run.bat --deploy-plugin, the web CC's "
+                                "⏱ Schedule, or START HERE\\3. Deploy Staged Update (restarts the match)")
     if "bot" in did and do_apply:
         _apply_bot(latest)
         result["bot"] = "APPLIED %s -- restart the bot to load it" % latest

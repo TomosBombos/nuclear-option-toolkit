@@ -653,7 +653,7 @@ const cpuHist=[],memHist=[];
 
 async function jget(u){const r=await fetch(u);return r.json();}
 var _settleAt=0;function settle(){_settleAt=Date.now()+10000;}   // after a user change, hold the ~1s poll from re-rendering the editable panels with the dashboard's OLD value. The admin round trip is queue-file -> bot loop -> dashboard write -> next poll = 2-5s+ (worse when the SFTP console poll stalls), so 10s: an optimistic edit must NEVER flicker back mid-flight; if the bot is truly down the panels honestly resync after the window.
-async function jpost(u,b){settle();const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});return r.json();}
+async function jpost(u,b,o){if(!(o&&o.nosettle))settle();const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});return r.json();}
 function getCSS(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
 function facClass(f){return /bosc/i.test(f)?'bdf':/prim|pala/i.test(f)?'pala':'';}
 function facColor(f){return /bosc/i.test(f)?getCSS('--bdf'):/prim|pala/i.test(f)?getCSS('--pala'):'#9aa';}
@@ -1194,7 +1194,7 @@ async function tick(){const _g=(tick._gen=(tick._gen||0)+1);try{
   if($('#repOv').classList.contains('on')){ if($('#banPane')&&$('#banPane').style.display!=='none')renderBanned(); else renderReports(); }
   if(st.sys_messages&&Date.now()>=_settleAt){sysMessages=st.sys_messages;if($('#msgOv').classList.contains('on'))renderSysMessages();}
   if(st.help_config&&Date.now()>=_settleAt){helpCfg=st.help_config;if($('#msgOv').classList.contains('on'))renderHelpEditor();}
-  if(st.server_config&&Date.now()>=_settleAt){serverConfig=st.server_config;if($('#srvOv').classList.contains('on'))renderServerCfg();}
+  if(st.server_config){serverConfig=st.server_config;if($('#srvOv').classList.contains('on'))renderServerCfg();}   // NO settle gate: _srvReconcile holds posted values per-field and turns bot truth into ✓/✗ badges — hiding the authoritative copy for 10s only delayed real confirmations
   const _safe=(f)=>{try{f();}catch(_e){console.error('tick render',_e);}};   // one panel throwing must not skip the rest of the tick or mislabel the server 'backend?'
   lastKillfeed=st.killfeed||[];lastActivity=st.activity||[];
   _safe(()=>drawMap(lastPlayers));_safe(()=>recordEntities(entities));_safe(()=>renderPlayers(lastPlayers));_safe(()=>renderAir(st.air));_safe(()=>renderNet(st.net));
@@ -1746,7 +1746,7 @@ async function missionUploadFolder(input){
     else showToast('Upload failed: '+((r&&r.error)||'?'));
   }catch(e){ input.value=''; showToast('Upload failed.'); }
 }
-const _VM_BOUNDS={coop_count:[0,12],pvp_count:[0,6],avoid_recent:[0,10],force_pvp_players:[1,200],force_pvp_coop:[0,12],force_pvp_pvp:[0,6]};
+const _VM_BOUNDS={coop_count:[0,12],pvp_count:[0,6],avoid_recent:[0,10],force_pvp_players:[1,200],force_pvp_coop:[0,12],force_pvp_pvp:[0,6],coop_minutes:[10,600],builtin_minutes:[10,600]};
 function _votemapHtml(){
   const c=votemapCfg; if(!c) return '';
   // tolerate an OLD v1-shape config (served by the still-running bot before its restart) so the panel
@@ -1837,6 +1837,12 @@ function _votemapHtml(){
     +'<span class="msgfl">PvP options '+tgl('include_pvp',c.include_pvp)+'</span>'
     +'<span class="msgfl">Custom missions '+tgl('include_custom',c.include_custom)+'</span>'
     +'<span class="dim">vote lasts '+(c.vote_duration||60)+'s</span>'
+    +'</div>'
+    +'<div style="display:flex;flex-wrap:wrap;gap:14px;align-items:center;font-size:12px;margin-top:7px">'
+    +'<span class="dim">Match length:</span>'
+    +'<label class="msgfl">Co-op / custom '+num('coop_minutes',c.coop_minutes==null?180:c.coop_minutes,10,600)+' min</label>'
+    +'<label class="msgfl">Built-in ops '+num('builtin_minutes',c.builtin_minutes==null?180:c.builtin_minutes,10,600)+' min</label>'
+    +'<span class="dim">the bot sets this when it queues a map — give built-ins ~180 so a 2h default doesn\'t cut the timeout→vote short</span>'
     +'</div>'
     +coopW+pvpW+force+guaranteed
     +'<div class="muted" style="font-size:11px;margin-top:8px">Normal ballot: <b>'+cc+'</b> PvE + <b>'+pp+'</b> PvP = <b>'+tot+'</b> options.'
@@ -2403,18 +2409,55 @@ async function clearAllReports(){
 // ── server settings tab (DedicatedServerConfig.json + gpanel) ───────────────────
 let serverConfig=null;
 function openServerCfg(){ $('#srvOv').classList.add('on'); $('#srvMsg').textContent=''; renderServerCfg(); srvRefresh(); }
-async function srvRefresh(){ try{ await jpost('/api/serverconfig/refresh',{}); }catch(e){} }
+async function srvRefresh(){ try{ await jpost('/api/serverconfig/refresh',{},{nosettle:true}); }catch(e){} }   // nosettle: a refresh must never hide the data it just asked for
+// Per-field save tracking: srvSet records what was POSTED; each tick the bot's authoritative copy is
+// compared against it -> per-row badge "confirming… / ✓ saved / ✗ NOT SAVED". A failed save can never
+// look like a success again. sc.pending_restart (bot-persisted) drives the amber "restart to apply" dot.
+let _srvDirty={};   // key -> {posted, at, mask}
+let _srvBadge={};   // key -> {s:'confirm'|'saved'|'fail'|'timeout', err, until}
+function _srvReconcile(sc){
+  if(!sc||!sc.fields) return;
+  const now=Date.now(), ls=sc.last_set;
+  for(const key of Object.keys(_srvDirty)){
+    const d=_srvDirty[key], f=sc.fields.find(x=>x.key===key);
+    if(!f){ delete _srvDirty[key]; continue; }
+    if(ls && ls.key===key && ls.ok===false && (ls.ts*1000)>=d.at-2000){
+      _srvBadge[key]={s:'fail', err:ls.error||'rejected'}; delete _srvDirty[key]; continue;   // bot said NO — show it
+    }
+    if(d.mask){
+      if(ls && ls.key===key && ls.ok===true && (ls.ts*1000)>=d.at-2000){ _srvBadge[key]={s:'saved', until:now+60000}; delete _srvDirty[key]; }
+      else if(now-d.at>20000){ _srvBadge[key]={s:'timeout'}; delete _srvDirty[key]; }
+      continue;                                          // masked value never appears in the state — judge by last_set only
+    }
+    if(!f._held && String(f.value)===String(d.posted)){ _srvBadge[key]={s:'saved', until:now+60000}; delete _srvDirty[key]; continue; }   // confirmed by a FRESH bot payload only — our own held value must never self-confirm
+    if(now-d.at>20000){ _srvBadge[key]={s:'timeout'}; delete _srvDirty[key]; continue; }   // honest revert: bot never confirmed
+    f.value=d.posted; f._held=true;                      // still confirming: hold the posted value on screen
+    _srvBadge[key]={s:'confirm'};
+  }
+  for(const k of Object.keys(_srvBadge)){ const b=_srvBadge[k]; if(b.until&&now>b.until) delete _srvBadge[k]; }
+}
+function _srvBadgeHtml(key){
+  const b=_srvBadge[key]; if(!b) return '';
+  if(b.s==='confirm') return ' <span style="font-size:10px;color:#9fb6d9">saving…</span>';
+  if(b.s==='saved')   return ' <span style="font-size:10px;color:#5df2a0">✓ saved</span>';
+  if(b.s==='fail')    return ' <span style="font-size:10px;color:#ff9a9a;font-weight:700" title="'+esc(b.err||'')+'">✗ NOT SAVED: '+esc((b.err||'').slice(0,60))+'</span>';
+  if(b.s==='timeout') return ' <span style="font-size:10px;color:#ffce7a;font-weight:700">✗ not confirmed — check the bot is running, then retry</span>';
+  return '';
+}
 function renderServerCfg(){
   const L=$('#srvList'); if(!L)return;
   { const _ae=document.activeElement; if(L.contains(_ae)&&(_ae.tagName==='INPUT'||_ae.tagName==='TEXTAREA')) return; }   // text fields only — a focused ON/OFF button must not swallow its own optimistic re-render
-  { const _scSig=JSON.stringify(serverConfig||{}); if(_scSig===window._srvSigPrev)return; window._srvSigPrev=_scSig; }   // change-detection: only rebuild on real change (no per-poll flash)
   const sc=serverConfig;
+  _srvReconcile(sc);
+  { const _scSig=JSON.stringify(serverConfig||{})+JSON.stringify(_srvBadge)+Object.keys(_srvDirty).join(',');   // badges/dirty changes must repaint too
+    if(_scSig===window._srvSigPrev)return; window._srvSigPrev=_scSig; }
   if(!sc){ L.innerHTML='<div class="dim" style="padding:12px 4px">Loading server config…</div>'; return; }
   if(sc.ok===false){ L.innerHTML='<div class="er" style="padding:12px 4px">Couldn’t read DedicatedServerConfig.json: '+esc(sc.err||'?')+'<br><span class="dim">Check SFTP creds in run.bat, then ↻ refresh.</span></div>'; return; }
   if(!sc.fields||!sc.fields.length){ L.innerHTML='<div class="dim" style="padding:12px 4px">No fields yet — ↻ refresh.</div>'; return; }
+  const pend=sc.pending_restart||{};
   let h='';
   for(const f of sc.fields){
-    const rb=f.needs_restart?' <span title="needs a restart to apply" style="color:var(--warn)">●</span>':'';
+    const rb=(f.key in pend)?' <span title="saved to the config — applies after the next server restart" style="color:var(--warn)">● restart to apply</span>':'';
     let ctrl;
     if(f.type==='bool'||f.type==='strbool'){
       const on=(f.value===true||String(f.value).toLowerCase()==='true');
@@ -2427,27 +2470,30 @@ function renderServerCfg(){
       ctrl='<input type="text" value="'+esc(String(f.value==null?'':f.value))+'" data-k="'+esc(f.key)+'" onchange="srvSetFromInput(this)" style="width:250px;max-width:46vw;background:var(--input);border:1px solid var(--bd);border-radius:6px;color:var(--txt);padding:6px 9px">';
     }
     h+='<div style="display:flex;align-items:flex-start;gap:12px;padding:8px 4px;border-bottom:1px solid var(--bd2)">'
-      +'<div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:600">'+esc(f.label)+rb+'</div>'
+      +'<div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:600">'+esc(f.label)+rb+_srvBadgeHtml(f.key)+'</div>'
       +'<div class="muted" style="font-size:11px">'+esc(f.note||'')+'</div></div>'
       +'<div style="flex:none">'+ctrl+'</div></div>';
   }
   L.innerHTML=h;
   const ls=sc.last_set;
-  if(ls && !$('#srvMsg').textContent.trim()){ let m='';
-    if(ls.needs_restart) m+='<span style="color:var(--warn)">saved — restart to apply. </span>';
-    if(ls.panel){ m+= ls.panel.mirrored?('<span class="ok">synced to gpanel ('+esc(ls.panel.var||'')+').</span>'):('<span class="dim">gpanel: '+esc(ls.panel.reason||'config-file only')+'</span>'); }
-    if(m) $('#srvMsg').innerHTML=m;
+  if(ls && ls.ok!==false && ls.panel && !$('#srvMsg').textContent.trim()){
+    $('#srvMsg').innerHTML= ls.panel.mirrored?('<span class="ok">synced to gpanel ('+esc(ls.panel.var||'')+').</span>'):('<span class="dim">gpanel: '+esc(ls.panel.reason||'config-file only')+'</span>');
   }
 }
-function srvSetFromInput(el){ srvSet(el.getAttribute('data-k'), el.value); }
+function srvSetFromInput(el){
+  if(el.type==='number'&&String(el.value).trim()===''){ $('#srvMsg').innerHTML='<span class="er">enter a value first</span>'; return; }
+  srvSet(el.getAttribute('data-k'), el.value);
+}
 async function srvSet(key,value){
-  // optimistic: show the new value NOW (jpost arms the settle window so the ~1s poll can't
-  // paint the stale copy back before the bot's SFTP write + re-read lands)
-  if(serverConfig&&serverConfig.fields){ const f=serverConfig.fields.find(x=>x.key===key); if(f&&!f.mask){ f.value=value; renderServerCfg(); } }
+  const f=(serverConfig&&serverConfig.fields||[]).find(x=>x.key===key);
+  _srvDirty[key]={posted:value, at:Date.now(), mask:!!(f&&f.mask)};   // tracked until the BOT confirms or rejects it
+  _srvBadge[key]={s:'confirm'};
+  window._srvSigPrev='';   // force the repaint (the reconciler paints the held value — srvSet must NOT write f.value itself or the hold would self-confirm as saved)
+  renderServerCfg();
   $('#srvMsg').innerHTML='<span class="dim">saving '+esc(key)+'…</span>';
   let r; try{ r=await jpost('/api/serverconfig',{key:key,value:value}); }catch(e){ r={ok:false,error:String(e)}; }
-  if(r.ok){ $('#srvMsg').innerHTML='<span class="ok">✓ '+esc(key)+' queued</span>'; setTimeout(srvRefresh,500); }
-  else $('#srvMsg').innerHTML='<span class="er">✗ '+esc(r.error||'failed')+'</span>';
+  if(r.ok){ setTimeout(function(){ srvRefresh(); }, 500); }
+  else { _srvBadge[key]={s:'fail', err:r.error||'failed'}; delete _srvDirty[key]; window._srvSigPrev=''; renderServerCfg(); $('#srvMsg').innerHTML='<span class="er">✗ '+esc(r.error||'failed')+'</span>'; }
 }
 async function srvRestart(){
   if(!confirm('Restart the game server now to apply config changes? Players will be briefly disconnected.'))return;

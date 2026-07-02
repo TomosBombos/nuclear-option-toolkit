@@ -316,8 +316,14 @@ def main(argv=None):
         pb.upload_asset(token, rel, f)
     print("DONE. https://github.com/%s/releases/tag/%s" % (pb.REPO, tag))
 
-    # 5. retention: keep only the N most-recent nightlies (stable releases are never touched)
+    # 5. retention. FIRST supersede any OLDER same-date nightly (the version-in-tag scheme leaves
+    # an earlier same-day tag live when the version bumps between runs — a server updating in that
+    # window would pull the stale one; this guarantees a nightly can never fetch the wrong version).
+    # THEN keep only the N most-recent nightlies. Stable releases are never touched.
     if a.channel == "nightly" and not a.no_prune:
+        superseded = pb.supersede_same_date_nightlies(token, tag)
+        if superseded:
+            print("[release] superseded older same-date nightlies: %s" % ", ".join(superseded))
         print("[release] retention: keeping %d most-recent nightlies ..." % a.keep_nightly)
         pruned = pb.prune_nightlies(token, keep=a.keep_nightly)
         print("[release] pruned: %s" % (", ".join(pruned) if pruned else "(none)"))

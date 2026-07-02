@@ -3,8 +3,14 @@
 
 Schema (the subset the installer owns): Port/QueryPort are {IsOverride, Value}; ServerName,
 MaxPlayers, Password are scalars; ModdedServer is the STRING "true"/"false". We MERGE into
-any existing file (preserving unknown keys like MissionRotation / VoteKick) and back it up
-first, so re-running is idempotent and never clobbers a hand-tuned config.
+any existing file (existing values always win) and back it up first, so re-running is
+idempotent and never clobbers a hand-tuned config.
+
+IMPORTANT: DEFAULTS must contain the COMPLETE key set the web command centre's Server Config
+tab can edit. A slim config isn't just missing features — before the create-on-save fix it made
+every save of an absent field (VoteKick, PostMissionDelay, ...) fail silently. Because the merge
+is defaults-under-existing, re-running the installer also fills these keys into older slim
+configs without touching any value the operator already set.
 """
 import json
 import os
@@ -28,7 +34,8 @@ _MISSION_NAMES = [
 ]
 _ROTATION = [{"Key": {"Group": "User", "Name": n}, "MaxTime": 7200.0} for n in _MISSION_NAMES]
 
-# Defaults used only when creating a fresh config (no existing file to merge into).
+# Defaults for a fresh config; also merged UNDER an existing file so older slim installs gain
+# any missing keys (their own values always win). Keep this the FULL editable key set.
 DEFAULTS = {
     "MissionDirectory": "NuclearOption-Missions",
     "ModdedServer": "true",
@@ -38,6 +45,15 @@ DEFAULTS = {
     "MaxPlayers": 16,
     "RotationType": 2,
     "MissionRotation": _ROTATION,
+    "DisableErrorKick": False,        # vanilla behaviour: kick clients on desync errors
+    "PostMissionDelay": 90.0,         # seconds between mission end and next load — enough for the bot's end-of-match map vote
+    "NoPlayerStopTime": 300.0,        # seconds with no players before the match stops (game default)
+    "VoteKick": {                     # the game's built-in vote-kick
+        "Enabled": True,
+        "PassRatio": 0.6,
+        "MinVotes": 3,
+        "VoteDuration": 30.0,
+    },
 }
 
 

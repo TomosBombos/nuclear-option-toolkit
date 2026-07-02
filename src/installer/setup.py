@@ -425,6 +425,66 @@ call "%~dp0..\run.bat"
 pause >nul
 '''
 
+# One-click "apply everything the updater staged" for THIS folder. Interactive by default
+# (asks before the match-restarting plugin deploy, offers a daily 05:00 auto-update task);
+# `/auto` runs unattended (used by that scheduled task). Fixes the field gap where a staged
+# update sat forever on installs that have no Server-1-style deploy task.
+_WIN_DEPLOY_UPDATE = r'''@echo off
+for %%I in ("%~dp0..\.") do set "NOST_FOLDER=%%~nxI"
+title Nuke Option UPDATE - %NOST_FOLDER%
+set "NOST_ROOT=%~dp0..\"
+set "NOST_DATA_DIR=%NOST_ROOT%.nost-data"
+if not exist "%NOST_DATA_DIR%" mkdir "%NOST_DATA_DIR%"
+if /I "%~1"=="/auto" goto :auto
+
+echo ============================================
+echo   NUKE OPTION - update THIS server
+echo   Folder: %NOST_FOLDER%
+echo ============================================
+echo Checking for + installing the latest release (bot, web CC, updater install
+echo immediately with backups; the game plugin is only STAGED here)...
+python "%NOST_ROOT%installer\updater.py" update
+if errorlevel 1 (
+  echo.
+  echo The update reported a problem - see above or %NOST_DATA_DIR%\update.log
+  pause
+  exit /b 1
+)
+if not exist "%NOST_ROOT%pending_plugin.dll" goto :restarthint
+echo.
+echo A game-plugin update is STAGED. Deploying it RESTARTS the match.
+choice /C YN /M "Deploy the staged plugin to the game server now"
+if errorlevel 2 goto :restarthint
+call "%NOST_ROOT%run.bat" --deploy-plugin
+
+:restarthint
+echo.
+echo Bot / web command centre updates load on their next restart
+echo (use START THIS SERVER.bat, or restart their windows).
+echo.
+choice /C YN /M "Schedule this update to run automatically every day at 05:00"
+if errorlevel 2 goto :done
+schtasks /Create /F /TN "NukeOption AutoUpdate - %NOST_FOLDER%" /TR "\"%~f0\" /auto" /SC DAILY /ST 05:00
+echo Scheduled. Remove any time with:
+echo   schtasks /Delete /F /TN "NukeOption AutoUpdate - %NOST_FOLDER%"
+:done
+echo.
+pause
+exit /b 0
+
+:auto
+REM ---- unattended daily run: install everything, deploy a staged plugin (guarded job:
+REM ---- it warns in-chat and prefers an empty server), then reload the bot + web CC.
+python "%NOST_ROOT%installer\updater.py" update
+if exist "%NOST_ROOT%pending_plugin.dll" call "%NOST_ROOT%run.bat" --deploy-plugin
+powershell -NoProfile -Command "$d=(Resolve-Path '%NOST_ROOT%').Path; if (-not $d.EndsWith([char]92)) { $d=$d+[char]92 }; Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match 'no_mapvote_bot\.py|cc_web\.py' -and $_.CommandLine -like ('*' + $d + '*') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+ping -n 3 127.0.0.1 >nul
+start /min "Nuke Option BOT - %NOST_FOLDER%" cmd /c "cd /d "%NOST_ROOT%" & set "NOST_DATA_DIR=%NOST_DATA_DIR%" & call run.bat"
+ping -n 3 127.0.0.1 >nul
+start /min "Nuke Option WEBCC - %NOST_FOLDER%" cmd /c "cd /d "%NOST_ROOT%" & set "NOST_DATA_DIR=%NOST_DATA_DIR%" & set "NOCC_PORT=__P__" & python -u "%NOST_ROOT%cc_web.py""
+exit /b 0
+'''
+
 _WIN_WRAP_WEBCC = r'''@echo off
 for %%I in ("%~dp0..\.") do set "NOST_FOLDER=%%~nxI"
 title Nuke Option WEBCC - %NOST_FOLDER%
@@ -450,6 +510,20 @@ sleep 3
 
 _SH_GAMESTART = ('pgrep -f "__GAMEDIR__.*NuclearOptionServer" >/dev/null '
                  '|| ( cd "__GAMEDIR__" && bash "__GAMEDIR__start_server.sh" & )\nsleep 5\n')
+
+_SH_DEPLOY_UPDATE = r'''#!/usr/bin/env bash
+# Nuke Option - apply everything the updater staged for THIS server.
+# Installs bot/web CC/updater updates (backups kept) and deploys a staged plugin
+# (the guarded job restarts the match). Restart the bot + web CC afterwards.
+here="$(cd "$(dirname "$0")/.." && pwd)/"
+export NOST_DATA_DIR="${here}.nost-data"; mkdir -p "$NOST_DATA_DIR"
+python3 "${here}installer/updater.py" update || { echo "update failed - see ${NOST_DATA_DIR}/update.log"; exit 1; }
+if [ -f "${here}pending_plugin.dll" ]; then
+  if [ "$1" = "--auto" ]; then ans=y; else read -r -p "Deploy the staged plugin now (restarts the match)? [y/N] " ans; fi
+  case "$ans" in y|Y) ( cd "$here" && python3 -u "${here}no_mapvote_bot.py" --deploy-plugin );; esac
+fi
+echo "Done. Restart the bot + web command centre to load new code (start_this_server.sh)."
+'''
 
 
 def _write_bat(path, text):
@@ -477,6 +551,8 @@ def _folder_safe_launchers(root, platform, web_port, own_pc=False, game_dir=None
         _write_bat(main_path, main)
         _write_bat(os.path.join(start_here, "1. Start Bot.bat"), _WIN_WRAP_BOT)
         _write_bat(os.path.join(start_here, "2. Start Web Command Centre.bat"), _WIN_WRAP_WEBCC)
+        _write_bat(os.path.join(start_here, "3. Deploy Staged Update.bat"),
+                   _WIN_DEPLOY_UPDATE.replace("__P__", p))
         # remove any legacy name-blind launcher left in the folder
         for legacy in (os.path.join(root, "START EVERYTHING.bat"),
                        os.path.join(start_here, "START EVERYTHING.bat")):
@@ -492,8 +568,12 @@ def _folder_safe_launchers(root, platform, web_port, own_pc=False, game_dir=None
     main_path = os.path.join(start_here, "start_this_server.sh")
     with open(main_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(body)
+    upd_path = os.path.join(start_here, "deploy_staged_update.sh")
+    with open(upd_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(_SH_DEPLOY_UPDATE)
     try:
         os.chmod(main_path, 0o755)
+        os.chmod(upd_path, 0o755)
     except OSError:
         pass
     for legacy in (os.path.join(root, "start_everything.sh"),):

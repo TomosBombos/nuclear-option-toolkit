@@ -112,6 +112,35 @@ def delete_release(token, rel):
     return st in (200, 204)
 
 
+def supersede_same_date_nightlies(token, keep_tag, dry_run=False):
+    """Delete any OTHER nightly pre-release sharing keep_tag's date suffix (-nightly.<YYYYMMDD>).
+
+    The tag encodes the version (`v<ver>-nightly.<date>`), so when the plugin version bumps
+    between two runs on the SAME day the earlier tag stays live — that is exactly how the 4am
+    v0.9.21-nightly.20260702 survived when the 08:31 run minted v0.9.22-nightly.20260702, and a
+    server that updated in between pulled the stale one. A nightly is "one build for that night":
+    the newest for a date supersedes every earlier same-date nightly. Keeps keep_tag; returns
+    removed tags. Stable releases are never touched (only `-nightly.` tags match)."""
+    import re
+    m = re.search(r"-nightly\.(\d{8})$", keep_tag or "")
+    if not m:
+        return []
+    date = m.group(1)
+    removed = []
+    for r in list_all_releases(token):
+        tag = r.get("tag_name") or ""
+        if not r.get("prerelease") or tag == keep_tag:
+            continue
+        if tag.endswith("-nightly.%s" % date):
+            if dry_run:
+                print("  [supersede] WOULD delete older same-date nightly %s (keeping %s)" % (tag, keep_tag))
+            else:
+                print("  [supersede] deleting superseded same-date nightly %s" % tag)
+                delete_release(token, r)
+            removed.append(tag)
+    return removed
+
+
 def prune_nightlies(token, keep=3, dry_run=False):
     """Keep the `keep` most-recent nightly PRE-releases; delete older ones (and their git tags).
     Stable (non-prerelease) releases are NEVER touched. Returns the list of removed tags."""

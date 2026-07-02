@@ -892,13 +892,22 @@ def api_banlog_remove():
 
 @app.route("/api/serverconfig", methods=["POST"])
 def api_serverconfig_set():
-    """webcc Server Settings tab: edit one config field (routed to the bot -> SFTP + gpanel mirror)."""
+    """webcc Server Settings tab: edit one config field (routed to the bot -> SFTP + gpanel mirror).
+    Rejects unknown fields and empty numeric values HERE so obvious mistakes fail fast; a true 'saved'
+    is only ever reported by the bot after its verify-after-write (queued != applied)."""
     b = request.get_json(force=True, silent=True) or {}
     key = str(b.get("key", "")).strip()
     if not key:
         return jsonify({"ok": False, "error": "no key"})
+    srv_map = getattr(bot, "_SRVCFG_MAP", None)
+    if isinstance(srv_map, dict) and srv_map and key not in srv_map:
+        return jsonify({"ok": False, "error": f"unknown field {key}"})
+    if isinstance(srv_map, dict) and key in srv_map:
+        typ = srv_map[key][1]
+        if typ in ("int", "float") and str(b.get("value", "")).strip() == "":
+            return jsonify({"ok": False, "error": "enter a value"})
     _queue_admin({"action": "setserverconfig", "key": key, "value": b.get("value")})
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "queued": True})
 
 
 @app.route("/api/serverconfig/restart", methods=["POST"])
