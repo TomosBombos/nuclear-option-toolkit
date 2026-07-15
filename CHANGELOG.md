@@ -1,7 +1,21 @@
 # Changelog
 
 What changed in each toolkit release. Every GitHub release shows its own section from this file.
-Versions follow the toolkit release number; 1.0.2 is the first stable release.
+Versions follow the toolkit release number.
+
+## [1.0.10] — 2026-07-15
+
+Anti-grief and flood-protection rework, plus a team-colour cleanup.
+
+### Changed
+
+- **Flood protection and anti-grief are now one system.** The separate "Flood Guard" and "Anti-Grief" dashboard tabs are merged into a single **Anti-Grief** tab, with one rate limit (`Flood.FleetOrdersPerSec`, default 1/sec), one kick path, and one storm breaker — the previous overlapping, duplicated rate-limit-and-kick logic is gone. The redundant `Grief.FloodOrdersPerSec` setting is retired (kept only as a hidden legacy alias).
+- **Team colours are consistent everywhere** — join messages, the kill feed, the player list, the live map, and the panels all use PALA yellow and BDF lavender. Live-map bases are now neutral grey for a cleaner read.
+
+### Added
+
+- Inbound-RPC rate guarding and send-buffer-overflow protection, hardening the server against command-flood mass-disconnects.
+- The two storm-breaker controls (`Grief.BreakerDistinctPlayers`, `Grief.BreakerWindowSeconds`) are now editable from the dashboard.
 
 ## [1.0.2] — 2026-07-14
 

@@ -253,11 +253,12 @@ Detects a single connection flooding unit-move commands to brick the server, and
 **How to use it:** Automatic. Owners tune it and view entries in the Web CC **Reports** tab. Validate the threshold first with report-only mode.
 
 **Settings:**
-- `Grief.AutoKick` - default `true` - master on/off for detect + report + kick.
-- `Grief.RequireActiveFlooding` - default `true` - kick on a sustained order-flood rate alone (recommended), not on unit count.
-- `Grief.FloodOrdersPerSec` - default `3` - sustained orders/sec that trips the auto-kick.
+- `Flood.FleetOrdersPerSec` - default `1` - max accepted unit commands/sec; excess = drop + immediate kick.
+- `Flood.FleetOrderBurst` - default `1` - token-bucket capacity (1 = no burst).
+- `Grief.AutoKick` - default `true` - master on/off for detect + report + immediate kick.
+- `Grief.RequireActiveFlooding` - default `true` - kick on order-rate excess alone (recommended), not on unit count.
 - `Grief.ReportOnly` - default `false` - report but do not kick, to validate the threshold.
-- Full list: **[CONFIGURATION.md](CONFIGURATION.md) → Anti-Grief**.
+- Full list: **[CONFIGURATION.md](CONFIGURATION.md) → Anti-grief / flood protection**.
 
 ### In-game vote-kick
 The game's own built-in player vote-to-kick.

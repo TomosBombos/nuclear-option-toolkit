@@ -48,6 +48,7 @@ release_out/
 # machine-generated dev dumps / harness
 docs/_*.json
 .claude/
+AGENTS.md
 __pycache__/
 *.pyc
 

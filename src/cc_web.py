@@ -56,7 +56,9 @@ _CATALOGUE_REMOVE = {"Net.TrackingCoalesceMs", "Net.RadarWarnCoalesceMs",
                      "VOTE_DURATION", "APPROVAL_DURATION", "PostMissionDelay",
                      # public-listing / server-directory feature retired (owner request, 1.0.1): drop the whole
                      # Public Listing group regardless of what the shipped catalogue still carries.
-                     "Global.ListServer", "Global.Region", "Global.Gamemonitoring", "Global.Enabled"}
+                     "Global.ListServer", "Global.Region", "Global.Gamemonitoring", "Global.Enabled",
+                     # RETIRED: Grief.FloodOrdersPerSec — setcfg forwards to Flood.FleetOrdersPerSec; hide UI row.
+                     "Grief.FloodOrdersPerSec"}
 # Item 10: Damage Calibration is a teamkill-floor diagnostic, not a chat/feed toggle — regroup it.
 # Rank embedding was DECOUPLED from the killfeed mode in plugin 1.0.1 (a 0.9.48 change had gated it on
 # KillFeed.Custom, so turning the custom feed off silently disabled rank embedding). These override the
@@ -77,6 +79,18 @@ _CATALOGUE_GROUP_OVERRIDE = {
     "Mission.PvpRankCatchupMaxRank": "Rank + Fund catch-up",
     "Scoring.RankFundsPerRank": "Rank + Fund catch-up",
     "Scoring.RankFundsMode": "Rank + Fund catch-up",
+    # Anti-Grief consolidate: merge former Flood Guard rows into the single Anti-Grief tab
+    # (belt-and-suspenders if a stale catalogue still says "Flood Guard").
+    "Flood.Enforce": "Anti-Grief",
+    "Flood.FleetOrdersPerSec": "Anti-Grief",
+    "Flood.FleetOrderBurst": "Anti-Grief",
+    "Flood.LogDrops": "Anti-Grief",
+    "Flood.DropDeadNetIdRpcs": "Anti-Grief",
+    "Command.Policy": "Anti-Grief",
+    "Command.AllowedJsonKeys": "Anti-Grief",
+    "Command.DiagLog": "Anti-Grief",
+    "Mirage.RaiseReliableSendBuffer": "Anti-Grief",
+    "Mirage.ReliableSendBufferLimit": "Anti-Grief",
 }
 # Items 11/12: knobs the shipped catalogue may not carry yet. Injected only when absent (keyed by "key"),
 # so a catalogue that already defines them wins. Shapes match the catalogue rows (key/owner/type/…).

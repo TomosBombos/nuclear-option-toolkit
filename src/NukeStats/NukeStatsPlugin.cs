@@ -46,7 +46,7 @@ namespace NukeStats
     public class NukeStatsPlugin : BaseUnityPlugin
     {
         public const string Guid = "anz.nukestats";
-        public const string Version = "1.0.2";
+        public const string Version = "1.0.10";
         internal static ManualLogSource Log;
         internal static NukeStatsPlugin Instance;
 
@@ -59,6 +59,8 @@ namespace NukeStats
         internal static ConfigEntry<bool> RankInName;            // embed [RANK] into the player's chat name (restores native TTS)
         internal static ConfigEntry<bool> ProfanityFilter;       // replace whole messages that contain a racist slur
         internal static ConfigEntry<bool> CustomKillFeed;        // suppress the native flood; announce streaks + ship sinks instead
+        internal static ConfigEntry<bool> HideRepairMessages;    // native "repaired/rearmed/refueled" notification; ON = hide/suppress (drives webcc "Hide Repair Feed Messages")
+        internal static ConfigEntry<bool> KillFeedTeamColour;    // colour the rank tag + name in the game's TEAM colour (matches chat) + everything else white
         internal static ConfigEntry<bool> CleanupPilots;         // periodically despawn old dismounted pilots
         internal static ConfigEntry<int> PilotLifetime;          // seconds a dismounted pilot may linger before cleanup
         internal static ConfigEntry<bool> AiLimit;               // AI aircraft limiter (perf precaution)
@@ -72,6 +74,11 @@ namespace NukeStats
         internal static ConfigEntry<bool> FloodEnforce;          // per-player rate limit on fleet move-orders (anti mass-DC)
         internal static ConfigEntry<int>  FloodPerSec, FloodBurst;
         internal static ConfigEntry<bool> FloodLogDrops, FloodDropDeadNet;
+        internal static ConfigEntry<bool>  FloodInboundGuard;     // ROOT-CAUSE guard D: general per-connection inbound-RPC rate limit (ALL rpc types) + auto-kick a sustained flooder
+        internal static ConfigEntry<int>   FloodInboundPerSec, FloodInboundBurst;
+        internal static ConfigEntry<float> FloodInboundKickSeconds;
+        internal static ConfigEntry<bool>  OverflowAbsorb;        // guard E: veto the send-buffer-full disconnect (reason 5) so an overflow can't mass-DC the lobby; genuinely-dead clients still drop via Mirage's own Timeout (reason 1, un-vetoed)
+        internal static ConfigEntry<int>   OverflowKickThreshold; // # of DISTINCT victims ONE source must overflow within ~3s before that source is kicked (a legit sender overflows ~none). 0 = absorb-only
         internal static ConfigEntry<bool> MirageRaiseSendBuffer;  // anti mass-DC Layer C: raise the reliable-send-buffer cap
         internal static ConfigEntry<int>  MirageSendBufferLimit;  // target for MaxReliablePacketsInSendBufferPerConnection
         internal static ConfigEntry<bool> DiagNetProbe;          // ONE-OFF diagnostic: dump the connection object's fields to LogOutput.log to settle whether per-player RTT is reachable on this Mirage build (OFF by default)
@@ -235,6 +242,15 @@ namespace NukeStats
                 "is unaffected) and instead announce kill STREAKS (N confirmed kills, colour escalates at " +
                 "5/10/25/50) and CARRIER/DESTROYER sinks. Also drops the player name from the unit label " +
                 "(radar/map) so a pilot's name shows once, via their chat name.");
+            HideRepairMessages = Config.Bind("KillFeed", "HideRepairMessages", true,
+                "Hide the game's native 'repaired / rearmed / refueled' notification that fires when a player "
+                + "services their aircraft at a base. ON (default) = suppressed entirely (nothing else emits this "
+                + "line); OFF shows it. Drives the web CC 'Hide Repair Feed Messages' switch.");
+            KillFeedTeamColour = Config.Bind("KillFeed", "TeamColourNames", true,
+                "Kill feed: colour each player's rank tag + name in their TEAM colour -- the EXACT game faction colour, the "
+                + "same one chat uses -- and render everything else (splashed / shot down by / sunk, the underdog bonus, the "
+                + "points, the streak count, ship names) in WHITE. OFF = the older look (rank tag in the rank-tier colour, ship "
+                + "names in their class colour). Rank-up announcements and the leaderboard keep their own colours either way.");
             // ---- KILLFEED customization: per-line Mode (vanilla|custom|off) + custom Text template.
             //      Applies to the PLUGIN-emitted feed lines. Placeholders in Text: {killer} {killer_plane}
             //      {victim} {victim_plane} {weapon} {streak} {ship} {points}. Live via setcfg. ----
@@ -322,15 +338,15 @@ namespace NukeStats
             AiStuckRadius   = Config.Bind("AILimit", "StuckRadiusMetres", 25,
                 "Movement radius (metres) under which a grounded AI counts as 'not moving' for the stuck check.");
             FloodEnforce    = Config.Bind("Flood", "Enforce", true,
-                "Per-player rate limit on fleet move-orders (UnitCommand.CmdSetDestination). Stops a runaway/held-key/macro "
-                + "order spam from flooding the reliable send buffer and mass-disconnecting the whole lobby at match start. "
-                + "ONLY drops the offending connection's EXCESS orders server-side; never kicks, never touches other players.");
-            FloodPerSec     = Config.Bind("Flood", "FleetOrdersPerSec", 3,
-                "Sustained fleet move-orders accepted per second per player (token refill). A human commander issues well "
-                + "under 1/s; the observed flood was ~19/s. 3/s leaves a large safety margin.");
-            FloodBurst      = Config.Bind("Flood", "FleetOrderBurst", 6,
-                "Max burst of fleet orders before excess is dropped (token-bucket capacity). The bucket starts FULL, so a "
-                + "player's first orders are never dropped.");
+                "Per-player rate limit on fleet move-orders (UnitCommand.CmdSetDestination). Excess orders are DROPPED "
+                + "server-side; when Anti-Grief AutoKick is on, the offender is ALSO kicked immediately on the first excess "
+                + "(never touches other players). Primary defence against order-spam mass-disconnects.");
+            FloodPerSec     = Config.Bind("Flood", "FleetOrdersPerSec", 1,
+                "Max unit move-orders accepted per second per player (token refill). DEFAULT 1: a legit commander is at "
+                + "most ~1/s; ANY excess is dropped and (with AutoKick) immediately kicked. Raise only if false positives.");
+            FloodBurst      = Config.Bind("Flood", "FleetOrderBurst", 1,
+                "Token-bucket capacity for fleet orders. DEFAULT 1 with FleetOrdersPerSec=1 means a second order within "
+                + "the same second is excess (drop + kick). Raise only to allow a brief intentional multi-select burst.");
             FloodLogDrops   = Config.Bind("Flood", "LogDrops", true,
                 "Log (throttled, at most once per 5s per player) the name/SteamID of a player whose orders are being dropped.");
             FloodDropDeadNet = Config.Bind("Flood", "DropDeadNetIdRpcs", true,
@@ -339,6 +355,47 @@ namespace NukeStats
                 + "reader -- under a flood (a client re-firing at a just-destroyed unit) that storm exhausts the ByteBuffer "
                 + "pool and overflows send buffers. Dropping silently removes the amplifier. Patches a private Mirage method; "
                 + "fail-open (auto-disables if it can't bind, leaving the CmdSetDestination throttle as the primary guard).");
+            FloodInboundGuard = Config.Bind("Flood", "InboundRpcGuard", true,
+                "ROOT-CAUSE flood guard (Layer D): a GENERAL per-connection rate limit on ALL inbound ServerRpcs, not just "
+                + "fleet move-orders (Layer A). A single client streaming reliable RPCs is re-broadcast by the server to EVERY "
+                + "player, so one source multiplies by the player count and overflows every client's reliable send buffer -- the "
+                + "lobby-wide mass-disconnect flood that Layers A/B/C could not stop. Caps each connection's RPC intake with a "
+                + "token bucket at the HandleRpc choke point; excess is dropped server-side. ALSO emits a [flood-measure] log of "
+                + "the real peak inbound RPC/s per connection so the cap can be TUNED FROM DATA rather than a guess. Shares guard "
+                + "B's HandleRpc patch; fail-open (any error/unbound = disabled, Layers A/B/C still apply). LIVE-tunable.");
+            FloodInboundPerSec = Config.Bind("Flood", "InboundRpcPerSec", 400,
+                "Sustained inbound ServerRpcs accepted per second per connection (token refill); excess is dropped. DELIBERATELY "
+                + "HIGH (400) because this counts EVERY Cmd and a 60hz sim can legitimately stream many state RPCs/s per player -- "
+                + "the observed flood was far higher (hundreds+/s of re-broadcast RPCs). Watch the [flood-measure] log for your "
+                + "server's real peak, then set this to ~3-5x that peak before tightening. Dropping non-move-order RPCs is NOT "
+                + "free (a dropped fire/spawn is lost), so keep this comfortably above legit peak.");
+            FloodInboundBurst = Config.Bind("Flood", "InboundRpcBurst", 800,
+                "Token-bucket capacity: the max burst of inbound RPCs before excess is dropped (bucket starts FULL, so a normal "
+                + "burst -- a salvo, a spawn-in, a scene/mission load -- is never dropped). 800 = ~2s of headroom at 400/s.");
+            FloodInboundKickSeconds = Config.Bind("Flood", "InboundRpcKickSeconds", 0f,
+                "If a connection stays OVER the inbound rate limit continuously for this many seconds, auto-kick it (the offender, "
+                + "not the lobby; admins exempt). DEFAULT 0 = DROP-ONLY, never kick. Auto-kick is OPT-IN: only enable it (typical "
+                + "1.5) AFTER you have watched [flood-measure] and confirmed a legit client never sustains > InboundRpcPerSec, "
+                + "otherwise a busy 60hz player could be false-kicked. Floored to 0.5s minimum when > 0.");
+            OverflowAbsorb = Config.Bind("Flood", "AbsorbSendBufferOverflow", true,
+                "GUARD E (the real mass-DC fix): when a client's reliable send buffer overflows, Mirage's built-in reaction is to "
+                + "DISCONNECT that player -- and a flood overflows EVERYONE's buffer at once, so the game itself kicks the whole "
+                + "lobby. This vetoes ONLY that buffer-full disconnect (Mirage DisconnectReason 5, used nowhere else, verified by "
+                + "decompiling the SocketLayer) so the overflow is ABSORBED instead of disconnecting the lobby. COMMAND-AGNOSTIC "
+                + "(works no matter what/how-little is spammed). The overflowing packet is dropped for that one connection, so a "
+                + "SUSTAINED flood causes DESYNC (not a brief blip) until the source stops or is kicked -- but nobody is mass-kicked. "
+                + "Genuinely-dead clients still drop via Mirage's own Timeout (reason 1), which is NOT vetoed, so there are no zombie "
+                + "connections. Patches Mirage.NetworkPlayer.Disconnect(DisconnectReason); fail-open (any error/unbound = normal game "
+                + "behavior). Known gaps: a match-start string-store send overflow uses a different disconnect overload (not covered); "
+                + "SyncVar/spawn-storm floods are absorbed but their source is not identified for the kick.");
+            OverflowKickThreshold = Config.Bind("Flood", "OverflowKickThreshold", 0,
+                "GUARD E part 2 -- stop the flood at its source. DEFAULT 0 = ABSORB-ONLY (the absorb alone already prevents the "
+                + "mass-kick; the source is not auto-kicked). Set to ~6 to ENABLE the auto-kick after you've watched the [flood] blame "
+                + "logs and confirmed it only ever fingers real flooders. When enabled: each absorbed overflow is blamed on the client "
+                + "whose ServerRpc is being broadcast at that instant (the amplifier); if ONE source overflows this many DISTINCT "
+                + "victims within ~3s it is kicked (admins exempt). Counting DISTINCT victims (not raw overflows) is what makes it "
+                + "safe -- a legit sender overflows ~no one, a flooder overflows everyone -- plus a congestion breaker suppresses the "
+                + "kick when 3+ sources flood at once (server-wide lag, not one griefer). Only reached for RPC-triggered broadcasts.");
             CommandPolicy = Config.Bind("Command", "Policy", "HeliDroppedOnly",
                 "Which units players may order via CmdSetDestination (unit move-commands). One of: "
                 + "All (any commandable unit) | RateLimitOnly (alias of All) | "
@@ -378,22 +435,19 @@ namespace NukeStats
                 + "any ping feature is built (research says NetworkTime.Rtt is client-fed ~0 on a headless server). Turn ON, "
                 + "capture one LogOutput.log dump, turn OFF.");
             GriefAutoKick = Config.Bind("Grief", "AutoKick", true,
-                "Anti-grief: automatically KICK a single player who is mass-commanding units to brick the server (the "
-                + "reliable-buffer flood that mass-disconnects everyone). Kicks the OFFENDER, not the lobby, and emits a "
-                + "report to the webcc Reports tab. Two-factor by default (see RequireActiveFlooding) so a legit "
-                + "base-builder is not kicked. Set false to disable detection+report+kick entirely. LIVE-tunable.");
+                "Anti-grief: automatically KICK a player who exceeds Flood.FleetOrdersPerSec (default 1 cmd/s) — kicks "
+                + "the OFFENDER immediately on the first excess order (Layer A), not the lobby, and emits a report to "
+                + "the webcc Moderation tab. Set false to disable kick (rate-limit drops still apply if Flood.Enforce). LIVE-tunable.");
             GriefOwnedThreshold = Config.Bind("Grief", "OwnedUnitThreshold", 12,
-                "Auto-kick when a player owns MORE than this many live ground vehicles (their heli-dropped SAMs/AA/APC/"
-                + "etc.) AND is actively flooding move-orders. The owner's '>10 units' rule; 12 leaves headroom for a "
-                + "legit multi-SAM setup.");
+                "Only used when RequireActiveFlooding is OFF: then owning MORE than this many live ground vehicles also "
+                + "trips a kick. With RequireActiveFlooding ON (default) the kick is driven by order RATE alone.");
             GriefRequireFlooding = Config.Bind("Grief", "RequireActiveFlooding", true,
-                "Two-factor safety (recommended ON): only auto-kick if the player is ALSO sustained-flooding move-orders "
-                + "(a macro/held-key/loop), not merely owning many units sitting idle. A normal 'select all + move once' "
-                + "burst never trips it. Set false for the literal 'owns > threshold units -> kick' rule (more aggressive).");
-            GriefFloodPerSec = Config.Bind("Grief", "FloodOrdersPerSec", 3,
-                "The sustained move-order rate (orders/second per player) that counts as 'flooding'; must be held ~4s "
-                + "(2 scan windows). A legit commander issues well under 1/s, and the game caps a connection's ACCEPTED "
-                + "orders at ~5/s, so 3/s sustained = deliberate macro/click-spam. Lower = more aggressive.");
+                "Recommended ON: kick on order-rate excess alone (Flood.FleetOrdersPerSec). OFF = also kick anyone simply "
+                + "OWNING more than OwnedUnitThreshold (aggressive; can false-positive a base-builder).");
+            GriefFloodPerSec = Config.Bind("Grief", "FloodOrdersPerSec", 1,
+                "RETIRED alias (kept so old cfgs still load without BepInEx dropping the key). NEVER used for kick/drop "
+                + "decisions — canonical rate is Flood.FleetOrdersPerSec only. setcfg Grief.FloodOrdersPerSec is "
+                + "forwarded to Flood.FleetOrdersPerSec.");
             GriefHardBan = Config.Bind("Grief", "HardBan", false,
                 "If true, a tripped offender is also BANNED (plugin_bans.txt, kicked on rejoin), not just kicked once. "
                 + "Default false = kick only (recoverable). You can always ban from the Reports tab.");
@@ -413,6 +467,7 @@ namespace NukeStats
 
             LoadBans();
             LoadSquads();
+            _mainThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;   // guard E: netcode overflow blame/kick runs ONLY on this thread
 
             _harmony = new Harmony(Guid);
             try
@@ -435,13 +490,34 @@ namespace NukeStats
                 var handleRpc = rpcHandlerT != null ? AccessTools.Method(rpcHandlerT, "HandleRpc") : null;
                 if (handleRpc != null)
                 {
-                    _harmony.Patch(handleRpc, prefix: new HarmonyMethod(
-                        typeof(DeadNetIdDropPatch).GetMethod("Prefix", BindingFlags.Static | BindingFlags.NonPublic)));
-                    Log.LogInfo("[diag] HandleRpc patched (flood guard B: dead-netId drop)");
+                    _harmony.Patch(handleRpc,
+                        prefix:  new HarmonyMethod(typeof(DeadNetIdDropPatch).GetMethod("Prefix",  BindingFlags.Static | BindingFlags.NonPublic)),
+                        postfix: new HarmonyMethod(typeof(DeadNetIdDropPatch).GetMethod("Postfix", BindingFlags.Static | BindingFlags.NonPublic)));
+                    Log.LogInfo("[diag] HandleRpc patched (flood guards B: dead-netId drop, D: inbound rate, E: source-tag)");
                 }
                 else Log.LogWarning("[flood] RpcHandler.HandleRpc not found; dead-netId drop disabled (Layer A still active)");
             }
             catch (Exception e) { Log.LogError("[flood] HandleRpc patch failed (Layer A still active): " + e); }
+
+            // Flood guard Layer E (the real mass-DC fix): veto Mirage's buffer-full disconnect (DisconnectReason 5) so a
+            // send-buffer overflow is ABSORBED instead of disconnecting the player. That is the exact point the game kicks
+            // the whole lobby, so vetoing it stops the mass-DC exploit regardless of which command triggers it, and can
+            // never false-kick. Manual patch of Mirage.NetworkPlayer.Disconnect(DisconnectReason) via reflection.
+            // Fail-open: if it can't bind, guards A/B/C/D still apply.
+            try
+            {
+                var npT  = AccessTools.TypeByName("Mirage.NetworkPlayer");
+                var drT  = AccessTools.TypeByName("Mirage.SocketLayer.DisconnectReason");
+                var disc = (npT != null && drT != null) ? AccessTools.Method(npT, "Disconnect", new[] { drT }) : null;
+                if (disc != null)
+                {
+                    _harmony.Patch(disc, prefix: new HarmonyMethod(
+                        typeof(OverflowDisconnectVetoPatch).GetMethod("Prefix", BindingFlags.Static | BindingFlags.NonPublic)));
+                    Log.LogInfo("[diag] NetworkPlayer.Disconnect(reason) patched (flood guard E: absorb send-buffer overflow -> no lobby-wide mass-DC)");
+                }
+                else Log.LogWarning("[flood] guard E: Mirage.NetworkPlayer.Disconnect(DisconnectReason) not found; overflow-absorb disabled (guards A/B/C/D still apply)");
+            }
+            catch (Exception e) { Log.LogError("[flood] guard E patch failed (guards A/B/C/D still apply): " + e); }
 
             // Flood guard Layer C: raise Mirage's per-connection reliable-send-buffer cap so a transient
             // fleet-order / dead-netId RPC burst is ABSORBED and drained instead of overflowing into a
@@ -581,6 +657,7 @@ namespace NukeStats
         static readonly Dictionary<string, float> _orderDropLog = new Dictionary<string, float>();
 
         // true = ALLOW this fleet order, false = DROP it. Keyed on SteamID (one bucket per player).
+        // On excess: drop + (if Grief.AutoKick) IMMEDIATE kick — do not wait for GriefTick (~seconds).
         internal static bool AllowFleetOrder(Player player)
         {
             try
@@ -589,8 +666,8 @@ namespace NukeStats
                 string id = Sid(player);
                 if (string.IsNullOrEmpty(id)) return true;                 // can't key -> never punish
                 float now = Time.time;
-                float cap  = Mathf.Max(1f, FloodBurst  != null ? FloodBurst.Value  : 6);
-                float rate = Mathf.Max(0.5f, FloodPerSec != null ? FloodPerSec.Value : 3);
+                float cap  = Mathf.Max(1f, FloodBurst  != null ? FloodBurst.Value  : 1);
+                float rate = Mathf.Max(0.5f, FloodPerSec != null ? FloodPerSec.Value : 1);
                 if (!_orderBucket.TryGetValue(id, out var b)) b = (cap, now);   // new player: bucket starts FULL
                 float tokens = Mathf.Min(cap, b.tokens + (now - b.last) * rate);
                 if (tokens >= 1f) { _orderBucket[id] = (tokens - 1f, now); return true; }
@@ -604,9 +681,272 @@ namespace NukeStats
                         Log?.LogWarning($"[flood] rate-dropping fleet orders from {player.PlayerName} ({id}) -> exceeded {rate}/s (burst {cap})");
                     }
                 }
+                MaybeKickOrderFlooder(player, now, (int)rate);           // immediate kick on first excess
                 return false;
             }
             catch (Exception e) { Log?.LogError("AllowFleetOrder: " + e); return true; }
+        }
+
+        // Immediate kick when Layer A drops an excess fleet order. Honours Grief.AutoKick / ReportOnly /
+        // ExemptAdmins + the grief circuit breaker. Throttled ~15s per SteamID. Queues via _tkKicks (TkTick).
+        static readonly Dictionary<string, float> _orderFloodKickAt = new Dictionary<string, float>();
+        static void MaybeKickOrderFlooder(Player player, float now, int rate)
+        {
+            try
+            {
+                if (GriefAutoKick == null || !GriefAutoKick.Value) return;
+                if (player == null) return;
+                string sid = Sid(player);
+                if (string.IsNullOrEmpty(sid) || sid == "0") return;
+                if (_orderFloodKickAt.TryGetValue(sid, out var t) && now - t < 15f) return;
+                if (GriefExemptAdmins == null || GriefExemptAdmins.Value) { if (IsAdmin(player)) return; }
+
+                // circuit breaker (same window as GriefTick): many distinct flooders at once = congestion
+                _griefTrips[sid] = now;
+                float breakerWin = GriefBreakerWindow != null ? Mathf.Max(1, GriefBreakerWindow.Value) : 6f;
+                int breakerDist = GriefBreakerDistinct != null ? Mathf.Max(0, GriefBreakerDistinct.Value) : 3;
+                if (breakerWin > 0)
+                    foreach (var s in new List<string>(_griefTrips.Keys))
+                        if (now - _griefTrips[s] > breakerWin) _griefTrips.Remove(s);
+                bool storm = breakerDist > 0 && _griefTrips.Count >= breakerDist;
+
+                _orderFloodKickAt[sid] = now;
+                _griefActed[sid] = now;
+                bool reportOnly = GriefReportOnly != null && GriefReportOnly.Value;
+                bool hardBan = GriefHardBan != null && GriefHardBan.Value;
+                string action = reportOnly ? "report" : (storm ? "report" : (hardBan ? "ban" : "kick"));
+                string nm = RawNameOf(player);
+                if (storm)
+                {
+                    if (now - _griefStormAt > 30f)
+                    {
+                        _griefStormAt = now;
+                        Log?.LogWarning($"[grief] STORM: {_griefTrips.Count} players exceeded order rate together within {breakerWin}s "
+                            + "-> treated as congestion; auto-kicks SUPPRESSED");
+                    }
+                }
+                else
+                    Log?.LogWarning($"[grief] {action} {nm} ({sid}) immediate excess over {rate}/s (Layer A)");
+
+                Out("{\"t\":\"report\",\"id\":\"" + sid + "\",\"n\":\"" + Esc(nm)
+                    + "\",\"reason\":\"" + (storm ? "command-spam (SUPPRESSED: server-wide storm, likely congestion)" : "command-spam (exceeded order rate)")
+                    + "\",\"count\":0,\"rate\":" + (rate + 1)
+                    + ",\"action\":\"" + action + "\",\"ts\":0}");
+                if (reportOnly || storm) return;
+                try { Instance?.TellPlayer(player, "<color=#FF0000>Removed: unit-command flooding (server protection).</color>"); } catch { }
+                if (hardBan) { _tkBanned.Add(sid); SaveBans(); }
+                _tkKicks.Add(new KeyValuePair<string, float>(sid, now + 0.5f));   // near-immediate; whisper lands first
+            }
+            catch (Exception e) { Log?.LogError("MaybeKickOrderFlooder: " + e); }
+        }
+
+        // ---------------- flood guard Layer D: general per-connection INBOUND RPC rate limit (root-cause fix) ----------------
+        // A single client streaming reliable ServerRpcs is re-broadcast by the server to EVERY connected client, so one
+        // source multiplies by player-count and overflows every client's reliable send buffer -> the lobby-wide mass-DC
+        // flood (Steam k_EResultLimitExceeded -> Mirage "Sent queue is full"). Layer A throttled ONLY CmdSetDestination;
+        // this caps ALL inbound RPCs per SENDER at the HandleRpc choke point (shared with guard B). Excess is dropped
+        // server-side (same safe path as guard B); a connection that SUSTAINS past InboundRpcKickSeconds MAY be auto-kicked.
+        // SAFETY (why the defaults are conservative): this is the choke point for EVERY Cmd, and a 60hz sim can legitimately
+        // stream many state RPCs/s per player -- and dropping a non-move-order RPC is NOT free (a dropped fire/spawn is lost).
+        // So the cap defaults HIGH (400/s) and auto-kick DEFAULTS OFF (drop-only): the [flood-measure] log reports the real
+        // per-connection peak, and the operator tightens the cap / opts into the kick only AFTER seeing that data. Thread
+        // safety: HandleRpc dispatches during NetworkServer.Update on the MAIN thread (Layer A reads Time.time in the same
+        // path and would already be failing-open + log-spamming if it were off-thread), so Humans()/Sid/_tkKicks are safe;
+        // and every path is wrapped so nothing can throw into the netcode (fails open = guard disables, never a crash/kick).
+        internal sealed class RefCmp : IEqualityComparer<object>
+        {
+            public new bool Equals(object a, object b) => ReferenceEquals(a, b);
+            public int GetHashCode(object o) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(o);
+        }
+        static readonly Dictionary<object, (float tokens, float last, float starvedSince)> _rpcBucket =
+            new Dictionary<object, (float, float, float)>(new RefCmp());
+        static readonly Dictionary<object, float> _rpcKickActed = new Dictionary<object, float>(new RefCmp());
+        static readonly Dictionary<object, float> _rpcDropLog   = new Dictionary<object, float>(new RefCmp());
+        static readonly Dictionary<object, int>   _rpcWindow    = new Dictionary<object, int>(new RefCmp());   // measurement: RPCs this 1s window
+        static float _rpcBucketPrune, _rpcWindowStart, _rpcMeasureLog;
+        static int _rpcWindowPeak;
+        static bool _inboundDiagFired;
+
+        // true = DROP this inbound RPC (over the per-connection rate limit), false = allow it. `sender` is HandleRpc's
+        // first arg (__0, the sending connection/player) -- a stable per-connection object we key the token bucket on.
+        internal static bool DropInboundRpc(object sender)
+        {
+            try
+            {
+                if (FloodInboundGuard == null || !FloodInboundGuard.Value || sender == null) return false;
+                if (!_inboundDiagFired) { _inboundDiagFired = true; Log?.LogInfo("[diag] inbound RPC guard ACTIVE (flood guard D); VERIFY sender is an INetworkPlayer -> " + sender.GetType().FullName); }
+                float now = Time.time;
+                float cap  = Mathf.Max(1f, FloodInboundBurst  != null ? FloodInboundBurst.Value  : 800);
+                float rate = Mathf.Max(1f, FloodInboundPerSec != null ? FloodInboundPerSec.Value : 400);
+
+                // MEASUREMENT (always-on while enabled; drives NO drop/kick): count each connection's RPCs in 1s windows and
+                // log the peak every 30s, so the REAL per-connection inbound rate can be observed and the cap/kick tuned from
+                // data instead of a guess. Look at this number before tightening InboundRpcPerSec or enabling the kick.
+                if (now - _rpcWindowStart >= 1f) { _rpcWindowStart = now; _rpcWindow.Clear(); }
+                int wc = (_rpcWindow.TryGetValue(sender, out var wcp) ? wcp : 0) + 1;
+                _rpcWindow[sender] = wc;
+                if (wc > _rpcWindowPeak) _rpcWindowPeak = wc;
+                if (now - _rpcMeasureLog > 30f)
+                {
+                    _rpcMeasureLog = now;
+                    bool kickOn = (FloodInboundKickSeconds != null ? FloodInboundKickSeconds.Value : 0f) > 0f;
+                    Log?.LogInfo($"[flood-measure] peak inbound RPC/s per connection (last 30s) = {_rpcWindowPeak}  [cap {(int)rate}/s burst {(int)cap}, auto-kick {(kickOn ? "ON" : "OFF")}]");
+                    _rpcWindowPeak = 0;
+                }
+
+                // occasional prune so the ref-keyed dicts never outlive the connection set (bounded by concurrent players)
+                if (now - _rpcBucketPrune > 30f)
+                {
+                    _rpcBucketPrune = now;
+                    if (_rpcBucket.Count > 64)
+                    {
+                        var dead = new List<object>();
+                        foreach (var kv in _rpcBucket) if (now - kv.Value.last > 30f) dead.Add(kv.Key);
+                        foreach (var k in dead) { _rpcBucket.Remove(k); _rpcKickActed.Remove(k); _rpcDropLog.Remove(k); }
+                    }
+                }
+
+                if (!_rpcBucket.TryGetValue(sender, out var b)) b = (cap, now, 0f);   // new connection: bucket starts FULL
+                float tokens = Mathf.Min(cap, b.tokens + (now - b.last) * rate);
+                if (tokens >= 1f) { _rpcBucket[sender] = (tokens - 1f, now, 0f); return false; }   // under limit -> allow + clear starvation
+
+                float starvedSince = b.starvedSince > 0f ? b.starvedSince : now;   // over limit: record when starvation began
+                _rpcBucket[sender] = (tokens, now, starvedSince);
+                if (FloodLogDrops != null && FloodLogDrops.Value)   // throttled visibility that a connection is being rate-dropped
+                {
+                    if (!_rpcDropLog.TryGetValue(sender, out var dt) || now - dt > 5f)
+                    { _rpcDropLog[sender] = now; Log?.LogWarning($"[flood] rate-dropping inbound RPCs from a connection -> sustained over {(int)rate}/s (burst {(int)cap})"); }
+                }
+                float kickSecs = FloodInboundKickSeconds != null ? FloodInboundKickSeconds.Value : 0f;   // DEFAULT 0 = drop-only (no kick until measured)
+                if (kickSecs > 0f) kickSecs = Mathf.Max(0.5f, kickSecs);   // floor: a tiny typo must not insta-kick
+                if (kickSecs > 0f && now - starvedSince >= kickSecs) MaybeKickFlooder(sender, now, (int)rate);
+                return true;   // DROP the excess RPC
+            }
+            catch (Exception e) { Log?.LogError("DropInboundRpc: " + e); return false; }   // fail-open: never drop on error
+        }
+
+        // Queue a one-shot kick of a connection sustained-flooding inbound RPCs. Main thread; reuses the tk-kick drain
+        // (TkTick). Resolves sender -> Player for the SteamID/report; admins exempt; throttled once per ~15s per sender.
+        static void MaybeKickFlooder(object sender, float now, int rate)
+        {
+            try
+            {
+                if (_rpcKickActed.TryGetValue(sender, out var t) && now - t < 15f) return;   // throttle re-acting per connection
+                _rpcKickActed[sender] = now;
+                Player p = null;
+                try
+                {
+                    foreach (var h in Humans())
+                    {
+                        if (ReferenceEquals(h.Owner, sender)) { p = h; break; }
+                        object conn = h.Owner != null ? ReflectGet(h.Owner, "Connection") : null;
+                        if (conn != null && ReferenceEquals(conn, sender)) { p = h; break; }
+                    }
+                }
+                catch { }
+                if (p == null) { Log?.LogWarning($"[flood] inbound RPC flood over {rate}/s from an unresolved connection -> already rate-dropping (no player to kick)"); return; }
+                string sid = Sid(p); string nm = RawNameOf(p);
+                if (GriefExemptAdmins != null && GriefExemptAdmins.Value && IsAdmin(p)) { Log?.LogWarning($"[flood] {nm} ({sid}) over {rate}/s inbound but ADMIN-exempt -> not kicked (still rate-dropped)"); return; }
+                if (string.IsNullOrEmpty(sid) || sid == "0") return;   // unresolved -> the drop already protects the lobby
+                Log?.LogWarning($"[flood] INBOUND RPC flood from {nm} ({sid}) -> sustained over {rate}/s; auto-kick (guard D)");
+                // report to the webcc Reports tab ONLY when a kick actually fires (ts=0 -> the bot stamps the real time)
+                Out("{\"t\":\"report\",\"id\":\"" + sid + "\",\"n\":\"" + Esc(nm)
+                    + "\",\"reason\":\"RPC flood (sustained inbound rate) - server protection\",\"count\":0,\"rate\":" + rate
+                    + ",\"action\":\"kick\",\"ts\":0}");
+                try { Instance?.TellPlayer(p, "<color=#FF0000>Removed: RPC flooding (server protection).</color>"); } catch { }
+                _tkKicks.Add(new KeyValuePair<string, float>(sid, now + 0.5f));   // drained by TkTick on the main thread
+            }
+            catch (Exception e) { Log?.LogError("MaybeKickFlooder: " + e); }
+        }
+
+        // ---------------- flood guard Layer E: absorb the send-buffer overflow + kick its source ----------------
+        // The actual mass-DC mechanism: a flood overflows every client's reliable send buffer, and Mirage's reaction is
+        // to DISCONNECT each overflowing player (reason 5) -> the game kicks the WHOLE lobby (not our guards). Guard E
+        // (OverflowDisconnectVetoPatch) ALWAYS vetoes that reason-5 disconnect so the overflow is ABSORBED. A genuinely
+        // dead client is still dropped by Mirage's own Timeout (reason 1, un-vetoed) -- so no grace valve is needed and
+        // there are no zombies. To STOP the flood we attribute each absorbed overflow to the client whose ServerRpc is
+        // being broadcast at that instant (_curSource) and kick a source that overflows too many DISTINCT victims: only
+        // a genuine amplifier overflows many distinct players, a legit sender overflows ~none -> no false-kick, plus a
+        // congestion breaker. Blame/kick is MAIN-THREAD-ONLY (gated on _mainThreadId + locked) so the netcode cannot
+        // race the dictionaries; the absorb path itself touches no shared dictionary, so it is thread-safe regardless.
+        // Documented limits: SyncVar/spawn-storm floods run OUTSIDE an RPC so _curSource is null -> absorbed but source
+        // not kicked; and a match-start string-store overflow uses the no-arg Disconnect() overload, not covered here.
+        [ThreadStatic] static object _curSource;                     // per-thread: the ServerRpc sender being dispatched/broadcast right now
+        static readonly Dictionary<object, (HashSet<object> victims, float last)> _ovBlame = new Dictionary<object, (HashSet<object>, float)>(new RefCmp());
+        static readonly Dictionary<object, float> _ovKickActed = new Dictionary<object, float>(new RefCmp());
+        static readonly object _ovLock = new object();
+        static float _ovStormAt;
+        internal static int _mainThreadId;                           // captured in Awake (definitely main thread)
+        internal static void SetRpcSource(object s) { _curSource = s; }
+        internal static void ClearRpcSource() { _curSource = null; }
+
+        // Called from OverflowDisconnectVetoPatch each time a buffer-full disconnect is absorbed; `victim` = the
+        // NetworkPlayer whose buffer overflowed. Blames the current RPC source and kicks it once it has overflowed
+        // OverflowKickThreshold DISTINCT victims within ~3s (with a congestion breaker). Main-thread-only + locked.
+        internal static void NoteOverflowAbsorbed(object victim)
+        {
+            try
+            {
+                if (System.Threading.Thread.CurrentThread.ManagedThreadId != _mainThreadId) return;   // blame/kick only on the main thread (netcode-safe)
+                object src = _curSource;
+                if (src == null || victim == null) return;           // overflow OUTSIDE an RPC (AI-tick / SyncVar / spawn broadcast) -> absorb only, blame no one
+                int thr = OverflowKickThreshold != null ? OverflowKickThreshold.Value : 6;
+                if (thr <= 0) return;                                // absorb-only mode
+                float now; try { now = Time.time; } catch { return; }
+                object toKick = null;
+                lock (_ovLock)
+                {
+                    if (!_ovBlame.TryGetValue(src, out var b) || now - b.last > 3f) b = (new HashSet<object>(new RefCmp()), now);   // >3s gap = new burst window
+                    b.victims.Add(victim); b.last = now;
+                    _ovBlame[src] = b;
+                    if (_ovBlame.Count > 64 || _ovKickActed.Count > 64)   // time-prune BOTH maps independently (a kicked source leaves _ovBlame, so its _ovKickActed entry must be aged out on its own or it leaks)
+                    {
+                        var deadB = new List<object>();
+                        foreach (var kv in _ovBlame) if (now - kv.Value.last > 5f) deadB.Add(kv.Key);
+                        foreach (var k in deadB) _ovBlame.Remove(k);
+                        var deadK = new List<object>();
+                        foreach (var kv in _ovKickActed) if (now - kv.Value > 20f) deadK.Add(kv.Key);
+                        foreach (var k in deadK) _ovKickActed.Remove(k);
+                    }
+                    if (b.victims.Count >= thr)
+                    {
+                        int flooding = 0;                            // congestion breaker: many sources each hitting many victims = server-wide lag, not one griefer
+                        foreach (var kv in _ovBlame) if (now - kv.Value.last <= 3f && kv.Value.victims.Count >= thr) flooding++;
+                        if (flooding >= 3) { if (now - _ovStormAt > 30f) { _ovStormAt = now; Log?.LogWarning($"[flood] overflow STORM: {flooding} sources flooding at once -> treated as congestion; auto-kick SUPPRESSED (still absorbing)"); } }
+                        else { _ovBlame.Remove(src); toKick = src; }
+                    }
+                }
+                if (toKick != null) KickOverflowSource(toKick, now);
+            }
+            catch (Exception e) { Log?.LogError("NoteOverflowAbsorbed: " + e); }
+        }
+
+        // Kick the connection overflowing everyone's send buffer (guard E part 2). Resolves source -> Player; admins
+        // exempt; throttled per source; queued via the tk-kick drain (TkTick). Main thread (from NoteOverflowAbsorbed).
+        static void KickOverflowSource(object src, float now)
+        {
+            try
+            {
+                if (_ovKickActed.TryGetValue(src, out var t) && now - t < 15f) return;   // throttle re-acting per source
+                _ovKickActed[src] = now;
+                Player p = null;
+                foreach (var h in Humans())
+                {
+                    if (ReferenceEquals(h.Owner, src)) { p = h; break; }
+                    object conn = h.Owner != null ? ReflectGet(h.Owner, "Connection") : null;
+                    if (conn != null && ReferenceEquals(conn, src)) { p = h; break; }
+                }
+                if (p == null) { Log?.LogWarning("[flood] send-buffer overflow flood from an unresolved connection -> absorbed (no player to kick)"); return; }
+                string sid = Sid(p); string nm = RawNameOf(p);
+                if (GriefExemptAdmins != null && GriefExemptAdmins.Value && IsAdmin(p)) { Log?.LogWarning($"[flood] {nm} ({sid}) is overflowing send buffers but ADMIN-exempt -> absorbed, not kicked"); return; }
+                if (string.IsNullOrEmpty(sid) || sid == "0") return;
+                Log?.LogWarning($"[flood] SEND-BUFFER OVERFLOW flood from {nm} ({sid}) -> auto-kick (guard E: overflow source)");
+                Out("{\"t\":\"report\",\"id\":\"" + sid + "\",\"n\":\"" + Esc(nm)
+                    + "\",\"reason\":\"send-buffer overflow flood (mass-DC exploit) - server protection\",\"count\":0,\"rate\":0,\"action\":\"kick\",\"ts\":0}");
+                try { Instance?.TellPlayer(p, "<color=#FF0000>Removed: flooding the network (server protection).</color>"); } catch { }
+                _tkKicks.Add(new KeyValuePair<string, float>(sid, now + 0.2f));   // drained by TkTick on the main thread
+            }
+            catch (Exception e) { Log?.LogError("KickOverflowSource: " + e); }
         }
 
         // COMMAND POLICY: which units may be ordered via CmdSetDestination, ON TOP of the per-sender rate limit.
@@ -1426,7 +1766,8 @@ namespace NukeStats
                 if (string.IsNullOrEmpty(vid) || vid == "0" || vid == kid) return;     // human victim, not self
                 if (killer.HQ != null && victim.HQ != null && killer.HQ == victim.HQ) return;  // enemy team only
                 Out("{\"t\":\"kill\",\"kid\":\"" + kid + "\",\"kn\":\"" + Esc(RawNameOf(killer)) +
-                    "\",\"vid\":\"" + vid + "\",\"vn\":\"" + Esc(RawNameOf(victim)) + "\"}");
+                    "\",\"kc\":\"" + FactionColour(killer) + "\",\"vid\":\"" + vid + "\",\"vn\":\"" + Esc(RawNameOf(victim)) +
+                    "\",\"vc\":\"" + FactionColour(victim) + "\"}");   // kc/vc = owner-picked team colours for the bot's 'splashed' line
             }
             catch (Exception e) { Log?.LogError("OnKill: " + e); }
         }
@@ -1458,29 +1799,63 @@ namespace NukeStats
         static int StreakTier(int n) => n >= 50 ? 4 : n >= 25 ? 3 : n >= 10 ? 2 : n >= 5 ? 1 : 0;
         static string TierColour(int t) => t >= 4 ? "#FF1493" : t == 3 ? "#FF3B3B" : t == 2 ? "#FF8C00" : "#FFD200";
 
-        // faction colour for a player's NAME in the kill feed (blue Boscali / red Primeva).
+        // faction colour for a player's NAME in the kill feed -- hardcoded FALLBACK approximation (blue Boscali /
+        // red Primeva), used only if the game's real faction colour can't be read.
         static string FactionColour(Player p)
         {
             try
             {
                 string f = (p != null && p.HQ != null && p.HQ.faction != null) ? p.HQ.faction.factionName : "";
                 f = (f ?? "").ToLowerInvariant();
-                if (f.StartsWith("bosc") || f == "bdf") return "#5BA3FF";
-                if (f.StartsWith("prim") || f == "pala") return "#FF6B5B";
+                if (f.StartsWith("bosc") || f == "bdf") return "#d4baff";   // BDF / Boscali - owner-picked lavender (matches chat)
+                if (f.StartsWith("prim") || f == "pala") return "#ffe294";  // PALA / Primeva - owner-picked yellow
             }
             catch { }
             return "#CFCFCF";
         }
 
-        // "[ABBR] Name" - rank tag in the RANK colour, name in the player's TEAM colour.
+        // Owner-picked team colour for a NON-PLAYER killer (SAM / AI aircraft / ground / naval unit),
+        // keyed off its faction HQ -- so a SAM/AI kill-feed line shows in the same team colour as a player name.
+        static string FactionColour(FactionHQ hq)
+        {
+            try
+            {
+                string f = (hq != null && hq.faction != null) ? hq.faction.factionName : "";
+                f = (f ?? "").ToLowerInvariant();
+                if (f.StartsWith("bosc") || f == "bdf") return "#d4baff";   // BDF / Boscali - owner-picked lavender (matches chat)
+                if (f.StartsWith("prim") || f == "pala") return "#ffe294";  // PALA / Primeva - owner-picked yellow
+            }
+            catch { }
+            return "#CFCFCF";
+        }
+
+        // The game's ACTUAL faction colour for a player -- the exact Color the client paints chat names with -- as
+        // "#RRGGBB". Read live so the kill feed matches chat EXACTLY; falls back to the hardcoded approximation.
+        static string GameFactionColour(Player p)
+        {
+            try
+            {
+                if (p != null && p.HQ != null && p.HQ.faction != null)
+                    return "#" + ColorUtility.ToHtmlStringRGB(p.HQ.faction.color);
+            }
+            catch { }
+            return FactionColour(p);
+        }
+
+        // "[ABBR] Name". TEAM-COLOUR mode (default, KillFeed.TeamColourNames): rank tag + name BOTH in the game's real
+        // team colour -- identical to chat. Legacy: rank tag in the rank-tier colour, name in the approx faction colour.
         static string RankNameTag(Player p)
         {
             string raw = SafeText(RawNameOf(p));
-            string fc = FactionColour(p);
+            bool team = (KillFeedTeamColour == null || KillFeedTeamColour.Value);
+            string nameC = FactionColour(p);   // owner-picked team colours (NOT the game faction.color)
             LoadRankMap();
             if (RankMap.TryGetValue(Sid(p), out var rc) && !string.IsNullOrEmpty(rc.label))
-                return $"<color={rc.color}>[{rc.label}]</color> <color={fc}>{raw}</color>";
-            return $"<color={fc}>{raw}</color>";
+            {
+                if (team) return $"<color={nameC}>[{rc.label}] {raw}</color>";                 // tag + name in ONE team-colour span (matches chat)
+                return $"<color={rc.color}>[{rc.label}]</color> <color={nameC}>{raw}</color>";  // legacy: rank-tier tag colour
+            }
+            return $"<color={nameC}>{raw}</color>";
         }
 
         // Count one kill (any unit) toward the killer's rolling 5s streak.
@@ -1512,8 +1887,9 @@ namespace NukeStats
                     if (p != null)
                     {
                         string n = s.count >= 50 ? "50+" : s.count.ToString();
+                        string cntC = (KillFeedTeamColour != null && KillFeedTeamColour.Value) ? "#FFFFFF" : TierColour(tier);
                         string ln = RenderKillFeed("streak",
-                            $"<color={TierColour(tier)}>{n}</color> <color=#FFFFFF>confirmed kills for</color> {RankNameTag(p)}<color=#FFFFFF>!</color>",
+                            $"<color={cntC}>{n}</color> <color=#FFFFFF>confirmed kills for</color> {RankNameTag(p)}<color=#FFFFFF>!</color>",
                             RawNameOf(p), "", "", "", "", n, "", "");
                         if (ln != null) Instance?.BroadcastAll(ln);
                         Log?.LogInfo($"[killfeed] streak {s.count} for {RawNameOf(p)} (tier {tier})");
@@ -1557,8 +1933,9 @@ namespace NukeStats
                 else if (low.Contains("cursor"))    { cls = "CURSOR";    colour = "#C080FF"; }
                 else                                { cls = "SHIP";      colour = "#FF8C00"; }
                 // chat-feed style line: "[RANK] Name sunk <ship>"
+                string shipC = (KillFeedTeamColour != null && KillFeedTeamColour.Value) ? "#FFFFFF" : colour;
                 string ln = RenderKillFeed("ship_sink",
-                    $"{RankNameTag(killer)} <color=#FFFFFF>sunk</color> <color={colour}>{nm}</color>",
+                    $"{RankNameTag(killer)} <color=#FFFFFF>sunk</color> <color={shipC}>{nm}</color>",
                     RawNameOf(killer), "", "", "", "", "", nm, "");
                 if (ln != null) Instance?.BroadcastAll(ln);
                 Log?.LogInfo($"[killfeed] {cls} sink: {nm} by {RawNameOf(killer)}");
@@ -2275,7 +2652,7 @@ namespace NukeStats
                             { _stratStrikes++; _stratLast = Time.time; }
                             else
                             {
-                                string ln = RenderKillFeed("ai_kill", $"{vt} <color=#FFFFFF>was shot down by</color> <color=#FF6A00>{killerName}</color>",
+                                string ln = RenderKillFeed("ai_kill", $"{vt} <color=#FFFFFF>was shot down by</color> <color={FactionColour(killerHQ)}>{killerName}</color>",
                                     killerName, killerName, vname, deadName ?? "", killWeapon, "", "", "");
                                 if (ln != null) Instance?.BroadcastAll(ln);
                             }
@@ -2525,12 +2902,10 @@ namespace NukeStats
             catch (Exception e) { Log?.LogError("TkTick: " + e); }
         }
 
-        // ===== ANTI-GRIEF: detect a single connection mass-commanding units to brick the server (the
-        // reliable-send-buffer flood that mass-disconnects EVERYONE) and auto-kick THAT one offender (not the
-        // lobby) + emit a report the webcc Reports tab shows with a Ban button. Two-factor by default: a player
-        // must own > threshold GroundVehicles AND be SUSTAINED-flooding move-orders (a macro/held-key/loop) --
-        // so a legit base-builder who 'select-all + move once' is never kicked. Reuses the teamkill kick/ban
-        // path (Kick / _tkKicks / _tkBanned). Fail-open everywhere. =====
+        // ===== ANTI-GRIEF: ONE rate-kick path = Layer A MaybeKickOrderFlooder (Flood.FleetOrdersPerSec +
+        // Grief.AutoKick). GriefTick does NOT rate-kick while Flood.Enforce is on (that was the double-kick).
+        // GriefTick still handles owned-unit trips when RequireActiveFlooding is OFF, plus diag. Storm breaker
+        // = Grief.Breaker* shared via _griefTrips (bot grief_flood kick path retired). Fail-open. =====
         internal static ConfigEntry<bool> GriefAutoKick, GriefRequireFlooding, GriefHardBan, GriefReportOnly, GriefExemptAdmins;
         internal static ConfigEntry<int>  GriefOwnedThreshold, GriefFloodPerSec, GriefBreakerDistinct, GriefBreakerWindow;
         static readonly Dictionary<string, int>   _orderAttempts = new Dictionary<string, int>();   // CmdSetDestination attempts since last GriefTick
@@ -2539,7 +2914,7 @@ namespace NukeStats
         static readonly Dictionary<string, float> _griefTrips    = new Dictionary<string, float>();  // sid -> last trip time (server-wide circuit breaker)
         static float _griefStormAt;   // last time a storm-suppression line was logged (throttle)
         static float _nextGriefScan, _lastGriefScan;
-        const float GRIEF_INTERVAL = 2f;
+        const float GRIEF_INTERVAL = 1f;   // 1s window: owned-unit kicks + rate-kick ONLY when Flood.Enforce is off
 
         // called from FleetOrderFloodPatch.Prefix on EVERY CmdSetDestination attempt (before the rate/policy gates)
         internal static void NoteOrderAttempt(Player p)
@@ -2568,25 +2943,29 @@ namespace NukeStats
                 bool enabled      = GriefAutoKick.Value;
                 int  ownThresh    = GriefOwnedThreshold != null ? Mathf.Max(1, GriefOwnedThreshold.Value) : 12;
                 bool requireFlood = GriefRequireFlooding == null || GriefRequireFlooding.Value;
-                int  floodPerSec  = GriefFloodPerSec != null ? Mathf.Max(1, GriefFloodPerSec.Value) : 3;
+                // ONE rate source: Flood.FleetOrdersPerSec only (Grief.FloodOrdersPerSec is retired, never read)
+                int  floodPerSec  = FloodPerSec != null ? Mathf.Max(1, FloodPerSec.Value) : 1;
                 bool reportOnly   = GriefReportOnly != null && GriefReportOnly.Value;
                 bool hardBan      = GriefHardBan != null && GriefHardBan.Value;
                 bool exemptAdmins = GriefExemptAdmins == null || GriefExemptAdmins.Value;
                 bool diag         = CommandDiagLog != null && CommandDiagLog.Value;
                 int  breakerDist  = GriefBreakerDistinct != null ? Mathf.Max(0, GriefBreakerDistinct.Value) : 3;   // 0 = breaker off
                 float breakerWin  = GriefBreakerWindow != null ? Mathf.Max(1, GriefBreakerWindow.Value) : 6f;
+                // When Flood.Enforce is ON, Layer A MaybeKickOrderFlooder is the SOLE rate-kick path.
+                // GriefTick must not also trip on rate (that was the double-kick). Rate trips here ONLY if Enforce is off.
+                bool floodEnforceOn = FloodEnforce != null && FloodEnforce.Value;
 
                 // snapshot + reset the per-player order-attempt counters for this window
                 var attempts = new Dictionary<string, int>(_orderAttempts);
                 _orderAttempts.Clear();
 
-                // update sustained-flooding streaks (high order RATE held across consecutive ticks)
+                // trip when rate STRICTLY exceeds the allowed max (1/s allowed → 2+/s trips)
                 var streakKeys = new List<string>(_griefStreak.Keys);
                 foreach (var id in streakKeys) if (!attempts.ContainsKey(id)) _griefStreak[id] = 0;   // decay idle
                 foreach (var kv in attempts)
                 {
                     float rate = kv.Value / elapsed;
-                    _griefStreak[kv.Key] = rate >= floodPerSec
+                    _griefStreak[kv.Key] = rate > floodPerSec
                         ? (_griefStreak.TryGetValue(kv.Key, out var st) ? st : 0) + 1
                         : 0;
                 }
@@ -2614,32 +2993,33 @@ namespace NukeStats
 
                     int owned = ownedCount.TryGetValue(p, out var oc2) ? oc2 : 0;
                     int streak  = _griefStreak.TryGetValue(sid, out var s2) ? s2 : 0;
-                    bool flooding = streak >= 2;                  // ~2 ticks (~4s) of sustained high order rate
-                    int rateNow = attempts.TryGetValue(sid, out var a2) ? (int)(a2 / GRIEF_INTERVAL) : 0;
+                    bool flooding = streak >= 1;
+                    int rateNow = attempts.TryGetValue(sid, out var a2) ? (int)(a2 / elapsed) : 0;
 
                     if (diag && (owned > 0 || rateNow > 0))
                         Log?.LogInfo($"[grief] {RawNameOf(p)} ({sid}) owned={owned} rate={rateNow}/s streak={streak} thr={ownThresh} flooding={flooding}");
 
                     if (!enabled) continue;
-                    // AGGRESSIVE: sustained command-spam ALONE trips it -- catch a single connection
-                    // re-commanding units >= floodPerSec/s (held ~4s), regardless of how many units they
-                    // own (the spam can be on units they don't even own). OwnedUnitThreshold is now an
-                    // OPTIONAL escalator: with RequireActiveFlooding=false, owning a huge fleet also trips.
-                    bool trip = requireFlood ? flooding : (flooding || owned > ownThresh);
+                    // Rate kick: Layer A only when Flood.Enforce is on. GriefTick rate trip ONLY when Enforce is off
+                    // (otherwise two layers trip the same flooder). Owned-unit kick is separate (RequireActiveFlooding OFF).
+                    bool rateTrip = flooding && !floodEnforceOn;
+                    bool ownedTrip = !requireFlood && owned > ownThresh;
+                    bool trip = requireFlood ? rateTrip : (rateTrip || ownedTrip);
                     if (!trip) continue;
                     if (exemptAdmins && IsAdmin(p)) continue;          // never auto-kick an admin (legit mass-command)
                     if (_griefActed.TryGetValue(sid, out var t) && now - t < 15f) continue;   // throttle re-acting
                     _griefActed[sid] = now;
 
-                    // SERVER-WIDE CIRCUIT BREAKER (#8): record this trip + prune the window. If MANY DISTINCT
-                    // players trip together it's a synchronized order/lag SPIKE (congestion), not grief -> SUPPRESS
-                    // all kicks/bans (we still emit each report so admins see it). Mirrors the bot's flood-breaker.
+                    // SERVER-WIDE CIRCUIT BREAKER: same Grief.Breaker* keys as Layer A (ONE breaker, shared _griefTrips).
                     _griefTrips[sid] = now;
                     if (breakerWin > 0)
                         foreach (var s in new List<string>(_griefTrips.Keys))
                             if (now - _griefTrips[s] > breakerWin) _griefTrips.Remove(s);
                     bool storm = breakerDist > 0 && _griefTrips.Count >= breakerDist;
 
+                    string reason = ownedTrip && !rateTrip
+                        ? "command-spam (owned-unit threshold)"
+                        : "command-spam (exceeded order rate)";
                     string action = reportOnly ? "report" : (storm ? "report" : (hardBan ? "ban" : "kick"));
                     if (storm)
                     {
@@ -2654,13 +3034,13 @@ namespace NukeStats
                         Log?.LogWarning($"[grief] {action} {RawNameOf(p)} ({sid}) owned={owned} rate={rateNow}/s streak={streak}");
                     // emit the report ([NOSTATS] line the bot tails); ts=0 -> the bot stamps the real time on ingest
                     Out("{\"t\":\"report\",\"id\":\"" + sid + "\",\"n\":\"" + Esc(RawNameOf(p))
-                        + "\",\"reason\":\"" + (storm ? "command-spam (SUPPRESSED: server-wide storm, likely congestion)" : "command-spam (sustained order rate)")
+                        + "\",\"reason\":\"" + (storm ? "command-spam (SUPPRESSED: server-wide storm, likely congestion)" : reason)
                         + "\",\"count\":" + owned + ",\"rate\":" + rateNow
                         + ",\"action\":\"" + action + "\",\"ts\":0}");
                     if (reportOnly || storm) continue;   // storm -> report only, never kick (don't amplify congestion into a mass-kick)
-                    Instance?.TellPlayer(p, "<color=#FF0000>Auto-removed: commanding too many units at once (server protection).</color>");
+                    Instance?.TellPlayer(p, "<color=#FF0000>Removed: unit-command flooding (server protection).</color>");
                     if (hardBan) { _tkBanned.Add(sid); SaveBans(); }
-                    _tkKicks.Add(new KeyValuePair<string, float>(sid, now + 2.5f));   // delayed kick (let the msg land) -> drained by TkTick
+                    _tkKicks.Add(new KeyValuePair<string, float>(sid, now + 0.5f));   // near-immediate kick
                 }
             }
             catch (Exception e) { Log?.LogError("GriefTick: " + e); }
@@ -2789,6 +3169,9 @@ namespace NukeStats
             {
                 if (_cfgFile == null) return "no-config";
                 if (string.IsNullOrEmpty(key)) return "no-key";
+                // RETIRED alias: never leave Grief.FloodOrdersPerSec as a second source of truth
+                if (key.Equals("Grief.FloodOrdersPerSec", StringComparison.OrdinalIgnoreCase))
+                    key = "Flood.FleetOrdersPerSec";
                 foreach (var def in _cfgFile.Keys)
                 {
                     if (!CfgKey(def).Equals(key, StringComparison.OrdinalIgnoreCase)) continue;
@@ -3046,6 +3429,32 @@ namespace NukeStats
         {
             try { var cm = Cm ?? (Cm = UnityEngine.Object.FindObjectOfType<ChatManager>()); if (cm != null) cm.RpcServerMessage(msg, false); }
             catch (Exception e) { Log?.LogError("BroadcastAll: " + e); }
+        }
+
+        // Absolute faction-coloured "X joined Y" (replaces native RpcPlayerJoinFactionMessage friend/foe colours).
+        // Uses the same FactionColour hexes as the killfeed: PALA #ffe294, BDF #d4baff.
+        internal static void AnnounceJoinFaction(Player player, FactionHQ hq)
+        {
+            try
+            {
+                if (player == null || hq == null) return;
+                string col = FactionColour(hq);
+                string name = SafeText(RawNameOf(player));
+                if (string.IsNullOrEmpty(name)) return;
+                string fac = "";
+                try
+                {
+                    if (hq.faction != null)
+                        fac = !string.IsNullOrEmpty(hq.faction.factionExtendedName)
+                            ? hq.faction.factionExtendedName
+                            : (hq.faction.factionName ?? "");
+                }
+                catch { }
+                if (string.IsNullOrEmpty(fac)) fac = "a faction";
+                fac = SafeText(fac);
+                Instance?.BroadcastAll($"<color={col}>{name}</color> joined <color={col}>{fac}</color>");
+            }
+            catch (Exception e) { Log?.LogError("AnnounceJoinFaction: " + e); }
         }
 
         // ---- admin auth for the IN-GAME commands (config; the user named this SteamID) ----
@@ -4881,6 +5290,38 @@ namespace NukeStats
         }
     }
 
+    // Replace the native "X joined Y faction" GameMessage (friend=blue / foe=red via ColorFromFaction)
+    // with the SAME absolute faction colours the killfeed uses (PALA yellow #ffe294, BDF lavender #d4baff).
+    // Suppress the ClientRpc so clients never paint relative colours; rebroadcast a pre-coloured line.
+    [HarmonyPatch(typeof(MessageManager), "RpcPlayerJoinFactionMessage")]
+    internal static class JoinFactionMsgPatch
+    {
+        static bool _fired;
+        static bool Prefix(Player player, FactionHQ hq)
+        {
+            if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] RpcPlayerJoinFactionMessage hooked (absolute faction colours)"); }
+            try { NukeStatsPlugin.AnnounceJoinFaction(player, hq); }
+            catch (Exception e) { NukeStatsPlugin.Log?.LogError("JoinFactionMsgPatch: " + e); }
+            return false;   // never send the native friend/foe-coloured RPC
+        }
+    }
+
+    // Hide the native "repaired / rearmed / refueled" notification (fires when a player services their
+    // aircraft at a base). NOTHING in the plugin or the bot emits this line -- it is a native MessageManager
+    // RPC, so before this patch NO toggle could suppress it. Mirror the kill/pilot suppress patches.
+    // RpcRepairMessage(PersistentID id) confirmed via ilspycmd as the sole repair RPC (message "was repaired").
+    [HarmonyPatch(typeof(MessageManager), "RpcRepairMessage")]
+    internal static class RepairMsgSuppressPatch
+    {
+        static bool _fired;
+        static bool Prefix()
+        {
+            if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] RpcRepairMessage hooked (repair feed suppression)"); }
+            // Show only when Hide is explicitly OFF; fail-open (show) if the config is unresolved.
+            return NukeStatsPlugin.HideRepairMessages == null || !NukeStatsPlugin.HideRepairMessages.Value;
+        }
+    }
+
     // NuclearSkill: a base capture gives the capturing player +CaptureBonus to their current life's score.
     [HarmonyPatch(typeof(FactionHQ), "ReportCaptureLocationAction")]
     internal static class CapturePatch
@@ -5126,8 +5567,16 @@ namespace NukeStats
         static TryGetIdDel _tryGetId;
         static bool _fired;
 
-        static bool Prefix(object __instance, uint __1, ref bool __result)
+        static bool Prefix(object __instance, object __0, uint __1, ref bool __result)
         {
+            // GUARD E source-attribution: record which connection's ServerRpc is being dispatched, so a send-buffer
+            // overflow that fires while broadcasting it is blamed on THIS source. Postfix clears it after dispatch, so
+            // an overflow OUTSIDE an RPC (e.g. an AI-tick broadcast) blames no one -> absorb-only, never a false kick.
+            NukeStatsPlugin.SetRpcSource(__0);
+            // ROOT-CAUSE flood guard D: general per-connection inbound RPC rate limit (ALL rpc types). Runs FIRST so it
+            // also catches RPCs to LIVE netIds (guard B below only handles already-dead ones). Drops the excess with the
+            // game's own safe result; DropInboundRpc fails open internally (never throws).
+            if (NukeStatsPlugin.DropInboundRpc(__0)) { __result = false; return false; }
             try
             {
                 var cfg = NukeStatsPlugin.FloodDropDeadNet;
@@ -5154,6 +5603,45 @@ namespace NukeStats
             }
             catch (Exception e) { NukeStatsPlugin.Log?.LogError("DeadNetIdDrop: " + e); }
             return true;
+        }
+
+        // guard E: clear the RPC source after dispatch, so a send-buffer overflow that fires OUTSIDE an RPC context
+        // (e.g. an AI-tick broadcast) is attributed to no one -> absorbed but never blamed/kicked. Harmony runs the
+        // postfix even when Prefix returned false (a dropped RPC broadcast nothing), which is exactly what we want.
+        static void Postfix() { NukeStatsPlugin.ClearRpcSource(); }
+    }
+
+    // FLOOD GUARD E (the real mass-DC fix): veto Mirage's buffer-full disconnect. When a client's reliable send buffer
+    // overflows, Mirage.NetworkPlayer.Send catches BufferFullException and calls Disconnect((DisconnectReason)5) -- and a
+    // flood overflows EVERY client's buffer at once, so the game itself disconnects the whole lobby (not our guards).
+    // DisconnectReason 5 is used ONLY for this (verified by decompiling Mirage.dll: exactly two call sites, both the
+    // buffer-full catch). We prefix Disconnect(reason) and ALWAYS VETO reason 5 -> the overflow is ABSORBED (the
+    // un-queueable packet is dropped for that one connection), the player STAYS. No grace valve: a genuinely-dead client
+    // is still dropped by Mirage's own Timeout (reason 1, un-vetoed). COMMAND-AGNOSTIC. A SUSTAINED flood causes desync
+    // (dropped reliable packets) until the source stops or is kicked, but nobody is mass-kicked. Applied MANUALLY from
+    // Awake (reflective lookup, no hard Mirage type dependency). Fail-open: any error -> allow the disconnect (normal).
+    internal static class OverflowDisconnectVetoPatch
+    {
+        static bool _fired;
+
+        // return false = SKIP the original Disconnect (veto). true = let it run. __instance = the NetworkPlayer whose
+        // send buffer overflowed (the victim); __0 = DisconnectReason (boxed as object). ALWAYS vetoes reason 5; a
+        // genuinely-dead client is still dropped by Mirage's own Timeout (reason 1), which we don't touch -> no zombies,
+        // no grace valve needed (the old grace valve re-enabled the mass-DC after N seconds -- removed).
+        static bool Prefix(object __instance, object __0)
+        {
+            try
+            {
+                var cfg = NukeStatsPlugin.OverflowAbsorb;
+                if (cfg == null || !cfg.Value) return true;                          // feature off -> normal game behavior
+                int reason;
+                try { reason = System.Convert.ToInt32(__0); } catch { return true; }
+                if (reason != 5) return true;                                        // ONLY the send-buffer-full disconnect; normal leaves/kicks/TIMEOUTS pass through untouched
+                if (!_fired) { _fired = true; NukeStatsPlugin.Log?.LogInfo("[diag] send-buffer overflow ABSORB ACTIVE (flood guard E): buffer-full disconnects vetoed; dead clients still drop via Mirage Timeout"); }
+                NukeStatsPlugin.NoteOverflowAbsorbed(__instance);                    // blame the current RPC source (main-thread-gated); kick it if it floods many distinct victims
+                return false;                                                         // ABSORB: skip the disconnect, keep the player connected
+            }
+            catch (Exception e) { NukeStatsPlugin.Log?.LogError("OverflowVeto: " + e); return true; }   // fail to default game behavior (never break disconnects)
         }
     }
 

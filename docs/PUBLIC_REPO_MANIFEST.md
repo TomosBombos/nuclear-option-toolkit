@@ -47,6 +47,7 @@ Plus a generated, hardened `.gitignore`.
 - **PII / runtime state:** `ranks*.json*` (incl. the `ranks.json.bak` that escaped the old rule — 544 SteamIDs), `backups/`, `*.jsonl` (ledgers, `admin_commands`), `match_history.json`, `*.log`, `dashboard_state.json`, `schedule.json`, `command_centre_settings.json`, `console_filters.json`, `plugin_*.txt`, `bot_overrides.json`, `*.done`.
 - **Build / binaries:** `*.dll`, `pending_plugin.*`, `deployed_plugin.*`, `NukeStats/{libs,bin,obj,bepinex_pack}`, the proprietary game assemblies (license).
 - **Bulk / dumps:** `archive/` (774 MB), `_server_backup/`, `map_backup_*/`, `mapdata/`, `docs/_*.json`, `__pycache__/`.
+- **Local AI / agent clutter:** `AGENTS.md` (and any `.cursor/` rules) — local-dev only; **not** on the whitelist (`REPO_ROOT_FILES` / `ROOT_FILES`). Keep it out of public trees.
 
 ## SCRUB transforms (applied to the copies)
 

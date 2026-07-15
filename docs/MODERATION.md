@@ -91,16 +91,18 @@ Both file into the same Reports tab, and both exempt admins by default.
 
 **How to use it:** It runs automatically. Validate your thresholds with report-only mode before you let it kick.
 
-**Settings (plugin side, Web dashboard Settings, live):**
-- `Grief.AutoKick` - default `true` - master switch for detect + report + kick.
-- `Grief.RequireActiveFlooding` - default `true` - kick only on a sustained order-flood, ignoring raw unit count (recommended on).
-- `Grief.FloodOrdersPerSec` - default `3` - sustained orders/second (held ~4s) that trips a kick.
+**Settings (plugin side, Web dashboard Settings → Anti-Grief, live):**
+- `Flood.FleetOrdersPerSec` - default `1` - max accepted unit commands/sec; excess = drop + immediate kick.
+- `Flood.FleetOrderBurst` - default `1` - token-bucket capacity (1 = no burst allowance).
+- `Grief.AutoKick` - default `true` - master switch for detect + report + immediate kick on excess.
+- `Grief.RequireActiveFlooding` - default `true` - kick only on order-rate excess, ignoring raw unit count (recommended on).
 - `Grief.OwnedUnitThreshold` - default `12` - only used when `RequireActiveFlooding` is off: owning more than this many live ground vehicles trips a kick.
 - `Grief.HardBan` - default `false` - also ban a tripped offender, not just kick once.
 - `Grief.ReportOnly` - default `false` - detect and report but do not kick (use to validate thresholds first).
 - `Grief.ExemptAdmins` - default `true` - never auto-kick a SteamID in `Admin.SteamIds`.
 - `Grief.BreakerDistinctPlayers` - default `3` - circuit breaker: if this many distinct players trip the detector within the breaker window, it is treated as a server-wide lag/order spike, not grief - kicks and bans in that window are suppressed (reports still file); 0 = off.
 - `Grief.BreakerWindowSeconds` - default `6` - the rolling window (seconds) the circuit breaker counts distinct trippers over.
+- (`Grief.FloodOrdersPerSec` is a legacy cfg alias; canonical rate is `Flood.FleetOrdersPerSec`.)
 
 **Settings (bot side, `grief_flood.json`, edit then restart the bot):**
 - `enabled` - default `true` - master switch.
@@ -164,9 +166,10 @@ The Web Command Centre has **no login**. Anyone who can reach its address can ba
 | `Teamkill.Enforce` | `true` | Web dashboard (live) | Friendly-fire ladder: eject → kick + rank reset → ban. |
 | `Teamkill.CollateralEnforce` | `true` | Web dashboard (live) | Judge blast collateral before punishing: collateral kills are reported, not punished; off = classic ladder, verdicts only logged. |
 | `Admin.SteamIds` | empty | Web dashboard / wizard | Who may run in-game team commands; also exempt from anti-grief. |
-| `Grief.AutoKick` | `true` | Web dashboard (live) | Anti-grief detect / report / kick master switch. |
-| `Grief.RequireActiveFlooding` | `true` | Web dashboard (live) | Kick only on sustained order-flooding. |
-| `Grief.FloodOrdersPerSec` | `3` | Web dashboard (live) | Orders/second (held ~4s) that trips a kick. |
+| `Grief.AutoKick` | `true` | Web dashboard (live) | Anti-grief detect / report / immediate kick master switch. |
+| `Grief.RequireActiveFlooding` | `true` | Web dashboard (live) | Kick only on order-rate excess. |
+| `Flood.FleetOrdersPerSec` | `1` | Web dashboard (live) | Max cmds/sec; excess = drop + immediate kick. |
+| `Flood.FleetOrderBurst` | `1` | Web dashboard (live) | Token-bucket capacity (1 = no burst). |
 | `Grief.HardBan` | `false` | Web dashboard (live) | Also ban on a trip, not just kick. |
 | `Grief.ReportOnly` | `false` | Web dashboard (live) | Detect and report, do not kick. |
 | `Grief.ExemptAdmins` | `true` | Web dashboard (live) | Never auto-kick an admin. |

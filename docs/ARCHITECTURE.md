@@ -4,7 +4,7 @@ This page explains how the toolkit fits together at a high level: the three part
 each one is responsible for, and how they actually talk to each other. For what each feature
 *does*, see **[FEATURES.md](FEATURES.md)**; for the command list, **[COMMANDS.md](COMMANDS.md)**.
 
-> Plugin identity: `anz.nukestats`, version `1.0.2`.
+> Plugin identity: `anz.nukestats`, version `1.0.10`.
 
 ---
 

@@ -2338,21 +2338,14 @@ def clear_all_reports():
 load_reports()
 
 
-# --- Anti-grief: command-flood (rate-limit storm) auto-kick --------------------
-# The game rate-limits each connection's UnitCommand RPCs and logs one
-#   [RateLimitAttribute] connection(SteamConnection(<sid>)) RPC rate limit exceeded for '<rpc>', dropping call
-# line for EVERY dropped call. A legit player generates ~0 of these (the game
-# allows a ~20 burst + ~5/s); a macro/exploit move-flood generates dozens/sec.
-# A sustained storm from ONE connection is a near-zero-false-positive griefer
-# fingerprint -> file a Reports-tab entry + auto-kick the offender (recoverable).
-# This is the RELIABLE detector: the plugin's GriefTick order-rate check sits
-# DOWNSTREAM of the game's limiter, so it only ever sees the ~5/s that pass
-# through and can't reach a flood threshold. We read the game's own drop lines
-# (the TRUE flood intensity) instead. Tunable via grief_flood.json (edit + restart
-# the bot). Defaults are deliberately conservative.
+# --- Anti-grief: command-flood (rate-limit storm) — RETIRED as a competing kick path ----------
+# Plugin Layer A (Flood.FleetOrdersPerSec + Grief.AutoKick + Grief.Breaker*) is the SOLE order-rate
+# kick + storm-breaker path. This bot detector used to kick from game RateLimitAttribute console
+# lines and could DOUBLE-ACT with the plugin. Default enabled=False. Leave as report-only diagnostics
+# or emergency fallback (edit grief_flood.json + restart bot) — do not run both kick paths.
 GRIEF_CFG_FILE = os.path.join(_BASE_DIR, "grief_flood.json")
 _GRIEF_FLOOD_DEFAULTS = {
-    "enabled": True,
+    "enabled": False,        # RETIRED: plugin owns CmdSetDestination flood kick + breaker (1.0.10+)
     "action": "kick",        # "kick" (recoverable) | "ban" | "report" (detect-only, no removal)
     "drops_per_window": 30,  # trip when ONE sid exceeds this many rate-limit drops...
     "window_sec": 3.0,       # ...within this rolling window (30/3s ~= 25 cmd/s OVER the cap -> macro only)
@@ -2363,8 +2356,7 @@ _GRIEF_FLOOD_DEFAULTS = {
     # network congestion (a BufferFull blip), NOT grief, and must never mass-kick -- the 2026-06-30 incident
     # kicked ~15 players at once on CmdUpdateTrackingInfo. Empty list [] = allow any RPC (legacy behaviour).
     "rpc_allow": ["CmdSetDestination"],
-    # Circuit breaker: if this many DIFFERENT players trip within breaker_window_sec, it's a server-wide
-    # storm -> suppress ALL flood-kicks (never amplify a congestion event into a mass-kick). 0 = disabled.
+    # Circuit breaker (unused while enabled=False): plugin Grief.Breaker* is canonical.
     "breaker_distinct": 3,
     "breaker_window_sec": 6.0,
 }
@@ -3377,12 +3369,12 @@ def rank_tag(points, pn=0):
 
 
 def _team_colour(sid):
-    """In-chat team colour for a player: PALA (Primeva) red, BDF (Boscali) blue."""
+    """In-chat / killfeed team colour — SAME hexes as plugin FactionColour (not friend/foe blue/red)."""
     f = (STATS_META.get(sid, {}).get("faction") or "").lower()
-    if f == "primeva":
-        return "#FF4444"      # PALA
-    if f == "boscali":
-        return "#4488FF"      # BDF
+    if f.startswith("prim") or f == "pala":
+        return "#ffe294"      # PALA / Primeva — killfeed yellow
+    if f.startswith("bosc") or f == "bdf":
+        return "#d4baff"      # BDF / Boscali — killfeed lavender
     return "#FFFFFF"
 
 

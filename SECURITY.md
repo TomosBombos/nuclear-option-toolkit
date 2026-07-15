@@ -19,7 +19,7 @@ minisign -G -p installer/trusted.pub -s ~/.minisign/nukeoption.key
 **Cutting a signed release (maintainer)**
 ```bash
 export NO_SIGN_KEY=~/.minisign/nukeoption.key
-python scripts/publish_release.py --out ../dist --version 1.0.2
+python scripts/publish_release.py --out ../dist --version 1.0.10
 #  builds the release assets, minisign-signs every one, and publishes the GitHub release
 #  (--version defaults to the plugin version in source; add --dry-run to build + sign without publishing)
 ```

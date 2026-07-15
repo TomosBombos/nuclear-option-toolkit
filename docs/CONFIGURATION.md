@@ -148,15 +148,15 @@ The AILimit group is a performance guard: it only ever removes AI aircraft, neve
 
 Server tick rate (`TICK_RATE`) is a bot value, listed under [Bot settings](#server-tuning-bot-constants).
 
-### Flood guard & unit-command policy
+### Anti-grief / flood protection (one settings group)
 
-Command/network flood protection. `Flood.Enforce` and `Flood.DropDeadNetIdRpcs` switch Harmony patches on at load, so toggling them **needs a SERVER restart**; their numeric parameters are live. The Mirage buffer settings apply at the next match host.
+Web CC exposes a single **Anti-Grief** tab covering rate-limit + auto-kick + unit-command policy + buffer raise. Canonical rate key is `Flood.FleetOrdersPerSec` (default **1**). Excess orders are dropped **and** the offender is kicked **immediately** (Layer A); `Grief.FloodOrdersPerSec` is a legacy cfg alias only (hidden in UI). Circuit breaker still suppresses mass-kicks on congestion storms.
 
 | Setting | Default | What it controls | Where |
 |---|---|---|---|
-| `Flood.Enforce` | `true` | Rate-limits fleet move-orders to stop order-spam mass-disconnecting the lobby. | Dashboard, needs SERVER restart |
-| `Flood.FleetOrdersPerSec` | `3` | Sustained fleet move-orders accepted per second per player (1-20). | Dashboard (live) |
-| `Flood.FleetOrderBurst` | `6` | Max burst of fleet orders before excess is dropped (token-bucket capacity; 1-40). | Dashboard (live) |
+| `Flood.Enforce` | `true` | Rate-limits fleet move-orders; excess dropped (+ immediate kick if AutoKick). | Dashboard (live; patch binds at load) |
+| `Flood.FleetOrdersPerSec` | `1` | Max accepted unit commands/sec/player; kick on excess (1-20). | Dashboard (live) |
+| `Flood.FleetOrderBurst` | `1` | Token-bucket capacity; 1 = no burst allowance (1-40). | Dashboard (live) |
 | `Flood.LogDrops` | `true` | Logs (throttled) name/SteamID of any player whose flooding orders are dropped. | Dashboard (live) |
 | `Flood.DropDeadNetIdRpcs` | `true` | Silently drops RPCs aimed at already-destroyed objects to kill a disconnect-storm amplifier. | Dashboard, needs SERVER restart |
 | `Command.Policy` | `HeliDroppedOnly` | Which units players may move via CmdSetDestination. Options: All, RateLimitOnly, HeliDroppedOnly (recommended), AllowlistTypes, Disabled. | Dashboard (live) |
@@ -164,17 +164,9 @@ Command/network flood protection. `Flood.Enforce` and `Flood.DropDeadNetIdRpcs` 
 | `Command.DiagLog` | `false` | Logs resolved unit type + ALLOW/DROP per command order to `BepInEx/LogOutput.log` (verbose; turn on briefly to discover unit jsonKeys, then off). | Dashboard (live) |
 | `Mirage.RaiseReliableSendBuffer` | `true` | Anti mass-disconnect: raise the per-connection reliable-send-buffer cap so a command/RPC burst is absorbed. | Dashboard, applies at next match host |
 | `Mirage.ReliableSendBufferLimit` | `12000` | Target cap for the reliable-send-buffer (game default 3000; recommended 8000-24000). Clamped to >=3000, never lowers a higher value. | Dashboard, applies at next match host |
-
-### Anti-grief (plugin auto-kick)
-
-Two-factor by default (`RequireActiveFlooding` on) so legit base-builders are not kicked; it kicks the offender, not the lobby. Validate with `Grief.ReportOnly=true` first, then enable kicking.
-
-| Setting | Default | What it controls | Where |
-|---|---|---|---|
-| `Grief.AutoKick` | `true` | Master on/off for detect + report + kick of a single mass-commanding griefer. | Dashboard (live) |
+| `Grief.AutoKick` | `true` | Master on/off for immediate kick + report on first excess order. | Dashboard (live) |
 | `Grief.OwnedUnitThreshold` | `12` | Only when RequireActiveFlooding is OFF: owning more than this many live ground vehicles is auto-kicked (1-200). | Dashboard (live) |
-| `Grief.RequireActiveFlooding` | `true` | Recommended ON: kick on sustained order-flood rate alone (~4s), ignoring unit count. OFF also kicks on owned-count. | Dashboard (live) |
-| `Grief.FloodOrdersPerSec` | `3` | Sustained orders/sec/player (held ~4s) that trips the auto-kick; lower = more aggressive (1-500). | Dashboard (live) |
+| `Grief.RequireActiveFlooding` | `true` | Recommended ON: kick on order-rate excess alone. OFF also kicks on owned-count. | Dashboard (live) |
 | `Grief.HardBan` | `false` | If ON, a tripped offender is also banned (kicked on rejoin), not just kicked once. | Dashboard (live) |
 | `Grief.ReportOnly` | `false` | If ON, detect + report to the Reports tab but do NOT kick (validate the threshold first). | Dashboard (live) |
 | `Grief.ExemptAdmins` | `true` | Recommended ON: never auto-kick a SteamID in `Admin.SteamIds`. | Dashboard (live) |

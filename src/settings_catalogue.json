@@ -548,48 +548,48 @@
   },
   {
    "key": "Flood.Enforce",
-   "friendlyName": "Flood Guard Enabled",
-   "group": "Flood Guard",
+   "friendlyName": "Rate-Limit Unit Commands",
+   "group": "Anti-Grief",
    "owner": "plugin",
    "type": "toggle",
    "default": "true",
    "live": "live",
    "commonlyChanged": true,
-   "adminDescription": "Rate-limits fleet move-orders to stop order-spam mass-disconnecting the lobby; needs a server restart to apply (gates a patch).",
+   "adminDescription": "Token-bucket rate limit on fleet move-orders (CmdSetDestination). Excess orders are DROPPED; with Auto-Kick on, the offender is ALSO kicked immediately on the first excess. Leave ON. Patch binds at load — toggling off/on needs a server restart; the numeric rate/burst are live.",
    "gameplay": false
   },
   {
    "key": "Flood.FleetOrdersPerSec",
-   "friendlyName": "Fleet Orders Per Second",
-   "group": "Flood Guard",
+   "friendlyName": "Max Unit Commands Per Second",
+   "group": "Anti-Grief",
    "owner": "plugin",
    "type": "int",
-   "default": "3",
+   "default": "1",
    "min": "1",
    "max": "20",
    "live": "live",
    "commonlyChanged": true,
-   "adminDescription": "Sustained fleet move-orders accepted per second per player; a human issues well under 1/s.",
+   "adminDescription": "Max accepted unit move-commands per second per player. DEFAULT 1: a legit commander is at most ~1/s; ANY excess is dropped and (with Auto-Kick) immediately kicked. This is the single rate control (replaces the old duplicate Flood Guard + Anti-Grief rate knobs). Raise only if false positives.",
    "gameplay": false
   },
   {
    "key": "Flood.FleetOrderBurst",
-   "friendlyName": "Fleet Order Burst",
-   "group": "Flood Guard",
+   "friendlyName": "Unit Command Burst Capacity",
+   "group": "Anti-Grief",
    "owner": "plugin",
    "type": "int",
-   "default": "6",
+   "default": "1",
    "min": "1",
    "max": "40",
    "live": "live",
    "commonlyChanged": true,
-   "adminDescription": "Max burst of fleet orders before excess is dropped (token-bucket capacity); first orders are never dropped.",
+   "adminDescription": "Token-bucket capacity. DEFAULT 1 with Max Unit Commands Per Second=1 means a second command within the same second is excess (drop + kick). Raise only to allow a brief intentional multi-select burst.",
    "gameplay": false
   },
   {
    "key": "Flood.LogDrops",
    "friendlyName": "Log Dropped Orders",
-   "group": "Flood Guard",
+   "group": "Anti-Grief",
    "owner": "plugin",
    "type": "toggle",
    "default": "true",
@@ -601,7 +601,7 @@
   {
    "key": "Flood.DropDeadNetIdRpcs",
    "friendlyName": "Drop Dead-NetId RPCs",
-   "group": "Flood Guard",
+   "group": "Anti-Grief",
    "owner": "plugin",
    "type": "toggle",
    "default": "true",
@@ -749,7 +749,7 @@
   {
    "key": "Command.Policy",
    "friendlyName": "Unit Command Policy",
-   "group": "Flood Guard",
+   "group": "Anti-Grief",
    "owner": "plugin",
    "type": "enum",
    "options": [
@@ -774,7 +774,7 @@
   {
    "key": "Command.AllowedJsonKeys",
    "friendlyName": "Command Allowlist (jsonKeys)",
-   "group": "Flood Guard",
+   "group": "Anti-Grief",
    "owner": "plugin",
    "type": "string",
    "default": "",
@@ -786,7 +786,7 @@
   {
    "key": "Command.DiagLog",
    "friendlyName": "Command Policy Diagnostics",
-   "group": "Flood Guard",
+   "group": "Anti-Grief",
    "owner": "plugin",
    "type": "toggle",
    "default": "false",
@@ -798,7 +798,7 @@
   {
    "key": "Mirage.RaiseReliableSendBuffer",
    "friendlyName": "Raise Reliable Send Buffer",
-   "group": "Flood Guard",
+   "group": "Anti-Grief",
    "owner": "plugin",
    "type": "toggle",
    "default": "true",
@@ -810,7 +810,7 @@
   {
    "key": "Mirage.ReliableSendBufferLimit",
    "friendlyName": "Reliable Send Buffer Limit",
-   "group": "Flood Guard",
+   "group": "Anti-Grief",
    "owner": "plugin",
    "type": "int",
    "default": "12000",
@@ -831,7 +831,7 @@
    "live": "live",
    "commonlyChanged": false,
    "gameplay": false,
-   "adminDescription": "Anti-grief: automatically KICK a single player mass-commanding units to brick the server (the buffer flood that mass-disconnects everyone) -- kicks the OFFENDER, not the lobby, and files a report in the Reports tab. Two-factor (see RequireActiveFlooding) so legit base-builders aren't kicked. Off = no detection/report/kick."
+   "adminDescription": "Master switch: when ON, a player who exceeds Max Unit Commands Per Second is reported and IMMEDIATELY kicked on the first excess order (not after a multi-second wait). Kicks the OFFENDER, not the lobby. Off = rate-limit drops still apply if Rate-Limit is on, but no auto-kick."
   },
   {
    "key": "Grief.OwnedUnitThreshold",
@@ -857,21 +857,7 @@
    "live": "live",
    "commonlyChanged": false,
    "gameplay": false,
-   "adminDescription": "Recommended ON: auto-kick on sustained move-order flooding ALONE (>= Flood Order Rate, held ~4s), regardless of how many units the player owns -- catches command-spam even on units they don't own. OFF = also kick anyone simply OWNING more than the Owned-Unit Threshold (aggressive; can false-positive a base-builder)."
-  },
-  {
-   "key": "Grief.FloodOrdersPerSec",
-   "friendlyName": "Flood Order Rate (per sec)",
-   "group": "Anti-Grief",
-   "owner": "plugin",
-   "type": "int",
-   "default": "3",
-   "live": "live",
-   "commonlyChanged": true,
-   "gameplay": false,
-   "adminDescription": "The sustained move-order rate (orders/sec per player, held ~4s = 2 scan windows) that auto-kicks a single connection spamming commands. A legit commander is well under 1/s and the game caps accepted orders at ~5/s, so 3/s sustained = deliberate macro/click-spam. LOWER = more aggressive (3 catches '3+/s on one unit'); raise toward 5 if you see false positives.",
-   "min": "1",
-   "max": "500"
+   "adminDescription": "Recommended ON: kick on order-rate excess alone (Max Unit Commands Per Second). OFF = also kick anyone simply OWNING more than the Owned-Unit Threshold (aggressive; can false-positive a base-builder)."
   },
   {
    "key": "Grief.HardBan",
@@ -908,6 +894,34 @@
    "commonlyChanged": false,
    "gameplay": false,
    "adminDescription": "Recommended ON: never auto-kick a player whose SteamID is in Admin.SteamIds (an admin may legitimately mass-command units for a scenario). Turn OFF only to self-test the detector on your own admin account."
+  },
+  {
+   "key": "Grief.BreakerDistinctPlayers",
+   "friendlyName": "Storm Breaker: Distinct Players",
+   "group": "Anti-Grief",
+   "owner": "plugin",
+   "type": "int",
+   "default": "3",
+   "min": "0",
+   "max": "20",
+   "live": "live",
+   "commonlyChanged": false,
+   "gameplay": false,
+   "adminDescription": "Circuit breaker against mass kicks during a congestion storm. If this many DISTINCT players trip the grief/flood detector within the breaker window, kicks and bans in that window are SUPPRESSED (reports still file) — treats it as a server-wide lag/order spike, not coordinated grief. 0 = breaker off (kick every tripper)."
+  },
+  {
+   "key": "Grief.BreakerWindowSeconds",
+   "friendlyName": "Storm Breaker: Window (s)",
+   "group": "Anti-Grief",
+   "owner": "plugin",
+   "type": "int",
+   "default": "6",
+   "min": "1",
+   "max": "60",
+   "live": "live",
+   "commonlyChanged": false,
+   "gameplay": false,
+   "adminDescription": "Rolling window (seconds) over which distinct grief/flood trips are counted toward the storm breaker. When N distinct players trip within this window, mass kicks are suppressed."
   }
  ],
  "notes": "SOURCES (all read directly): plugin Config.Bind block = C:/Users/Server/Documents/Nuke Option Server/NukeStats/NukeStatsPlugin.cs lines 98-212 (44 entries total, all enumerated). Bot constants = no_mapvote_bot.py: MISSION_MAX_TIME(L67), VOTE_DURATION(L120), APPROVAL_DURATION(L121), KILL_BONUS(L159), UNDERDOG_PER_PLAYER(L160), WARN_THRESHOLDS(L218, not surfaced as a single tunable - see below), START_BONUS_PTS(L225), START_BONUS_WINDOW(L226). Game config VoteKick = DedicatedServerConfig.json VoteKick.Enabled, set via no_mapvote_bot.py set_votekick() (L3626, run.bat --set-votekick on|off).\n\nCOVERAGE: 43 plugin Config.Bind entries + 7 bot constants + 1 game setting = 51 settings. I omitted WARN_THRESHOLDS (a Python LIST [3600,1200,600,300,60] of warning times, not a single scalar - not suitable for a single int/float control; mention to user if they want it editable as a comma list). All other requested bot constants are included.\n\nLIVE vs RESTART: Every plugin ConfigEntry is read live each HQ tick EXCEPT Flood.Enforce and Flood.DropDeadNetIdRpcs - those gate Harmony patch bindings at load (the CmdSetDestination throttle patch and the private-Mirage RPC patch), so toggling them needs a server restart; their numeric params (PerSec/Burst/LogDrops) ARE live. ALL bot constants are Python module-level = require a BOT restart. VoteKick is a game-config JSON change applied on reload-config / next mission / full restart (marked restart).\n\nRECOMMENDED GROUP ORDERING (top = most touched):\n1. Match  2. Team Balance  3. Scoring & Ranks  4. AI & Performance  5. Squads  6. Moderation  7. PvE  8. Chat  9. Flood Guard\n(Put Flood Guard and the live=restart items last since they're rarely touched and some need a restart.)\n\nRECOMMENDED SIMPLE (curated) VIEW - ~14 settings, based on owner Tomo's actual change history:\n1. MISSION_MAX_TIME (mission length, ~3h) [bot]\n2. AILimit.PerTeamAICap (32) [plugin]\n3. AILimit.TotalAircraftCap (64) [plugin]\n4. Balance.Enforce (autobalance on/off) [plugin]\n5. Balance.MinPlayers (6) [plugin]\n6. Balance.WarnSeconds (300) [plugin]\n7. Balance.NewJoinerSeconds (900) [plugin]\n8. START_BONUS_PTS (250) [bot]\n9. KILL_BONUS (50) [bot]\n10. Scoring.WinPoints (200) [plugin]\n11. PvE.TimeoutForceDefeat (off) [plugin]\n12. DedicatedServerConfig.VoteKick (off) [game]\n13. Mission.PvpStartingRank (3) [plugin]\n14. Teamkill.Enforce (on) [plugin]\n(Stretch to 15 with Squad.MaxSize or Chat.ProfanityFilter if room.)\n\nUI CAVEATS to surface to the admin:\n- Flag bot-owned + game-owned + the two Flood patch toggles as 'needs restart' in the UI (live=restart) - changing them via cc_web won't take effect until the bot/server restarts. Plugin live settings apply on the next HQ tick and persist to BepInEx/config/anz.nukestats.cfg on Config.Save().\n- Balance.GraceSeconds is LEGACY/unused (kept for completeness, commonlyChanged=false) - consider hiding it.\n- Admin.SteamIds is a comma-separated string, not a single ID. Min/max omitted for string/toggle types by design.\n- WARN_THRESHOLDS (mission-time chat warnings) is a list and not in the catalogue as a scalar; expose as an editable comma-separated field if desired."

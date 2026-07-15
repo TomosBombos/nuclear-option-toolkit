@@ -10,7 +10,7 @@ try{if(localStorage.getItem('nocc_theme')==='light')document.documentElement.set
   :root{
     --bg:#080b11; --panel:#10161f; --panel2:#0b1018; --bd:#222d3a; --bd2:#18212c;
     --txt:#e4ecf6; --dim:#8696aa; --accent:#57e08a; --land:#2EA847; --conc:#8b9097;
-    --bdf:#5BA3FF; --pala:#FF6B5B; --warn:#FFC857; --bad:#FF5C5C; --ok:#57e08a;
+    --bdf:#d4baff; --pala:#ffe294; --warn:#FFC857; --bad:#FF5C5C; --ok:#57e08a;
     /* semantic tokens (so light mode can re-skin without touching every rule) */
     --fg:#cdd8e6; --ac:#5aa0ff;
     --hover:#172230; --input:#0a0f17; --modal:#111923; --inset:#0c1620;
@@ -22,7 +22,7 @@ try{if(localStorage.getItem('nocc_theme')==='light')document.documentElement.set
   html[data-theme="light"]{
     --bg:#ccd3df; --panel:#dbe0ea; --panel2:#d0d7e3; --bd:#b6c0cf; --bd2:#c6cedb;
     --txt:#37424f; --dim:#586271; --accent:#1b7a44; --land:#2EA847; --conc:#737d8a;
-    --bdf:#345fb0; --pala:#b23e2c; --warn:#946400; --bad:#bb3a30; --ok:#1f8a4d;
+    --bdf:#7a52c4; --pala:#9a7a18; --warn:#946400; --bad:#bb3a30; --ok:#1f8a4d;
     --fg:#37424f; --ac:#2f63c2;
     --hover:#d2d9e5; --input:#d6dce7; --modal:#dbe0ea; --inset:#d0d7e3;
     --btn:#d4dbe6; --btnh:#c7cfdc; --mapbg:#060d16;
@@ -448,13 +448,13 @@ try{if(localStorage.getItem('nocc_theme')==='light')document.documentElement.set
           <span><i style="background:#060d16"></i>water</span>
           <span><span class="gl" style="color:var(--bdf)">▲</span><span class="gl" style="color:var(--pala)">▲</span>plane</span>
           <span><span class="gl" style="color:var(--bdf)">+</span><span class="gl" style="color:var(--pala)">+</span>heli</span>
-          <span class="muted">blue = BDF · coral = PALA · named = player, unnamed = AI</span>
+          <span class="muted">lavender = BDF · yellow = PALA · named = player, unnamed = AI</span>
           <span><canvas class="lgs" data-cls="corvette"></canvas>corvette</span>
           <span><canvas class="lgs" data-cls="argus"></canvas>argus</span>
           <span><canvas class="lgs" data-cls="destroyer"></canvas>destroyer</span>
           <span><canvas class="lgs" data-cls="carrier"></canvas>carrier</span>
           <span><canvas class="lgs" data-cls="cursor"></canvas>cursor</span>
-          <span><span class="gl" style="color:#7CA6FF">◌</span><span class="gl" style="color:#FFD21E">◌</span><span class="gl" style="color:#aeb6c2">◌</span>bases</span>
+          <span><span class="gl" style="color:#aeb6c2">◌</span>bases</span>
           <span>✝ down</span>
           <span class="muted">scroll/drag/dbl-click zoom · ◎ recenter</span>
         </div>
@@ -791,9 +791,9 @@ function render(){
    for(let wz=e.zT;wz>=e.zB-1;wz-=atlas.cell){const cy=Math.round(w2cy(wz))+.5;if(cy<m.iy-1||cy>m.iy+m.ih+1)continue;ctx.moveTo(m.ix,cy);ctx.lineTo(m.ix+m.iw,cy);}}
   ctx.stroke();
   drawMinorGrid(ctx,m);   // faint 10x10 sub-grid + addresses, only once zoomed in past the thresholds
-  // base markers (faction rings, constant screen size; Neutral=grey, e.g. Feldspar Intl)
+  // base markers (neutral grey rings for all factions; constant screen size)
   for(const b of(atlas.bases||[])){if(b[1]!=='w')continue;const cx=w2cx(b[2]),cy=w2cy(b[3]);
-    const col=b[4]==='Boscali'?'#7CA6FF':b[4]==='Neutral'?'#aeb6c2':'#FFD21E';
+    const col='#aeb6c2';
     ctx.beginPath();ctx.arc(cx,cy,5,0,7);ctx.strokeStyle=col;ctx.lineWidth=1.6;ctx.stroke();
     ctx.beginPath();ctx.arc(cx,cy,1.7,0,7);ctx.fillStyle=col;ctx.fill();}
   // player blips

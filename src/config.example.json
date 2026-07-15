@@ -31,8 +31,11 @@
     "Teamkill.Enforce": true,
     "AILimit.Enforce": true,
     "Flood.Enforce": true,
+    "Flood.FleetOrdersPerSec": 1,
+    "Flood.FleetOrderBurst": 1,
     "Flood.LogDrops": true,
     "Flood.DropDeadNetIdRpcs": true,
+    "Grief.AutoKick": true,
     "DedicatedServerConfig.VoteKick": false
   },
   "update": {
