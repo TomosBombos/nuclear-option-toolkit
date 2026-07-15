@@ -78,7 +78,7 @@ def _tag(version):
 def _changelog_section(version):
     """Release-notes body pulled from the [<version>] section of CHANGELOG.md, or '' if none."""
     import re as _re
-    path = os.path.join(ROOT, "CHANGELOG.md")
+    path = os.path.join(os.path.dirname(ROOT), "CHANGELOG.md")   # CHANGELOG lives at the repo root, not src/
     if not os.path.exists(path):
         return ""
     with open(path, encoding="utf-8") as f:
